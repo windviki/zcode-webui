@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ZCode WebUI · 登录</title>
+<style>
+  body { margin: 0; background: #111418; color: #e8eaed; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+  .card { width: 420px; max-width: 92vw; background: #1b1f24; border: 1px solid #2c3138; border-radius: 14px; padding: 28px; }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  p { color: #9aa3ad; font-size: 13px; line-height: 1.6; }
+  button { background: #2f6fed; color: #fff; border: 0; border-radius: 8px; padding: 10px 16px; font-size: 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  a.link { display: block; margin-top: 14px; color: #7fb0ff; font-size: 13px; word-break: break-all; }
+  .state { margin-top: 14px; font-size: 13px; color: #9aa3ad; white-space: pre-wrap; max-height: 180px; overflow: auto; background: #14171b; border-radius: 8px; padding: 10px; }
+  .back { margin-top: 14px; font-size: 12px; color: #7d8690; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>登录 Z.ai</h1>
+  <p>登录会启动官方 zcode CLI 的 OAuth 流程：在下方打开授权链接、在浏览器里完成授权，凭据会写入容器内的 ~/.zcode/v2/credentials.json（与官方客户端共用同一凭据库）。</p>
+  <button id="btn">开始登录</button>
+  <button id="cancel" style="display:none;background:#3a4048">取消</button>
+  <a class="link" id="url" target="_blank" rel="noopener" style="display:none"></a>
+  <div class="state" id="state"></div>
+  <hr style="border:0;border-top:1px solid #2c3138;margin:18px 0" />
+  <p style="margin:0 0 8px">已有登录好的 ZCode 桌面端？可用「导出工具」把桌面凭据解密后粘贴到这里直接导入（无需网络）。</p>
+  <textarea id="importSrc" style="width:100%;box-sizing:border-box;background:#14171b;color:#e8eaed;border:1px solid #2c3138;border-radius:8px;padding:8px;min-height:70px;font:12px monospace" placeholder='{"oauth:bigmodel:access_token":"...","zcodejwttoken":"...","oauth:bigmodel:user_info":"...","oauth:active_provider":"bigmodel"}'></textarea>
+  <button id="importBtn" style="background:#3a4048">导入凭据</button>
+  <p style="margin-top:8px"><a href="./export-credentials.html" target="_blank" rel="noopener" style="color:#7fb0ff;font-size:13px">打开桌面端凭据导出工具 →</a></p>
+  <div class="back"><a href="./" style="color:#7d8690">← 返回 ZCode</a></div>
+</div>
+<script>
+(function () {
+  // 全部使用相对路径：经 code-server /proxy/<port>/ 反代时前缀会被剥掉，
+  // 相对路径会自动落在正确的公共 URL 下。
+  var btn = document.getElementById('btn');
+  var cancelBtn = document.getElementById('cancel');
+  var urlEl = document.getElementById('url');
+  var stateEl = document.getElementById('state');
+  var timer = null;
+  var running = false;
+  var startedAt = 0;
+  var importBtn = document.getElementById('importBtn');
+  importBtn.addEventListener('click', function () {
+    var raw = document.getElementById('importSrc').value.trim();
+    if (!raw) { alert('请先粘贴凭据 JSON'); return; }
+    var creds;
+    try { creds = JSON.parse(raw); } catch (e) { alert('JSON 解析失败：' + e.message); return; }
+    importBtn.disabled = true;
+    stateEl.textContent = '正在导入凭据…';
+    fetch('api/login/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credentials: creds }) })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.ok) { stateEl.textContent = '导入成功，正在跳转…'; setTimeout(function () { window.location.href = './'; }, 800); }
+        else { alert('导入失败：' + (j.error || '未知错误')); importBtn.disabled = false; }
+      })
+      .catch(function (e) { alert('导入失败：' + e.message); importBtn.disabled = false; });
+  });
+
+  function api(p, opts) {
+    return fetch(p, opts || {}).then(function (r) { return r.json(); });
+  }
+  function poll() {
+    api('api/login/status').then(function (s) {
+      if (!running) return;
+      if (s.url) { urlEl.style.display = 'block'; urlEl.href = s.url; urlEl.textContent = s.url; }
+      if (s.output) stateEl.textContent = s.output;
+      if (s.running) {
+        if (!s.output && Date.now() - startedAt > 10000) {
+          stateEl.textContent = '等待 OAuth 端点响应超 10 秒：服务端到 zcode.z.ai/api/v1 的网络可能受限。可尝试：\n1) 在服务端设置 ZCODE_WEBUI_OAUTH_PROXY（或 config.json 的 oauthProxy）指向可用代理；\n2) 检查服务端启动日志中的 [login] 错误。';
+        }
+        timer = setTimeout(poll, 1500); return;
+      }
+      if (s.loggedIn) {
+        stateEl.textContent = '登录成功，正在跳转…';
+        setTimeout(function () { window.location.href = './'; }, 800);
+      } else {
+        btn.disabled = false;
+        running = false;
+        stateEl.textContent = (stateEl.textContent || '') + '\n[登录流程已结束，但未检测到凭据。请检查网络后重试。]';
+      }
+    }).catch(function (e) {
+      stateEl.textContent = '请求失败: ' + e.message;
+      btn.disabled = false;
+      running = false;
+    });
+  }
+  cancelBtn.addEventListener('click', function () {
+    running = false;
+    api('api/login/cancel', { method: 'POST' }).then(function () {
+      btn.disabled = false; cancelBtn.style.display = 'none';
+      stateEl.textContent = (stateEl.textContent || '') + '\n[已取消]';
+    });
+  });
+  btn.addEventListener('click', function () {
+    btn.disabled = true;
+    running = true;
+    startedAt = Date.now();
+    cancelBtn.style.display = 'inline-block';
+    stateEl.textContent = '正在启动登录流程…';
+    api('api/login/start', { method: 'POST' }).then(function (r) {
+      if (!r.ok) { stateEl.textContent = r.error || '启动失败'; alert('启动失败：' + (r.error || '未知错误')); btn.disabled = false; running = false; return; }
+      poll();
+    }).catch(function (e) {
+      stateEl.textContent = '启动失败: ' + e.message;
+      alert('启动失败：' + e.message + '（详情见页面下方状态区）');
+      btn.disabled = false;
+      running = false;
+    });
+  });
+  api('api/login/status').then(function (s) {
+    if (s.loggedIn) {
+      stateEl.textContent = '已登录，正在跳转…';
+      setTimeout(function () { window.location.href = './'; }, 600);
+    }
+  });
+})();
+</script>
+</body>
+</html>

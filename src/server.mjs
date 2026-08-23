@@ -1,0 +1,579 @@
+// zcode-webui: serve the official ZCode desktop renderer in a browser, backed by the
+// in-container zcode host service (zcode-server.cjs), bridged over WebSocket.
+//
+//   node src/server.mjs [--port 3102] [--base-path /proxy/3102] [--workspace /path]
+//
+// Env equivalents: ZCODE_WEBUI_PORT, ZCODE_WEBUI_BASE_PATH, ZCODE_WEBUI_WORKSPACE,
+// ZCODE_WEBUI_OAUTH_PROXY, ZCODE_SERVER_RUNTIME_ROOT.
+
+import http from 'node:http';
+import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+import { encodeFrame, FrameParser } from './frame.mjs';
+import { rpcLogLine } from './rpclog.mjs';
+import { spawnHost, handshake, resolveServerRoot } from './host.mjs';
+import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '..');
+
+// ---------- config ----------
+function argValue(name, fallback) {
+  const args = process.argv.slice(2);
+  const i = args.indexOf('--' + name);
+  if (i >= 0 && i + 1 < args.length) return args[i + 1];
+  return fallback;
+}
+// config.json in the project root (optional, lowest priority)
+let fileConfig = {};
+try {
+  fileConfig = JSON.parse(readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+} catch (_e) { /* ignore */ }
+
+const PORT = Number(process.env.ZCODE_WEBUI_PORT || argValue('port', fileConfig.port) || 3102);
+const WORKSPACE = process.env.ZCODE_WEBUI_WORKSPACE || argValue('workspace', fileConfig.workspace) || os.homedir();
+const OAUTH_PROXY = process.env.ZCODE_WEBUI_OAUTH_PROXY || argValue('oauth-proxy', fileConfig.oauthProxy) || '';
+// proxy used by the spawned host/agent processes for ZCode cloud + model APIs
+// (set ZCODE_HTTP_PROXY / ZCODE_NO_PROXY in the child env)
+const HOST_PROXY = process.env.ZCODE_WEBUI_HOST_PROXY || argValue('host-proxy', fileConfig.hostProxy) || '';
+const LOCALE = process.env.ZCODE_WEBUI_LOCALE || fileConfig.locale || 'zh-CN';
+
+let base = process.env.ZCODE_WEBUI_BASE_PATH || argValue('base-path', '') || '';
+base = ('/' + base).replace(/\/+/g, '/').replace(/\/$/, '');
+if (base === '/') base = '';
+const joinBase = (p) => base + p;
+
+const RENDERER_DIR = path.join(ROOT, 'vendor', 'renderer');
+const WEB_DIR = path.join(ROOT, 'web');
+
+let serverRoot;
+try {
+  serverRoot = resolveServerRoot();
+} catch (err) {
+  console.error('[zcode-webui] WARNING: ' + err.message);
+  serverRoot = '';
+}
+
+// per-run ws token: the browser's WebSocket must present it AND verify our first
+// text message; otherwise a foreign websocket server (e.g. code-server's own /ws
+// when the URL lacks a trailing slash) would feed garbage frames into the renderer.
+const WS_TOKEN = randomUUID();
+const WS_READY = '{"kind":"zcode-webui-ready"}';
+
+// persistent device id for the renderer
+const DEVICE_FILE = path.join(ROOT, 'data', 'device-id.json');
+let deviceId = '';
+try {
+  if (existsSync(DEVICE_FILE)) deviceId = JSON.parse(readFileSync(DEVICE_FILE, 'utf8')).deviceId || '';
+} catch (_e) { /* ignore */ }
+if (!deviceId) {
+  deviceId = 'zcode-webui-' + randomUUID();
+  try {
+    mkdirSync(path.dirname(DEVICE_FILE), { recursive: true });
+    writeFileSync(DEVICE_FILE, JSON.stringify({ deviceId }), { flag: 'w' });
+  } catch (_e) { /* ignore */ }
+}
+
+// ---------- static helpers ----------
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml',
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.ico': 'image/x-icon',
+  '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.otf': 'font/otf',
+  '.pdf': 'application/pdf', '.map': 'application/json', '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm', '.webp': 'image/webp',
+};
+
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, headers);
+  res.end(body);
+}
+function sendJson(res, status, obj) {
+  send(res, status, JSON.stringify(obj), { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+}
+function safeJoin(dir, rel) {
+  const p = path.normalize(path.join(dir, rel));
+  if (!p.startsWith(dir + path.sep) && p !== dir) return null;
+  return p;
+}
+function serveFile(res, filePath) {
+  if (!existsSync(filePath)) return send(res, 404, 'not found');
+  const ext = path.extname(filePath).toLowerCase();
+  const mime = MIME[ext] || 'application/octet-stream';
+  const size = statSync(filePath).size;
+  res.writeHead(200, {
+    'Content-Type': mime,
+    'Content-Length': String(size),
+    'Cache-Control': 'no-cache',
+  });
+  createReadStream(filePath).pipe(res);
+}
+
+// ---------- index.html transform ----------
+function readRendererIndex() {
+  const p = path.join(RENDERER_DIR, 'index.html');
+  if (!existsSync(p)) return null;
+  let html = readFileSync(p, 'utf8');
+  // NOTE: injected script srcs are RELATIVE (./__zcode_webui/...) so they resolve
+  // under whatever public prefix the reverse proxy uses (code-server strips
+  // /proxy/<port> before forwarding; absolute paths would escape the prefix).
+  const assetVersion = '?v=' + Date.now().toString(36);
+  // INLINE redirect: relative URLs break when the page URL is '/proxy/<port>'
+  // without a trailing slash (e.g. ./assets resolves to /proxy/assets). code-server
+  // strips the prefix before forwarding, so the backend cannot fix this — redirect
+  // in the browser before any external resource loads.
+  const slashRedirect = '<script>(function(){try{var p=window.location.pathname;if(/^\\/proxy\\/\\d+$/.test(p)){window.location.replace(p+"/"+window.location.search);}}catch(e){}})();</script>';
+  const cfgScript = '<script>window.__ZCODE_WEBUI_CONFIG__ = ' + JSON.stringify({
+    base,
+    wsPath: joinBase('/ws'),
+    wsToken: WS_TOKEN,
+    locale: LOCALE,
+    workspace: WORKSPACE,
+    deviceId,
+    serverRoot: serverRoot || null,
+  }) + ';</script>';
+  const bridgeScript = '<script src="./__zcode_webui/zcode-bridge.js' + assetVersion + '"></script>';
+  const bootScript = '<script src="./__zcode_webui/bootstrap.js' + assetVersion + '"></script>';
+  const inject = slashRedirect + cfgScript + bridgeScript + bootScript;
+  // Attach the injected scripts right after the renderer's viewport meta tag so they
+  // run before the official entry scripts. Fall back to right after <head> in case a
+  // future renderer version changes that tag.
+  const metaViewport = '<meta name="viewport" content="width=device-width, initial-scale=1.0" />';
+  if (html.includes(metaViewport)) {
+    html = html.replace(metaViewport, metaViewport + inject);
+  } else {
+    html = html.replace(/<head([^>]*)>/i, (m, attrs) => '<head' + attrs + '>' + inject);
+  }
+  return html;
+}
+
+// ---------- login ----------
+let loginRun = null; // {child, url(), output()}
+let loginLog = '';
+
+// ---------- host pipe (shared by WS transport and HTTP fallback transport) ----------
+function openHostPipe() {
+  const extraEnv = HOST_PROXY
+    ? { ZCODE_HTTP_PROXY: HOST_PROXY, ZCODE_NO_PROXY: 'localhost,127.0.0.1' }
+    : {};
+  const host = spawnHost({ serverRoot, log: (l) => console.error(l), extraEnv });
+  const { child } = host;
+  return handshake(child).then(({ hello, rest }) => {
+    const state = {
+      child, hello, closed: false, framesIn: 0, framesOut: 0,
+      onFrame: null, onExit: null,
+    };
+    const rpcDebug = process.env.ZCODE_WEBUI_DEBUG_RPC === '1';
+    const parser = new FrameParser((payload) => {
+      state.framesOut++;
+      if (rpcDebug) { const l = rpcLogLine('RPC-out', payload); if (l) console.error('[rpc] ' + l); }
+      if (state.onFrame && !state.closed) {
+        try { state.onFrame(Buffer.from(payload)); } catch (_e) { /* ignore */ }
+      }
+    });
+    parser.push(rest);
+    child.stdout.on('data', (d) => parser.push(d));
+    child.on('exit', (code, signal) => {
+      state.closed = true;
+      if (state.onExit) { try { state.onExit(code, signal); } catch (_e) { /* ignore */ } }
+    });
+    state.push = (payload) => {
+      if (state.closed) return false;
+      state.framesIn++;
+      // protect the host: only forward payloads that look like serialized channel
+      // messages (first byte is an RPC preset 0..6); drop flow-control JSON etc.
+      if (!payload || payload.length === 0 || payload[0] > 6) {
+        console.error('[bridge] dropped non-protocol inbound payload ' + payload.length + 'B first=' + (payload[0] ?? 'nil'));
+        return true;
+      }
+      if (rpcDebug) { const l = rpcLogLine('RPC-in ', payload); if (l) console.error('[rpc] ' + l); }
+      try { child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
+    };
+    state.close = () => {
+      state.closed = true;
+      if (child.exitCode === null) {
+        child.kill('SIGTERM');
+        setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+      }
+    };
+    return state;
+  });
+}
+
+const relays = new Set();
+const httpRelays = new Map(); // id -> {pipe, queue, waiter, waiterTimer, lastSeen}
+
+function attachRelay(ws) {
+  let closed = false;
+  let host = null;
+  const log = (line) => {
+    try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
+  };
+  try {
+    host = spawnHost({ serverRoot, log: (l) => console.error(l) });
+  } catch (err) {
+    log('[zcode-webui] failed to spawn host: ' + err.message);
+    ws.close(1011, 'host spawn failed');
+    return;
+  }
+  const { child } = host;
+  const relay = { ws, child };
+  relays.add(relay);
+  log('[zcode-webui] host spawned pid=' + child.pid);
+
+  // accept messages immediately (before the host handshake completes), buffer
+  // them and flush once the stdio pipe is ready — otherwise early frames are lost.
+  const pendingInbound = [];
+  ws.on('message', (data, isBinary) => {
+    if (closed) return;
+    if (!isBinary) return; // string messages are reserved for future control
+    pendingInbound.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+  });
+
+  handshake(child)
+    .then(({ hello, rest }) => {
+      if (closed) return;
+      log('[zcode-webui] handshake ok, host version=' + hello.version);
+      let framesIn = 0, framesOut = 0;
+      setInterval(() => {
+        if (framesIn || framesOut) console.error('[relay] frames in=' + framesIn + ' out=' + framesOut + ' (pid=' + child.pid + ')');
+      }, 15000).unref();
+      const parser = new FrameParser((payload) => {
+        framesOut++;
+        if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') {
+          const l = rpcLogLine('RPC-out', payload);
+          if (l) console.error('[rpc] ' + l);
+        }
+        if (closed || ws.readyState !== 1) return;
+        try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
+      });
+      parser.push(rest);
+      child.stdout.on('data', (d) => parser.push(d));
+      for (const p of pendingInbound.splice(0)) {
+        framesIn++;
+        try { child.stdin.write(encodeFrame(p)); } catch (_e) { /* ignore */ }
+      }
+      ws.on('message', (data, isBinary) => {
+        if (closed) return;
+        if (!isBinary) return; // string messages are reserved for future control
+        framesIn++;
+        const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') {
+          const l = rpcLogLine('RPC-in ', payload);
+          if (l) console.error('[rpc] ' + l);
+        }
+        try { child.stdin.write(encodeFrame(payload)); } catch (_e) { /* ignore */ }
+      });
+      ws.on('close', () => console.error('[ws] closed (pid=' + child.pid + ') frames in=' + framesIn + ' out=' + framesOut));
+    })
+    .catch((err) => {
+      log('[zcode-webui] handshake failed: ' + err.message);
+      ws.close(1011, 'host handshake failed');
+    });
+
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    relays.delete(relay);
+    if (child && child.exitCode === null) {
+      child.kill('SIGTERM');
+      setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+    }
+  };
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
+  child.on('exit', () => {
+    if (!closed) { try { ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ } }
+  });
+}
+
+// ---------- http server ----------
+const server = http.createServer((req, res) => {
+  // request logging (diagnostics)
+  if (!req.url.startsWith('/assets/') && !req.url.startsWith('/material-icons/') && !req.url.startsWith('/pdfjs/')) {
+    console.error('[http] ' + new Date().toISOString() + ' ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' ' + req.method + ' ' + req.url + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
+  }
+  let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  if (base) {
+    if (urlPath === base) {
+      res.writeHead(302, { Location: base + '/' });
+      return res.end();
+    }
+    if (!urlPath.startsWith(base + '/')) return send(res, 404, 'not found (outside base path)');
+    urlPath = urlPath.slice(base.length) || '/';
+  }
+  if (!urlPath.startsWith('/')) urlPath = '/' + urlPath;
+
+  // api
+  if (urlPath === '/api/health') {
+    return sendJson(res, 200, {
+      ok: true, name: 'zcode-webui', base,
+      rendererLoaded: existsSync(path.join(RENDERER_DIR, 'index.html')),
+      serverRoot: serverRoot || null, workspace: WORKSPACE,
+      login: loginState(), relays: relays.size,
+    });
+  }
+  if (urlPath === '/api/login/status') {
+    return sendJson(res, 200, {
+      ...loginState(),
+      running: !!loginRun && loginRun.child.exitCode === null,
+      url: loginRun ? loginRun.url() : null,
+      output: loginRun ? loginRun.output() : loginLog,
+    });
+  }
+  if (urlPath === '/api/login/start' && req.method === 'POST') {
+    if (!serverRoot) return sendJson(res, 500, { ok: false, error: 'zcode server runtime not found' });
+    if (loginRun && loginRun.child.exitCode === null) stopLogin(loginRun);
+    loginLog = '';
+    loginRun = startLogin({ serverRoot, oauthProxy: OAUTH_PROXY, log: (t) => { loginLog = (loginLog + t).slice(-8000); } });
+    loginRun.child.on('exit', (code) => {
+      loginLog += '[login] exited code=' + code + '\n';
+    });
+    return sendJson(res, 200, { ok: true, running: true });
+  }
+  if (urlPath === '/api/login/cancel' && req.method === 'POST') {
+    stopLogin(loginRun);
+    loginRun = null;
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // ---- HTTP fallback bridge (long-polling, works through any reverse proxy) ----
+  if (urlPath === '/bridge/open' && req.method === 'POST') {
+    return openHostPipe().then((pipe) => {
+      const id = randomUUID();
+      const entry = { pipe, queue: [], waiter: null, waiterTimer: null, lastSeen: Date.now() };
+      pipe.onFrame = (payload) => {
+        entry.lastSeen = Date.now();
+        if (entry.waiter) {
+          const w = entry.waiter;
+          entry.waiter = null;
+          clearTimeout(entry.waiterTimer);
+          w(payload);
+        } else {
+          entry.queue.push(payload);
+          if (entry.queue.length > 256) entry.queue.shift();
+        }
+      };
+      pipe.onExit = () => {
+        if (entry.waiter) {
+          const w = entry.waiter;
+          entry.waiter = null;
+          clearTimeout(entry.waiterTimer);
+          w(null);
+        }
+      };
+      httpRelays.set(id, entry);
+      console.error('[bridge] http session opened id=' + id + ' host=' + pipe.hello.version);
+      sendJson(res, 200, { ok: true, id, hostVersion: pipe.hello.version });
+    }).catch((err) => {
+      console.error('[bridge] open failed: ' + err.message);
+      sendJson(res, 500, { ok: false, error: err.message });
+    });
+  }
+  if (urlPath === '/bridge/send' && req.method === 'POST') {
+    const id = new URL(req.url, 'http://x').searchParams.get('id');
+    const entry = httpRelays.get(id);
+    if (!entry || entry.pipe.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
+    entry.lastSeen = Date.now();
+    const chunks = [];
+    req.on('data', (d) => chunks.push(d));
+    req.on('end', () => {
+      const ok = entry.pipe.push(Buffer.concat(chunks));
+      sendJson(res, ok ? 200 : 410, { ok });
+    });
+    return;
+  }
+  if (urlPath === '/bridge/poll' && req.method === 'GET') {
+    const id = new URL(req.url, 'http://x').searchParams.get('id');
+    const entry = httpRelays.get(id);
+    if (!entry || entry.pipe.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
+    entry.lastSeen = Date.now();
+    const hdrs = { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' };
+    const frames = entry.queue.splice(0, entry.queue.length);
+    if (frames.length > 0) {
+      const parts = frames.map((f) => {
+        const h = Buffer.alloc(4);
+        h.writeUInt32BE(f.length, 0);
+        return Buffer.concat([h, f]);
+      });
+      res.writeHead(200, hdrs);
+      return res.end(Buffer.concat(parts));
+    }
+    entry.waiter = (payload) => {
+      res.writeHead(200, hdrs);
+      if (payload) {
+        const h = Buffer.alloc(4);
+        h.writeUInt32BE(payload.length, 0);
+        res.end(Buffer.concat([h, payload]));
+      } else {
+        res.end(Buffer.alloc(0));
+      }
+    };
+    entry.waiterTimer = setTimeout(() => {
+      if (entry.waiter) {
+        const w = entry.waiter;
+        entry.waiter = null;
+        w(Buffer.alloc(0));
+      }
+    }, 25000).unref();
+    return;
+  }
+  if (urlPath === '/bridge/close' && req.method === 'POST') {
+    const id = new URL(req.url, 'http://x').searchParams.get('id');
+    const entry = httpRelays.get(id);
+    if (entry) {
+      entry.pipe.close();
+      httpRelays.delete(id);
+    }
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // import credentials (e.g. exported from an already-logged-in ZCode desktop)
+  if (urlPath === '/api/login/import' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 262144) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const j = JSON.parse(body);
+        const creds = j && j.credentials && typeof j.credentials === 'object' ? j.credentials : null;
+        if (!creds) return sendJson(res, 400, { ok: false, error: 'missing credentials object' });
+        if (!creds['oauth:zai:access_token'] && !creds.zaiAccessToken) {
+          return sendJson(res, 400, { ok: false, error: 'no zai access token in credentials' });
+        }
+        const p = credentialsPath();
+        mkdirSync(path.dirname(p), { recursive: true });
+        writeFileSync(p, JSON.stringify(creds, null, 2), { mode: 0o600 });
+        console.error('[login] credentials imported to ' + p);
+        sendJson(res, 200, { ok: true, ...loginState() });
+      } catch (e) {
+        sendJson(res, 400, { ok: false, error: String(e && e.message || e) });
+      }
+    });
+    return;
+  }
+
+  // directory listing for the web directory picker
+  if (urlPath === '/api/fs/list' && req.method === 'GET') {
+    const q = new URL(req.url, 'http://x').searchParams;
+    let p = (q.get('path') || WORKSPACE || os.homedir()).trim();
+    if (!p || !path.isAbsolute(p)) p = os.homedir();
+    try {
+      const entries = readdirSync(p, { withFileTypes: true });
+      const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+      sendJson(res, 200, { ok: true, path: p, parent: path.dirname(p), dirs });
+    } catch (e) {
+      sendJson(res, 200, { ok: false, error: String(e && e.message || e) });
+    }
+    return;
+  }
+
+  // browser-side diagnostics: POST {href, message, stack}
+  if (urlPath === '/api/log' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 16384) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const j = JSON.parse(body);
+        console.error('[browser] ' + (j.href || '?') + ' | ' + j.kind + ' | ' + String(j.message || '').slice(0, 500));
+        if (j.stack) console.error('[browser:stack] ' + String(j.stack).slice(0, 2000));
+      } catch (_e) { console.error('[browser] (unparseable log body)'); }
+      sendJson(res, 200, { ok: true });
+    });
+    return;
+  }
+
+  // webui injected assets
+  if (urlPath.startsWith('/__zcode_webui/')) {
+    const f = safeJoin(WEB_DIR, urlPath.slice('/__zcode_webui/'.length).split('?')[0]);
+    return f ? serveFile(res, f) : send(res, 404, 'not found');
+  }
+
+  // login page
+  if (urlPath === '/login') {
+    const f = path.join(WEB_DIR, 'login.html');
+    const html = existsSync(f) ? readFileSync(f, 'utf8') : '<h1>missing login.html</h1>';
+    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  }
+
+  // debug self-check page
+  if (urlPath === '/debug') {
+    const f = path.join(WEB_DIR, 'debug.html');
+    const html = existsSync(f) ? readFileSync(f, 'utf8') : '<h1>missing debug.html</h1>';
+    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  }
+
+  // web directory picker (replaces the desktop-native folder dialog)
+  if (urlPath === '/picker.html') {
+    const f = path.join(WEB_DIR, 'picker.html');
+    const html = existsSync(f) ? readFileSync(f, 'utf8') : '<h1>missing picker.html</h1>';
+    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  }
+
+  // desktop credentials export tool (runs entirely in the browser)
+  if (urlPath === '/export-credentials.html') {
+    const f = path.join(WEB_DIR, 'export-credentials.html');
+    const html = existsSync(f) ? readFileSync(f, 'utf8') : '<h1>missing export-credentials.html</h1>';
+    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  }
+
+  // official renderer
+  if (urlPath === '/' || urlPath === '/index.html') {
+    const html = readRendererIndex();
+    if (!html) return send(res, 503, 'renderer missing: run npm run fetch-renderer');
+    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  }
+  const f = safeJoin(RENDERER_DIR, urlPath.slice(1));
+  return f ? serveFile(res, f) : send(res, 404, 'not found');
+});
+
+// ---------- websocket ----------
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  if (base) {
+    if (urlPath === base) urlPath = base + '/';
+    if (!urlPath.startsWith(base + '/')) return socket.destroy();
+    urlPath = urlPath.slice(base.length) || '/';
+  }
+  if (urlPath !== '/ws') return socket.destroy();
+  const token = new URL(req.url, 'http://x').searchParams.get('token');
+  if (token !== WS_TOKEN) {
+    console.error('[ws] rejected upgrade with bad/missing token from ' + req.socket.remoteAddress);
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    return socket.destroy();
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+wss.on('connection', (ws, req) => {
+  console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
+  ws.send(WS_READY);
+  attachRelay(ws);
+});
+
+// ---------- start ----------
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('[zcode-webui] listening on http://0.0.0.0:' + PORT + base + '/');
+  console.log('[zcode-webui] base path : ' + (base || '(root)'));
+  console.log('[zcode-webui] workspace  : ' + WORKSPACE);
+  console.log('[zcode-webui] serverRoot : ' + (serverRoot || '(missing)'));
+  console.log('[zcode-webui] renderer   : ' + (existsSync(path.join(RENDERER_DIR, 'index.html')) ? 'ready' : 'MISSING (run: npm run fetch-renderer)'));
+});
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+function shutdown() {
+  console.log('[zcode-webui] shutting down');
+  for (const r of relays) {
+    try { r.child.kill('SIGTERM'); } catch (_e) { /* ignore */ }
+  }
+  stopLogin(loginRun);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 3000).unref();
+}

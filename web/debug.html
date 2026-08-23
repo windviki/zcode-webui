@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>zcode-webui 自检</title>
+<style>
+  body { margin: 0; background: #111418; color: #e8eaed; font-family: system-ui, sans-serif; padding: 24px; }
+  pre { background: #1b1f24; border: 1px solid #2c3138; border-radius: 8px; padding: 12px; white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.6; }
+  .ok { color: #7fd18b; } .fail { color: #ffb4ab; } .info { color: #9aa3ad; }
+</style>
+</head>
+<body>
+<h2>zcode-webui 自检</h2>
+<pre id="out">开始…</pre>
+<script>
+(function () {
+  var out = document.getElementById('out');
+  var lines = [];
+  function log(kind, msg) {
+    lines.push((kind === 'ok' ? '[OK]   ' : kind === 'fail' ? '[FAIL] ' : '[INFO] ') + msg);
+    out.textContent = lines.join('\n');
+    try {
+      fetch('api/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ href: location.href, kind: 'debug-' + kind, message: msg.slice(0, 400) }), keepalive: true });
+    } catch (e) { /* ignore */ }
+  }
+  log('info', 'href=' + location.href);
+  log('info', 'ua=' + navigator.userAgent);
+  var base = location.pathname.replace(/[^/]*$/, '');
+  log('info', 'base=' + base);
+
+  // 1. POST bridge/open
+  fetch(base + 'bridge/open', { method: 'POST' })
+    .then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); })
+    .then(function (o) {
+      if (o.j && o.j.ok) { log('ok', 'POST bridge/open -> ' + o.j.id + ' host=' + o.j.hostVersion); window.__sid = o.j.id; return testPoll(); }
+      log('fail', 'POST bridge/open status=' + o.status + ' body=' + JSON.stringify(o.j).slice(0, 200));
+      return testWs();
+    })
+    .catch(function (e) { log('fail', 'POST bridge/open threw: ' + (e.message || e)); return testWs(); });
+
+  function testPoll() {
+    // The host pushes its first protocol payload right after the stdio handshake;
+    // receiving it here proves the full backend bridge (host spawn + handshake + queue).
+    var t0 = Date.now();
+    return fetch(base + 'bridge/poll?id=' + window.__sid)
+      .then(function (r) { return r.arrayBuffer(); })
+      .then(function (buf) {
+        if (buf.byteLength > 0) {
+          var hex = Array.prototype.map.call(new Uint8Array(buf).slice(0, 32), function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+          log('ok', 'bridge/poll -> ' + buf.byteLength + ' bytes in ' + (Date.now() - t0) + 'ms hex=' + hex);
+        } else {
+          log('fail', 'bridge/poll -> 0 bytes in ' + (Date.now() - t0) + 'ms (no payload from host)');
+        }
+        testWs();
+      })
+      .catch(function (e) { log('fail', 'bridge/poll threw: ' + (e.message || e)); testWs(); });
+  }
+
+  function testWs() {
+    var wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + base + 'ws';
+    log('info', 'trying WebSocket ' + wsUrl);
+    var ws = new WebSocket(wsUrl);
+    var done = false;
+    var timer = setTimeout(function () {
+      if (!done) { log('fail', 'ws: no open/close after 5s (hung)'); }
+    }, 5000);
+    ws.onopen = function () { done = true; clearTimeout(timer); log('ok', 'ws: OPENED'); ws.close(); };
+    ws.onerror = function () { log('info', 'ws: error event'); };
+    ws.onclose = function (ev) { done = true; clearTimeout(timer); log('info', 'ws: closed code=' + ev.code); };
+    log('info', 'done');
+  }
+})();
+</script>
+</body>
+</html>

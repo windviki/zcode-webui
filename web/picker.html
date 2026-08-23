@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>选择文件夹</title>
+<style>
+  body { margin: 0; background: #111418; color: #e8eaed; font-family: system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 12px 14px; border-bottom: 1px solid #2c3138; display: flex; gap: 8px; align-items: center; }
+  input { flex: 1; background: #14171b; color: #e8eaed; border: 1px solid #2c3138; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+  button { background: #2f6fed; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button.sec { background: #3a4048; }
+  main { flex: 1; overflow: auto; padding: 8px; }
+  .row { padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row:hover { background: #262b31; }
+  .row.parent { color: #9aa3ad; }
+  .row.selected { background: #1f3d6e; }
+  footer { padding: 10px 14px; border-top: 1px solid #2c3138; display: flex; justify-content: flex-end; gap: 8px; }
+  #status { color: #ffb4ab; font-size: 12px; padding: 0 14px 6px; }
+</style>
+</head>
+<body>
+<header>
+  <input id="path" placeholder="留空使用服务端默认工作区" />
+  <button class="sec" id="go">跳转</button>
+</header>
+<div id="status"></div>
+<main id="list"></main>
+<footer>
+  <button class="sec" id="cancel">取消</button>
+  <button id="ok">选择当前目录</button>
+</footer>
+<script>
+(function () {
+  'use strict';
+  var listEl = document.getElementById('list');
+  var pathEl = document.getElementById('path');
+  var statusEl = document.getElementById('status');
+  var current = '';
+  var picked = '';
+
+  function sendToOpener(msg) {
+    try { window.opener.postMessage(msg, '*'); } catch (e) { /* ignore */ }
+    window.close();
+  }
+  function load(p) {
+    statusEl.textContent = '';
+    fetch('api/fs/list?path=' + encodeURIComponent(p))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) { statusEl.textContent = j.error || '读取失败'; return; }
+        current = j.path;
+        picked = j.path;
+        pathEl.value = j.path;
+        listEl.innerHTML = '';
+        if (j.parent !== j.path) {
+          var up = document.createElement('div');
+          up.className = 'row parent';
+          up.textContent = '.. （' + j.parent + '）';
+          up.addEventListener('click', function () { load(j.parent); });
+          listEl.appendChild(up);
+        }
+        (j.dirs || []).forEach(function (name) {
+          var row = document.createElement('div');
+          row.className = 'row';
+          row.textContent = name;
+          row.addEventListener('click', function () { load(j.path + (j.path === '/' ? '' : '/') + name); });
+          listEl.appendChild(row);
+        });
+      })
+      .catch(function (e) { statusEl.textContent = '请求失败: ' + e.message; });
+  }
+  document.getElementById('go').addEventListener('click', function () { load(pathEl.value.trim()); });
+  pathEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') load(pathEl.value.trim()); });
+  document.getElementById('ok').addEventListener('click', function () {
+    if (!current) return;
+    sendToOpener({ type: 'zcode-dir-picked', path: current });
+  });
+  document.getElementById('cancel').addEventListener('click', function () {
+    sendToOpener({ type: 'zcode-dir-cancelled' });
+  });
+  load(pathEl.value.trim());
+})();
+</script>
+</body>
+</html>
