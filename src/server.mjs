@@ -64,6 +64,31 @@ try {
 const WS_TOKEN = randomUUID();
 const WS_READY = '{"kind":"zcode-webui-ready"}';
 
+// ---------- client identity ----------
+// A long-lived cookie identifies the browser (all tabs share it), a sessionStorage
+// tab id identifies one tab across reloads. Together they let us re-attach a tab to
+// the host process it was using before a reload / disconnect, so tasks keep running
+// in the background instead of dying with the tab.
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of String(header).split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) {
+      try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); } catch (_e) { /* ignore */ }
+    }
+  }
+  return out;
+}
+const CLIENT_COOKIE = 'zwebui_client';
+function sessionKey(clientKey, tabId) {
+  return (clientKey || ('tab:' + tabId)) + ':' + (tabId || 'untabbed');
+}
+
+// Detached hosts (tab closed) are kept alive so their tasks can finish. Set a TTL to
+// reap hosts that have been detached for longer than this (0 = keep forever).
+const DETACHED_TTL_MS = Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS || 0);
+
 // persistent device id for the renderer
 const DEVICE_FILE = path.join(ROOT, 'data', 'device-id.json');
 let deviceId = '';
@@ -205,91 +230,213 @@ function openHostPipe() {
   });
 }
 
-const relays = new Set();
-const httpRelays = new Map(); // id -> {pipe, queue, waiter, waiterTimer, lastSeen}
+// ---------- host sessions ----------
+// One host process per (clientKey, tabId) session. Hosts are NOT killed when the
+// browser tab / websocket goes away: they keep running their turns in the background
+// and can be re-attached by a later tab (same tab id after a reload, or any tab of
+// the same browser adopting a detached host).
+const sessions = new Map();       // sessionKey -> session
+const clientSessions = new Map(); // clientKey -> Set(session)
+const httpRelays = new Map();     // id -> {pipe, queue, waiter, waiterTimer, lastSeen} (HTTP long-poll fallback)
 
-function attachRelay(ws) {
-  let closed = false;
-  let host = null;
-  const log = (line) => {
-    try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
-  };
-  try {
-    host = spawnHost({ serverRoot, log: (l) => console.error(l) });
-  } catch (err) {
-    log('[zcode-webui] failed to spawn host: ' + err.message);
-    ws.close(1011, 'host spawn failed');
-    return;
+function rpcLogOut(payload) {
+  const l = rpcLogLine('RPC-out', payload);
+  if (l) console.error('[rpc] ' + l);
+}
+function rpcLogIn(payload) {
+  const l = rpcLogLine('RPC-in ', payload);
+  if (l) console.error('[rpc] ' + l);
+}
+
+function writeToHost(session, payload) {
+  if (session.closed) return false;
+  session.framesIn++;
+  // protect the host: only forward payloads that look like serialized channel
+  // messages (first byte is an RPC preset 0..6); drop flow-control JSON etc.
+  if (!payload || payload.length === 0 || payload[0] > 6) {
+    console.error('[bridge] dropped non-protocol inbound payload ' + payload.length + 'B first=' + (payload[0] ?? 'nil'));
+    return true;
   }
-  const { child } = host;
-  const relay = { ws, child };
-  relays.add(relay);
-  log('[zcode-webui] host spawned pid=' + child.pid);
+  if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
+  try { session.child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
+}
 
-  // accept messages immediately (before the host handshake completes), buffer
-  // them and flush once the stdio pipe is ready — otherwise early frames are lost.
-  const pendingInbound = [];
-  ws.on('message', (data, isBinary) => {
-    if (closed) return;
-    if (!isBinary) return; // string messages are reserved for future control
-    pendingInbound.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+function removeSession(session) {
+  for (const [k, s] of sessions) if (s === session) sessions.delete(k);
+  const set = clientSessions.get(session.clientKey);
+  if (set) {
+    set.delete(session);
+    if (set.size === 0) clientSessions.delete(session.clientKey);
+  }
+}
+
+function terminateSession(session, reason) {
+  if (!session) return;
+  session.closed = true;
+  if (session.ws) { try { session.ws.close(1011, 'host terminated'); } catch (_e) { /* ignore */ } }
+  const child = session.child;
+  if (child && child.exitCode === null) {
+    console.error('[zcode-webui] terminating host pid=' + child.pid + ' reason=' + reason);
+    child.kill('SIGTERM');
+    setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+  }
+  removeSession(session);
+}
+
+function createSession(clientKey, tabId) {
+  let child;
+  try {
+    const host = spawnHost({ serverRoot, log: (l) => console.error(l) });
+    child = host.child;
+  } catch (err) {
+    throw new Error('failed to spawn host: ' + err.message);
+  }
+  const session = {
+    id: randomUUID(), clientKey, tabId, child, hello: null,
+    ws: null, wsAttachedAt: 0, detachedAt: 0,
+    framesIn: 0, framesOut: 0, pendingInbound: [], closed: false,
+  };
+  console.error('[zcode-webui] host spawned pid=' + child.pid + ' client=' + (clientKey || '(no-cookie)') + '/' + (tabId || '').slice(0, 8));
+  sessions.set(sessionKey(clientKey, tabId), session);
+  let set = clientSessions.get(clientKey);
+  if (!set) { set = new Set(); clientSessions.set(clientKey, set); }
+  set.add(session);
+
+  // stdout must be drained forever — even with no tab attached — so the pipe never
+  // fills up and blocks the host while it keeps working in the background.
+  const parser = new FrameParser((payload) => {
+    session.framesOut++;
+    // remember the host's Initialize frame (the first thing it pushes after the
+    // stdio handshake) so we can replay it to a freshly re-attached renderer —
+    // the renderer only starts its boot sequence after receiving it.
+    if (session.framesOut === 1) session.initializePayload = Buffer.from(payload);
+    if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogOut(payload);
+    const ws = session.ws;
+    if (!session.closed && ws && ws.readyState === 1) {
+      try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
+    }
+  });
+  session.parser = parser;
+  session.initializePayload = null;
+  child.on('exit', (code, signal) => {
+    session.closed = true;
+    if (session.ws) { try { session.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ } }
+    console.error('[zcode-webui] host exited pid=' + child.pid + ' code=' + code + ' signal=' + signal + (session.detachedAt ? ' (was detached)' : ''));
+    removeSession(session);
   });
 
   handshake(child)
     .then(({ hello, rest }) => {
-      if (closed) return;
-      log('[zcode-webui] handshake ok, host version=' + hello.version);
-      let framesIn = 0, framesOut = 0;
-      setInterval(() => {
-        if (framesIn || framesOut) console.error('[relay] frames in=' + framesIn + ' out=' + framesOut + ' (pid=' + child.pid + ')');
-      }, 15000).unref();
-      const parser = new FrameParser((payload) => {
-        framesOut++;
-        if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') {
-          const l = rpcLogLine('RPC-out', payload);
-          if (l) console.error('[rpc] ' + l);
-        }
-        if (closed || ws.readyState !== 1) return;
-        try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
-      });
+      if (session.closed) return;
+      session.hello = hello;
+      console.error('[zcode-webui] handshake ok pid=' + child.pid + ' host=' + hello.version);
+      // attach the stdout drain only after the handshake consumed the hello line —
+      // otherwise the hello JSON would contaminate the frame parser's buffer
       parser.push(rest);
       child.stdout.on('data', (d) => parser.push(d));
-      for (const p of pendingInbound.splice(0)) {
-        framesIn++;
-        try { child.stdin.write(encodeFrame(p)); } catch (_e) { /* ignore */ }
+      for (const p of session.pendingInbound.splice(0)) writeToHost(session, p);
+      if (session.ws && session.ws.readyState === 1) {
+        try { session.ws.send('[zcode-webui] handshake ok, host version=' + hello.version); } catch (_e) { /* ignore */ }
       }
-      ws.on('message', (data, isBinary) => {
-        if (closed) return;
-        if (!isBinary) return; // string messages are reserved for future control
-        framesIn++;
-        const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') {
-          const l = rpcLogLine('RPC-in ', payload);
-          if (l) console.error('[rpc] ' + l);
-        }
-        try { child.stdin.write(encodeFrame(payload)); } catch (_e) { /* ignore */ }
-      });
-      ws.on('close', () => console.error('[ws] closed (pid=' + child.pid + ') frames in=' + framesIn + ' out=' + framesOut));
     })
     .catch((err) => {
-      log('[zcode-webui] handshake failed: ' + err.message);
-      ws.close(1011, 'host handshake failed');
+      console.error('[zcode-webui] handshake failed pid=' + child.pid + ': ' + err.message);
+      if (session.ws) { try { session.ws.close(1011, 'host handshake failed'); } catch (_e) { /* ignore */ } }
+      terminateSession(session, 'handshake failed');
     });
 
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    relays.delete(relay);
-    if (child && child.exitCode === null) {
-      child.kill('SIGTERM');
-      setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+  const timer = setInterval(() => {
+    if (session.closed) { clearInterval(timer); return; }
+    if (session.framesIn || session.framesOut) {
+      console.error('[relay] frames in=' + session.framesIn + ' out=' + session.framesOut + ' (pid=' + child.pid + (session.ws ? '' : ', detached') + ')');
     }
+  }, 15000);
+  timer.unref();
+
+  return session;
+}
+
+function rebindSession(session, clientKey, tabId) {
+  for (const [k, s] of sessions) if (s === session) sessions.delete(k);
+  let set = clientSessions.get(session.clientKey);
+  if (set) {
+    set.delete(session);
+    if (set.size === 0) clientSessions.delete(session.clientKey);
+  }
+  session.clientKey = clientKey;
+  session.tabId = tabId;
+  sessions.set(sessionKey(clientKey, tabId), session);
+  set = clientSessions.get(clientKey);
+  if (!set) { set = new Set(); clientSessions.set(clientKey, set); }
+  set.add(session);
+}
+
+function attachRelay(ws, session) {
+  // reload race: a previous websocket for the same (client, tab) may still be open;
+  // park it so only one connection drives the host at a time.
+  const prev = session.ws;
+  if (prev && prev !== ws) {
+    try { prev.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
+  }
+  session.ws = ws;
+  session.wsAttachedAt = Date.now();
+  const reattach = !!session.detachedAt;
+  session.detachedAt = 0;
+  console.error('[zcode-webui] host ' + (reattach ? 'REATTACHED' : 'attached') + ' pid=' + session.child.pid + ' client=' + (session.clientKey || '(no-cookie)') + '/' + (session.tabId || '').slice(0, 8));
+
+  const log = (line) => {
+    try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
   };
-  ws.on('close', cleanup);
-  ws.on('error', cleanup);
-  child.on('exit', () => {
-    if (!closed) { try { ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ } }
+  log('[zcode-webui] host ' + (reattach ? 'reattached' : 'spawned') + ' pid=' + session.child.pid);
+  if (reattach && session.initializePayload) {
+    // kick the fresh renderer's boot sequence by replaying the host Initialize
+    try { ws.send(session.initializePayload, { binary: true }); } catch (_e) { /* ignore */ }
+    console.error('[zcode-webui] replayed host initialize to re-attached renderer pid=' + session.child.pid);
+  }
+
+  ws.on('message', (data, isBinary) => {
+    if (session.closed) return;
+    if (!isBinary) return; // string messages are reserved for future control
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (session.hello) writeToHost(session, payload);
+    else session.pendingInbound.push(payload);
   });
+
+  ws.on('close', (code) => {
+    if (session.ws !== ws) return; // superseded by a newer attachment
+    session.ws = null;
+    if (code === 4000) {
+      // explicit terminate request (tests / cleanup)
+      console.error('[ws] terminate (code 4000) pid=' + session.child.pid);
+      terminateSession(session, 'ws terminate');
+      return;
+    }
+    if (session.closed) return;
+    if (session.framesIn === 0 && session.framesOut === 0) {
+      // closed before any traffic: nothing was started, free the host
+      console.error('[ws] closed before traffic, terminating host pid=' + session.child.pid);
+      terminateSession(session, 'closed before traffic');
+      return;
+    }
+    // DETACH: the host keeps running in the background until its task finishes,
+    // waits for user input, or is re-attached by another tab.
+    session.detachedAt = Date.now();
+    console.error('[ws] DETACHED (host keeps running) pid=' + session.child.pid + ' frames in=' + session.framesIn + ' out=' + session.framesOut);
+  });
+  ws.on('error', () => { /* close follows */ });
+}
+
+// Optional reaper for hosts that stay detached for a long time (off by default).
+if (DETACHED_TTL_MS > 0) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const s of [...sessions.values()]) {
+      if (!s.closed && !s.ws && s.detachedAt && now - s.detachedAt > DETACHED_TTL_MS) {
+        console.error('[zcode-webui] reaping host detached for ' + Math.round((now - s.detachedAt) / 1000) + 's pid=' + s.child.pid);
+        terminateSession(s, 'detached ttl');
+      }
+    }
+  }, 30000).unref();
 }
 
 // ---------- http server ----------
@@ -297,6 +444,10 @@ const server = http.createServer((req, res) => {
   // request logging (diagnostics)
   if (!req.url.startsWith('/assets/') && !req.url.startsWith('/material-icons/') && !req.url.startsWith('/pdfjs/')) {
     console.error('[http] ' + new Date().toISOString() + ' ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' ' + req.method + ' ' + req.url + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
+  }
+  // browser identity cookie: lets a re-opened tab adopt the host it left running
+  if (!parseCookies(req.headers.cookie)[CLIENT_COOKIE]) {
+    res.setHeader('Set-Cookie', CLIENT_COOKIE + '=' + randomUUID() + '; Path=/; SameSite=Lax; HttpOnly; Max-Age=31536000');
   }
   let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
   if (base) {
@@ -311,11 +462,18 @@ const server = http.createServer((req, res) => {
 
   // api
   if (urlPath === '/api/health') {
+    const all = [...sessions.values()];
     return sendJson(res, 200, {
       ok: true, name: 'zcode-webui', base,
       rendererLoaded: existsSync(path.join(RENDERER_DIR, 'index.html')),
       serverRoot: serverRoot || null, workspace: WORKSPACE,
-      login: loginState(), relays: relays.size,
+      login: loginState(),
+      sessions: {
+        total: all.length,
+        attached: all.filter((s) => !s.closed && s.ws).length,
+        detached: all.filter((s) => !s.closed && !s.ws).length,
+      },
+      httpRelays: httpRelays.size,
     });
   }
   if (urlPath === '/api/login/status') {
@@ -433,6 +591,17 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 200, { ok: true });
   }
 
+  if (urlPath === '/api/sessions/terminate' && req.method === 'POST') {
+    // ops endpoint: terminate every host session (attached + detached) immediately
+    const n = sessions.size;
+    for (const s of [...sessions.values()]) terminateSession(s, 'api terminate');
+    for (const [, entry] of httpRelays) {
+      try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+    }
+    httpRelays.clear();
+    return sendJson(res, 200, { ok: true, terminated: n });
+  }
+
   // import credentials (e.g. exported from an already-logged-in ZCode desktop)
   if (urlPath === '/api/login/import' && req.method === 'POST') {
     let body = '';
@@ -541,20 +710,58 @@ server.on('upgrade', (req, socket, head) => {
     urlPath = urlPath.slice(base.length) || '/';
   }
   if (urlPath !== '/ws') return socket.destroy();
-  const token = new URL(req.url, 'http://x').searchParams.get('token');
+  const q = new URL(req.url, 'http://x').searchParams;
+  const token = q.get('token');
   if (token !== WS_TOKEN) {
     console.error('[ws] rejected upgrade with bad/missing token from ' + req.socket.remoteAddress);
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     return socket.destroy();
   }
+  // resolve the host session this connection should drive:
+  // 1. same (client, tab) as an existing session          -> re-attach (page reload)
+  // 2. ?takeover=1 with an active session for this client -> steal it (parked tab takes back over)
+  // 3. a detached session of this client                  -> adopt it (tab reopened after close)
+  // 4. otherwise                                          -> spawn a fresh host
+  const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+  const tabId = (q.get('tab') || '').slice(0, 128);
+  const takeover = q.get('takeover') === '1';
+  let session = sessions.get(sessionKey(clientKey, tabId));
+  if (session && session.closed) session = null;
+  if (!session && takeover && clientKey) {
+    const actives = [...(clientSessions.get(clientKey) || [])].filter((s) => !s.closed && s.ws);
+    if (actives.length) {
+      session = actives[0];
+      console.error('[zcode-webui] takeover: tab ' + tabId.slice(0, 8) + ' steals active host pid=' + session.child.pid);
+      rebindSession(session, clientKey, tabId);
+    }
+  }
+  if (!session && clientKey) {
+    const detached = [...(clientSessions.get(clientKey) || [])]
+      .filter((s) => !s.closed && !s.ws)
+      .sort((a, b) => (b.detachedAt || 0) - (a.detachedAt || 0));
+    if (detached.length) {
+      session = detached[0];
+      console.error('[zcode-webui] adopt detached host pid=' + session.child.pid + ' for tab ' + tabId.slice(0, 8));
+      rebindSession(session, clientKey, tabId);
+    }
+  }
+  if (!session) {
+    try {
+      session = createSession(clientKey, tabId);
+    } catch (err) {
+      console.error('[ws] host spawn failed: ' + err.message);
+      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      return socket.destroy();
+    }
+  }
   wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
+    wss.emit('connection', ws, req, session);
   });
 });
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws, req, session) => {
   console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
   ws.send(WS_READY);
-  attachRelay(ws);
+  attachRelay(ws, session);
 });
 
 // ---------- start ----------
@@ -570,9 +777,13 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 function shutdown() {
   console.log('[zcode-webui] shutting down');
-  for (const r of relays) {
-    try { r.child.kill('SIGTERM'); } catch (_e) { /* ignore */ }
+  for (const s of [...sessions.values()]) {
+    terminateSession(s, 'server shutdown');
   }
+  for (const [, entry] of httpRelays) {
+    try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+  }
+  httpRelays.clear();
   stopLogin(loginRun);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();

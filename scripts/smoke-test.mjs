@@ -95,7 +95,7 @@ const wsResult = await new Promise((resolve) => {
   const log = [];
   let initialized = false;
   let replied = false;
-  const timer = setTimeout(() => { try { ws.close(); } catch (e) {} resolve({ ok: false, log, reason: 'timeout' }); }, 25000);
+  const timer = setTimeout(() => { try { ws.close(4000, 'terminate'); } catch (e) {} resolve({ ok: false, log, reason: 'timeout' }); }, 25000);
 
   ws.on('open', () => log.push('open'));
   ws.on('message', (data, isBinary) => {
@@ -119,7 +119,7 @@ const wsResult = await new Promise((resolve) => {
       replied = true;
       log.push('got reply to system.info (round-trip OK)');
       clearTimeout(timer);
-      try { ws.close(); } catch (e) {}
+      try { ws.close(4000, 'terminate'); } catch (e) {}
       resolve({ ok: true, log });
     }
   });

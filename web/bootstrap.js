@@ -9,6 +9,23 @@
   var cfg = window.__ZCODE_WEBUI_CONFIG__ || {};
   var base = cfg.base || '';
 
+  // ---- tab identity (survives reloads, unique per tab) + takeover flag ----
+  var TAB_ID = '';
+  try { TAB_ID = sessionStorage.getItem('zwebui_tab') || ''; } catch (e) { /* ignore */ }
+  if (!TAB_ID) {
+    TAB_ID = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+    try { sessionStorage.setItem('zwebui_tab', TAB_ID); } catch (e) { /* ignore */ }
+  }
+  var TAKEOVER = '0';
+  try {
+    var initQs = new URLSearchParams(window.location.search);
+    if (initQs.get('takeover') === '1') {
+      TAKEOVER = '1';
+      initQs.delete('takeover');
+      window.history.replaceState(null, '', window.location.pathname + (initQs.toString() ? '?' + initQs.toString() : ''));
+    }
+  } catch (e) { /* ignore */ }
+
   // ---- browser-side diagnostics: forward errors to the server log + visible banner ----
   var reported = 0;
   var lastDelivered = [];
@@ -54,6 +71,35 @@
     };
   })();
 
+  // superseded by another tab: park this page with an explicit take-back control
+  function parkWithNotice() {
+    mode = 'parked';
+    try {
+      var el = document.getElementById('zcode-webui-error');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'zcode-webui-error';
+        el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:60%;background:#2b0f10;color:#ffb4ab;font:12px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre-wrap;word-break:break-all;';
+        document.body.appendChild(el);
+      }
+      el.innerHTML = '';
+      var t = document.createElement('div');
+      t.textContent = '[zcode-webui] 本页面的会话已被另一个标签页接管，此页面已暂停。';
+      var b = document.createElement('button');
+      b.textContent = '接管回来';
+      b.style.cssText = 'margin-top:8px;background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;';
+      b.addEventListener('click', function () {
+        try {
+          var q = new URLSearchParams(window.location.search);
+          q.set('takeover', '1');
+          window.location.search = q.toString();
+        } catch (e) { window.location.reload(); }
+      });
+      el.appendChild(t);
+      el.appendChild(b);
+    } catch (e) { /* ignore */ }
+  }
+
   // ---- URL params for the official renderer ----
   try {
     var params = new URLSearchParams(window.location.search);
@@ -75,6 +121,15 @@
   var httpSessionId = null;
   var uplinkChain = Promise.resolve();
   var reloadAttempts = 0;
+  var portQueue = []; // binary frames that arrive before the renderer's port exists
+
+  function deliverToRenderer(u8) {
+    if (port2) {
+      try { port2.postMessage(u8, [u8.buffer]); } catch (e) { /* ignore */ }
+      return;
+    }
+    if (portQueue.length < 64) portQueue.push(u8);
+  }
 
   function deliverPort() {
     if (delivered) return;
@@ -90,6 +145,12 @@
         port2 = channel.port2;
         port2.onmessage = function (ev) { sendToBridge(ev.data); };
         window.__zb_port2 = port2;
+        // flush frames buffered while the port was not available yet (e.g. the host
+        // Initialize replayed by the backend right after a re-attach)
+        for (var q = 0; q < portQueue.length; q++) {
+          try { port2.postMessage(portQueue[q], [portQueue[q].buffer]); } catch (e) { /* ignore */ }
+        }
+        portQueue = [];
         window.postMessage('zcode:service-port', '*', [channel.port1]);
         return;
       }
@@ -134,9 +195,7 @@
         noteDelivered(hex, payload.length);
         console.debug('[zb-debug] deliver ' + payload.length + 'B ' + hex);
       }
-      if (port2) {
-        try { port2.postMessage(payload, [payload.buffer]); } catch (e) { /* ignore */ }
-      }
+      deliverToRenderer(payload);
     }
   }
 
@@ -186,7 +245,7 @@
     wsPath = p + 'ws';
   }
   var wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var wsUrl = wsProto + '//' + window.location.host + wsPath + '?token=' + (cfg.wsToken || '');
+  var wsUrl = wsProto + '//' + window.location.host + wsPath + '?token=' + (cfg.wsToken || '') + '&tab=' + encodeURIComponent(TAB_ID) + (TAKEOVER === '1' ? '&takeover=1' : '');
   var wsVerified = false;
   var WS_READY = '{"kind":"zcode-webui-ready"}';
 
@@ -210,24 +269,32 @@
         return;
       }
       if (typeof ev.data === 'string') { console.debug('[zcode-webui]', ev.data); return; }
-      if (port2) {
-        try {
-          // The official renderer's port transport accepts ONLY Uint8Array
-          // (e.data instanceof Uint8Array); an ArrayBuffer is silently dropped.
-          var u8 = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
-          if (window.__zb_debug || reported > 0) {
-            var hx = '';
-            for (var k = 0; k < Math.min(u8.length, 16); k++) hx += ('0' + u8[k].toString(16)).slice(-2);
-            noteDelivered(hx, u8.length);
-            console.debug('[zb-debug] ws deliver ' + u8.length + 'B ' + hx);
-          }
-          port2.postMessage(u8, [u8.buffer]);
-        } catch (e) { console.debug('[zcode-webui] port post error: ' + e.message); }
+      // The official renderer's port transport accepts ONLY Uint8Array
+      // (e.data instanceof Uint8Array); an ArrayBuffer is silently dropped.
+      var u8 = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
+      if (window.__zb_debug || reported > 0) {
+        var hx = '';
+        for (var k = 0; k < Math.min(u8.length, 16); k++) hx += ('0' + u8[k].toString(16)).slice(-2);
+        noteDelivered(hx, u8.length);
+        console.debug('[zb-debug] ws deliver ' + u8.length + 'B ' + hx);
       }
+      deliverToRenderer(u8);
     };
-    ws.onclose = function () {
+    ws.onclose = function (ev) {
       if (mode !== 'ws') return;
+      // 4001: another tab of this browser took over this page's session; park here
+      // (do NOT reload — that would ping-pong the takeover between tabs).
+      if (ev.code === 4001) { parkWithNotice(); return; }
       if (!wsOpened) { startHttpMode(); return; }
+      // host gone (terminated/exit): a fresh page load will spawn a new host
+      if (ev.code === 4000 || ev.code === 1011) {
+        reloadAttempts++;
+        if (reloadAttempts > 6) { report('ws-closed', 'bridge closed ' + reloadAttempts + ' times, stopped reloading (wsUrl=' + wsUrl + ')'); return; }
+        setTimeout(function () { window.location.reload(); }, 1500);
+        return;
+      }
+      // ordinary close / network drop: the backend keeps the host running in the
+      // background; reload and re-attach to the same session (same tab id).
       reloadAttempts++;
       if (reloadAttempts > 6) { report('ws-closed', 'bridge closed ' + reloadAttempts + ' times, stopped reloading (wsUrl=' + wsUrl + ')'); return; }
       setTimeout(function () { window.location.reload(); }, 1500);
