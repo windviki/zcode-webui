@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# official renderer assets (fetched at deploy time with scripts/fetch-renderer.sh)
+vendor/renderer/
+
+# runtime state / local secrets
+config.json
+data/
+tmp/
+
+# fetch script workdir
+.fetch-tmp/
+
+# logs, screenshots, OS files
+*.log
+npm-debug.log*
+.zcode-webui.json
+scripts/dev/*.png
+.DS_Store

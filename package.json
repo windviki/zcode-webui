@@ -1,0 +1,32 @@
+{
+  "name": "zcode-webui",
+  "version": "0.1.0",
+  "description": "Run the official ZCode desktop UI in any browser, backed by the official zcode-server runtime, with code-server integration.",
+  "type": "module",
+  "main": "src/server.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "fetch-renderer": "bash scripts/fetch-renderer.sh",
+    "smoke": "node scripts/smoke-test.mjs"
+  },
+  "keywords": [
+    "zcode",
+    "glm",
+    "bigmodel",
+    "zai",
+    "coding-agent",
+    "webui",
+    "code-server",
+    "browser"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.62.1"
+  }
+}
