@@ -34,6 +34,7 @@
   - [第 6 步 · 独立部署 / 自有反代](#第-6-步--独立部署--自有反代)
   - [第 7 步 · 开始使用](#第-7-步--开始使用)
 - [配置参考](#配置参考)
+- [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包)
 - [官方 CLI 直连（可选）](#官方-cli-直连可选)
 - [HTTP API](#http-api)
 - [安全须知](#安全须知)
@@ -81,6 +82,10 @@ zcode-webui **尽可能依托官方实现，不重复造轮子**：
 > 不包含任何官方代码；请遵守官方服务条款，模型调用费用按你订阅的官方套餐计费。
 
 ## 完整使用指南（从零到可用）
+
+> 想更快上手？项目已发布为 npm 包，三步完成部署：`npm install -g zcode-webui` →
+> `zcode-webui setup`（交互式向导引导全部准备工作与配置）→ `zcode-webui start`。
+> 详见 [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包) 与下面的手动步骤。
 
 ### 第 0 步 · 前置条件
 
@@ -272,10 +277,34 @@ location /zcode/ {
 | `ZCODE_WEBUI_HOST_PROXY` / `--host-proxy` | `hostProxy` | 空 | 官方运行时与 Agent 访问云 API / 模型 API 的 HTTP 代理，容器直连 `api.z.ai`、`open.bigmodel.cn` 不通时配置 |
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（`zcode-server.cjs` 所在，通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
+| `ZCODE_WEBUI_HOME` | — | `~/.zcode-webui`（npm 安装）/ 项目目录（git 部署） | 本服务的数据目录：`config.json`、下载的渲染层与设备标识。git 部署且项目根存在 `config.json` 或 `vendor/renderer` 时自动使用项目目录（向后兼容） |
 | `ZCODE_APP_VERSION` | — | 渲染层版本（自动读取） | 覆盖传给运行时版本号，一般不需要 |
 | `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.8.1` / `x64` | `npm run fetch-renderer` 的下载版本与架构 |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `0`（永不清理） | 后台会话（已无标签页连接）在断开超过该毫秒数后自动终止；`0` 表示一直保留到任务结束/重启服务 |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | 关 | 设 `1` 在服务端日志打印协议消息预览（联调用） |
+
+## zcode-webui 命令行（npm 包）
+
+项目已发布到 npm（包名 `zcode-webui`）。安装后可用向导完成「准备工作 → 配置 → 部署」全流程：
+
+```bash
+npm install -g zcode-webui      # 需要 Node.js ≥ 18
+zcode-webui setup               # 交互式向导（见下）
+zcode-webui start               # 启动服务（前台，Ctrl-C 停止）
+```
+
+| 命令 | 作用 |
+|---|---|
+| `zcode-webui setup` | 向导：环境检查（curl/dpkg-deb）→ 官方运行时 `~/.zcode/server` 检查与获取引导 → 登录凭据检查 → 从官方 CDN 下载渲染层 → 生成 `config.json` → 可选生成 systemd 用户单元 → 可选立即启动。支持 `--yes`（全部默认，不启动）与 `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`、`--no-fetch`、`--no-start`、`--no-systemd` 等参数 |
+| `zcode-webui start` | 前台启动服务（等价于 `node src/server.mjs`，参数透传） |
+| `zcode-webui fetch-renderer` | 下载/更新官方渲染层（`ZCODE_VERSION`/`ZCODE_ARCH` 可选覆盖） |
+| `zcode-webui doctor [--net]` | 环境与就绪状态检查（`--net` 附带 CDN/云 API 连通性检查） |
+| `zcode-webui status` | 打印服务健康状态（未运行返回非 0） |
+| `zcode-webui version` / `help` | 版本号 / 帮助 |
+
+npm 安装后，所有可变数据（配置、渲染层、设备标识、日志）存放在数据目录
+`~/.zcode-webui`（可用 `ZCODE_WEBUI_HOME` 覆盖；git 部署时自动沿用项目目录），
+包目录本身保持只读，升级用 `npm update -g zcode-webui`。
 
 ## 官方 CLI 直连（可选）
 
@@ -401,6 +430,8 @@ node scripts/dev/reattach-close-test.mjs # 真实 UI：任务中途关闭标签�
 
 ```
 src/server.mjs             HTTP 静态服务 + base path + WS 桥 + 登录 API
+src/cli.mjs                zcode-webui 命令行（setup 向导 / start / doctor / status 等）
+src/dirs.mjs               数据目录解析（ZCODE_WEBUI_HOME / 仓库模式）
 src/frame.mjs              stdio 帧编解码（与官方运行时互通）
 src/host.mjs               官方运行时进程拉起与握手
 src/login.mjs              官方 CLI OAuth 登录子进程管理

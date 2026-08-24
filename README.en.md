@@ -35,6 +35,7 @@ sessions and credentials stay on your own server.
   - [Step 6 · Standalone / your own reverse proxy](#step-6--standalone--your-own-reverse-proxy)
   - [Step 7 · Start using it](#step-7--start-using-it)
 - [Configuration reference](#configuration-reference)
+- [zcode-webui command line (npm package)](#zcode-webui-command-line-npm-package)
 - [Official CLI headless usage (optional)](#official-cli-headless-usage-optional)
 - [HTTP API](#http-api)
 - [Security notes](#security-notes)
@@ -86,6 +87,12 @@ download script once is enough to follow the official version.
 > official terms of service. Model usage is billed according to your official subscription.
 
 ## Complete usage guide (from zero to working)
+
+> Want to move faster? The project is published on npm — three commands to deploy:
+> `npm install -g zcode-webui` → `zcode-webui setup` (an interactive wizard that guides
+> all preparation and configuration) → `zcode-webui start`. See
+> [zcode-webui command line (npm package)](#zcode-webui-command-line-npm-package)
+> alongside the manual steps below.
 
 ### Step 0 · Prerequisites
 
@@ -286,10 +293,36 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_WEBUI_HOST_PROXY` / `--host-proxy` | `hostProxy` | empty | HTTP proxy for the official runtime/agent's cloud & model API calls; set when the container cannot reach `api.z.ai` / `open.bigmodel.cn` directly |
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | Official runtime directory (where `zcode-server.cjs` lives; usually no change needed) |
 | `ZCODE_HOME` | — | `~/.zcode` | Official data/credential directory (shared with the official CLI) |
+| `ZCODE_WEBUI_HOME` | — | `~/.zcode-webui` (npm install) / project dir (git deploy) | Data directory of this service: `config.json`, the downloaded renderer and the device id. Git deployments automatically use the project dir when it already contains `config.json` or `vendor/renderer` (backward compatible) |
 | `ZCODE_APP_VERSION` | — | renderer version (auto-detected) | Override the version passed to the runtime; normally not needed |
 | `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.8.1` / `x64` | Version and architecture for `npm run fetch-renderer` |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `0` (never) | Auto-terminate background sessions (no tab connected) after this many milliseconds; `0` keeps them until the task ends / the service restarts |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | off | Set `1` to log protocol message previews server-side (for debugging) |
+
+## zcode-webui command line (npm package)
+
+The project is published on npm (package name `zcode-webui`). After installing it, a wizard
+covers the whole "prepare → configure → deploy" flow:
+
+```bash
+npm install -g zcode-webui      # requires Node.js ≥ 18
+zcode-webui setup               # interactive wizard (see below)
+zcode-webui start               # run the service (foreground, Ctrl-C stops)
+```
+
+| Command | What it does |
+|---|---|
+| `zcode-webui setup` | Wizard: environment checks (curl/dpkg-deb) → official runtime `~/.zcode/server` check + guidance on how to obtain it → credential check → downloads the renderer from the official CDN → writes `config.json` → optional systemd user unit → optional immediate start. Supports `--yes` (all defaults, no start) plus `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`, `--no-fetch`, `--no-start`, `--no-systemd` |
+| `zcode-webui start` | Run the service in the foreground (equals `node src/server.mjs`; args pass through) |
+| `zcode-webui fetch-renderer` | Download/update the official renderer (`ZCODE_VERSION`/`ZCODE_ARCH` override available) |
+| `zcode-webui doctor [--net]` | Environment and readiness checks (`--net` adds CDN/cloud API reachability checks) |
+| `zcode-webui status` | Print service health (non-zero exit when not running) |
+| `zcode-webui version` / `help` | Version / help |
+
+After an npm install, all mutable data (config, renderer, device id, logs) lives in the data
+directory `~/.zcode-webui` (override with `ZCODE_WEBUI_HOME`; git deployments keep using the
+project directory), so the package directory stays read-only. Upgrade with
+`npm update -g zcode-webui`.
 
 ## Official CLI headless usage (optional)
 
@@ -430,6 +463,8 @@ Point them at your own service/directory with `ZCODE_WEBUI_TEST_URL` / `ZCODE_WE
 
 ```
 src/server.mjs             HTTP static serving + base path + WS bridge + login API
+src/cli.mjs                zcode-webui command line (setup wizard / start / doctor / status …)
+src/dirs.mjs               data directory resolution (ZCODE_WEBUI_HOME / repo mode)
 src/frame.mjs              stdio frame codec (interop with the official runtime)
 src/host.mjs               official runtime process spawn + handshake
 src/login.mjs              official CLI OAuth login subprocess management

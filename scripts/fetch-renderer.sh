@@ -6,8 +6,11 @@ set -euo pipefail
 VERSION="${ZCODE_VERSION:-3.8.1}"
 ARCH="${ZCODE_ARCH:-x64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="$ROOT/.fetch-tmp"
-DEST="$ROOT/vendor/renderer"
+# ZCODE_WEBUI_HOME redirects all mutable state away from the package directory
+# (used by the npm-installed CLI; unset = repo checkout layout)
+DATA_HOME="${ZCODE_WEBUI_HOME:-$ROOT}"
+WORK="$DATA_HOME/.fetch-tmp"
+DEST="$DATA_HOME/vendor/renderer"
 
 if [ -f "$DEST/index.html" ] && [ "${FORCE:-0}" != "1" ]; then
   echo "renderer already present at $DEST (set FORCE=1 to re-fetch)"

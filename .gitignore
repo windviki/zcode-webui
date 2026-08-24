@@ -18,3 +18,7 @@ npm-debug.log*
 .zcode-webui.json
 scripts/dev/*.png
 .DS_Store
+
+# npm packaging artifacts
+*.tgz
+.npmrc

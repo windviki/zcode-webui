@@ -17,9 +17,11 @@ import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine } from './rpclog.mjs';
 import { spawnHost, handshake, resolveServerRoot } from './host.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
+import { resolvePaths } from './dirs.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
+const PATHS = resolvePaths(ROOT);
 
 // ---------- config ----------
 function argValue(name, fallback) {
@@ -28,10 +30,10 @@ function argValue(name, fallback) {
   if (i >= 0 && i + 1 < args.length) return args[i + 1];
   return fallback;
 }
-// config.json in the project root (optional, lowest priority)
+// config.json in the data home (optional, lowest priority)
 let fileConfig = {};
 try {
-  fileConfig = JSON.parse(readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
+  fileConfig = JSON.parse(readFileSync(PATHS.configFile, 'utf8'));
 } catch (_e) { /* ignore */ }
 
 const PORT = Number(process.env.ZCODE_WEBUI_PORT || argValue('port', fileConfig.port) || 3102);
@@ -47,7 +49,7 @@ base = ('/' + base).replace(/\/+/g, '/').replace(/\/$/, '');
 if (base === '/') base = '';
 const joinBase = (p) => base + p;
 
-const RENDERER_DIR = path.join(ROOT, 'vendor', 'renderer');
+const RENDERER_DIR = PATHS.rendererDir;
 const WEB_DIR = path.join(ROOT, 'web');
 
 let serverRoot;
@@ -90,7 +92,7 @@ function sessionKey(clientKey, tabId) {
 const DETACHED_TTL_MS = Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS || 0);
 
 // persistent device id for the renderer
-const DEVICE_FILE = path.join(ROOT, 'data', 'device-id.json');
+const DEVICE_FILE = PATHS.deviceFile;
 let deviceId = '';
 try {
   if (existsSync(DEVICE_FILE)) deviceId = JSON.parse(readFileSync(DEVICE_FILE, 'utf8')).deviceId || '';
@@ -465,6 +467,7 @@ const server = http.createServer((req, res) => {
     const all = [...sessions.values()];
     return sendJson(res, 200, {
       ok: true, name: 'zcode-webui', base,
+      dataHome: PATHS.dataHome,
       rendererLoaded: existsSync(path.join(RENDERER_DIR, 'index.html')),
       serverRoot: serverRoot || null, workspace: WORKSPACE,
       login: loginState(),
@@ -768,6 +771,7 @@ wss.on('connection', (ws, req, session) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log('[zcode-webui] listening on http://0.0.0.0:' + PORT + base + '/');
   console.log('[zcode-webui] base path : ' + (base || '(root)'));
+  console.log('[zcode-webui] data home : ' + PATHS.dataHome);
   console.log('[zcode-webui] workspace  : ' + WORKSPACE);
   console.log('[zcode-webui] serverRoot : ' + (serverRoot || '(missing)'));
   console.log('[zcode-webui] renderer   : ' + (existsSync(path.join(RENDERER_DIR, 'index.html')) ? 'ready' : 'MISSING (run: npm run fetch-renderer)'));

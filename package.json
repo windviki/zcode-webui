@@ -4,13 +4,30 @@
   "description": "Run the official ZCode desktop UI in any browser, backed by the official zcode-server runtime, with code-server integration.",
   "type": "module",
   "main": "src/server.mjs",
+  "bin": {
+    "zcode-webui": "src/cli.mjs"
+  },
+  "files": [
+    "src/",
+    "web/",
+    "scripts/fetch-renderer.sh",
+    "scripts/extract-asar.cjs",
+    "scripts/smoke-test.mjs",
+    "config.example.json",
+    "cli-config.example.json",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
     "start": "node src/server.mjs",
     "fetch-renderer": "bash scripts/fetch-renderer.sh",
-    "smoke": "node scripts/smoke-test.mjs"
+    "smoke": "node scripts/smoke-test.mjs",
+    "cli": "node src/cli.mjs",
+    "prepublishOnly": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/dirs.mjs && bash -n scripts/fetch-renderer.sh"
   },
   "keywords": [
     "zcode",
@@ -23,6 +40,14 @@
     "browser"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/windviki/zcode-webui.git"
+  },
+  "homepage": "https://github.com/windviki/zcode-webui#readme",
+  "bugs": {
+    "url": "https://github.com/windviki/zcode-webui/issues"
+  },
   "dependencies": {
     "ws": "^8.18.0"
   },
