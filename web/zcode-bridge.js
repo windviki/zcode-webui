@@ -7,6 +7,34 @@
   var DEVICE_ID = cfg.deviceId || 'zcode-webui-unknown';
   var LOCALE = cfg.locale || 'zh-CN';
 
+  // ---- desktop-style app zoom (CSS zoom, 50%..200%), driven by ctrl+wheel /
+  // two-finger pinch (see bootstrap.js) and reported back to the official UI ----
+  var ZOOM_MIN = 0.5, ZOOM_MAX = 2;
+  var ZOOM_KEY = 'zwebui-zoom';
+  var zoomLevel = 1;
+  try {
+    var savedZoom = parseFloat(localStorage.getItem(ZOOM_KEY) || '');
+    if (savedZoom >= ZOOM_MIN && savedZoom <= ZOOM_MAX) zoomLevel = savedZoom;
+  } catch (e) { /* ignore */ }
+  var zoomListeners = [];
+  function applyZoom() {
+    try { document.documentElement.style.zoom = String(zoomLevel); } catch (e) { /* ignore */ }
+    for (var i = 0; i < zoomListeners.length; i++) {
+      try { zoomListeners[i]({ zoomLevel: zoomLevel }); } catch (e) { /* ignore */ }
+    }
+  }
+  window.__zwebui_zoom = {
+    get: function () { return zoomLevel; },
+    set: function (lvl) {
+      if (typeof lvl !== 'number' || !isFinite(lvl)) return;
+      lvl = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(lvl * 100) / 100));
+      if (lvl === zoomLevel) return;
+      zoomLevel = lvl;
+      try { localStorage.setItem(ZOOM_KEY, String(lvl)); } catch (e) { /* ignore */ }
+      applyZoom();
+    }
+  };
+
   function noop() {}
   function ok() { return Promise.resolve(undefined); }
   function unsub() { return function () {}; }
@@ -41,7 +69,12 @@
     getSystemLocale: val(LOCALE),
     getApplicationLocale: val(LOCALE),
     setApplicationLocale: ok,
-    getDesktopZoomLevel: val({ zoomLevel: 1 }),
+    getDesktopZoomLevel: function () { return Promise.resolve({ zoomLevel: zoomLevel }); },
+    setDesktopZoomLevel: function (lvl) { window.__zwebui_zoom.set(Number(lvl)); return Promise.resolve(undefined); },
+    onDesktopZoomLevelChanged: function (cb) {
+      if (typeof cb === 'function' && zoomListeners.indexOf(cb) < 0) zoomListeners.push(cb);
+      return function () { var i = zoomListeners.indexOf(cb); if (i >= 0) zoomListeners.splice(i, 1); };
+    },
     getDesktopWindowChromeState: val({ maximized: false, fullscreen: false, focused: true }),
     getWindowControlsOverlayMetrics: val(null),
     setTitleBarTheme: ok,

@@ -16,6 +16,7 @@ sessions and credentials stay on your own server.
 - 🤝 Works naturally with code-server: mount it behind code-server's `/proxy/<port>/` port proxy and share its login
 - 🌐 Any device, no client install: just open the URL (falls back to HTTP long-polling when reverse proxies block WebSocket upgrades)
 - 🔑 Flexible sign-in: built-in OAuth login, or import credentials exported from a logged-in official desktop app — shares the official credential store
+- 🔍 Desktop-grade zoom: Ctrl+wheel or trackpad/touchscreen **two-finger pinch** zooms the UI (50%–200%, remembered per browser)
 - ⏳ **Tasks are decoupled from tabs**: closing a tab / losing the network does NOT stop a task — it keeps running server-side until it finishes or waits for your input; reopening the page automatically re-attaches to the background session (multiple tabs of the same browser run independently; a superseded tab shows a notice with a one-click take-back)
 - 📦 No official code is bundled, modified, or redistributed: renderer assets are downloaded by the deployer from the official CDN with a local script
 

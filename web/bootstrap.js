@@ -327,5 +327,51 @@
     } catch (e) { /* ignore */ }
   }, 20000);
 
+  // ---- desktop-style app zoom gestures ----
+  // Ctrl+wheel is how Chrome reports two-finger pinch on touchpads/touchscreens;
+  // a tiny two-pointer recognizer covers touchscreens whose regions set
+  // touch-action:none (pointer events still fire there). Both drive the zoom
+  // channel implemented in zcode-bridge.js (CSS zoom 50%..200%).
+  (function () {
+    function zoomGet() { return (window.__zwebui_zoom && window.__zwebui_zoom.get()) || 1; }
+    function zoomSet(l) { if (window.__zwebui_zoom) window.__zwebui_zoom.set(l); }
+
+    window.addEventListener('wheel', function (ev) {
+      if (!ev.ctrlKey || ev.defaultPrevented) return;
+      ev.preventDefault();
+      // ~12% per wheel notch (deltaY ≈ ±100), finer on trackpad pinch deltas
+      zoomSet(zoomGet() * Math.exp(-ev.deltaY * 0.001));
+    }, { passive: false });
+
+    var pointers = {};
+    var pinchDist = 0;
+    function onPointerDown(ev) {
+      if (ev.pointerType !== 'touch') return;
+      pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+      pinchDist = 0;
+    }
+    function onPointerMove(ev) {
+      if (ev.pointerType !== 'touch' || !pointers[ev.pointerId]) return;
+      pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+      var ids = Object.keys(pointers);
+      if (ids.length !== 2) { pinchDist = 0; return; }
+      var a = pointers[ids[0]], b = pointers[ids[1]];
+      var d = Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+      if (pinchDist > 0 && d > 0) {
+        ev.preventDefault();
+        zoomSet(zoomGet() * (d / pinchDist));
+      }
+      pinchDist = d;
+    }
+    function onPointerEnd(ev) {
+      delete pointers[ev.pointerId];
+      pinchDist = 0;
+    }
+    window.addEventListener('pointerdown', onPointerDown, { passive: true });
+    window.addEventListener('pointermove', onPointerMove, { passive: false });
+    window.addEventListener('pointerup', onPointerEnd, { passive: true });
+    window.addEventListener('pointercancel', onPointerEnd, { passive: true });
+  })();
+
   connect();
 })();
