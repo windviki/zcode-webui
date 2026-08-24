@@ -1,5 +1,7 @@
 # zcode-webui
 
+> 语言 / Language：**中文** | [English](./README.en.md)
+
 > 在浏览器里完整运行官方 ZCode 桌面端界面，并与 code-server 无缝协同。
 > Run the official ZCode desktop UI entirely in your browser, working side by side with code-server.
 
@@ -32,6 +34,7 @@
   - [第 6 步 · 独立部署 / 自有反代](#第-6-步--独立部署--自有反代)
   - [第 7 步 · 开始使用](#第-7-步--开始使用)
 - [配置参考](#配置参考)
+- [官方 CLI 直连（可选）](#官方-cli-直连可选)
 - [HTTP API](#http-api)
 - [安全须知](#安全须知)
 - [常见问题（FAQ）](#常见问题faq)
@@ -274,6 +277,36 @@ location /zcode/ {
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `0`（永不清理） | 后台会话（已无标签页连接）在断开超过该毫秒数后自动终止；`0` 表示一直保留到任务结束/重启服务 |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | 关 | 设 `1` 在服务端日志打印协议消息预览（联调用） |
 
+## 官方 CLI 直连（可选）
+
+zcode-webui 服务本身**不需要** CLI 配置（它直接驱动官方运行时）。但如果你想绕过浏览器、
+用官方 CLI 直接干活（SSH 终端、系统 cron 定时任务、脚本化续跑会话），CLI 需要一份自己的模型配置
+`~/.zcode/cli/config.json`：
+
+```bash
+cp cli-config.example.json ~/.zcode/cli/config.json
+chmod 600 ~/.zcode/cli/config.json
+# 编辑文件：把 provider.bigmodel.options.apiKey 换成你的 Coding Plan API Key
+# （bigmodel.cn → 个人编程套餐 → 套餐概览 → 新建 API Key；或直接跑官方 CLI 的 zcode login 自动生成）
+```
+
+之后即可在终端里 headless 使用（与 WebUI 共用同一凭据库与会话数据）：
+
+```bash
+# 给指定会话发送一条消息并继续执行（无 TUI）
+~/.zcode/server/node ~/.zcode/server/agents/glm/zcode.cjs \
+  --cwd /path/to/workspace \
+  --resume sess_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --prompt '继续' --locale zh-CN
+
+# 或运行一个新的一次性指令（--max-turns 限制回合数）
+~/.zcode/server/node ~/.zcode/server/agents/glm/zcode.cjs \
+  --cwd /path/to/workspace --prompt '列出当前目录的文件' --max-turns 1
+```
+
+> 注意：`cli-config.example.json` 是**脱敏样例**，其中的 apiKey 是占位符；请勿把填好真实密钥的
+> 配置文件提交到任何仓库（`~/.zcode/cli/config.json` 应在仓库之外，并保持 0600 权限）。
+
 ## HTTP API
 
 - `GET <base>/api/health` — 服务状态（renderer / 运行时目录 / 登录态 / 会话数：总数、在线、后台运行中）
@@ -378,6 +411,8 @@ web/login.html             登录页（OAuth + 凭据导入）
 web/export-credentials.html  桌面端凭据导出工具（浏览器本地运行）
 web/picker.html            Web 目录选择器
 web/debug.html             桥接自检页
+config.example.json        zcode-webui 服务配置模板
+cli-config.example.json    官方 CLI 模型配置模板（脱敏样例）
 scripts/fetch-renderer.sh  从官方 CDN 下载官方客户端并提取渲染层（vendor/renderer，不入库）
 scripts/extract-asar.cjs   安装包解包工具
 scripts/smoke-test.mjs     冒烟测试

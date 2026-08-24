@@ -1,0 +1,115 @@
+{
+  "_comment": "Template for the OFFICIAL zcode CLI config (~/.zcode/cli/config.json). Copy to ~/.zcode/cli/config.json, fill in apiKey, chmod 600. The zcode-webui service itself does NOT need this file — it is only required when driving the official CLI directly (headless prompts, cron, SSH). Never commit a filled-in copy. Get the Coding Plan API key from the BigModel console (bigmodel.cn → 个人编程套餐 → 套餐概览 → 新建 API Key), or let `zcode login` create this file for you.",
+  "provider": {
+    "bigmodel": {
+      "kind": "anthropic",
+      "name": "BigModel Coding Plan",
+      "options": {
+        "apiKeyRequired": true,
+        "baseURL": "https://open.bigmodel.cn/api/anthropic",
+        "apiKey": "YOUR_BIGMODEL_CODING_PLAN_API_KEY"
+      },
+      "headers": {},
+      "models": {
+        "glm-5.3": {
+          "name": "GLM-5.3"
+        },
+        "glm-5-turbo": {
+          "name": "GLM-5-Turbo"
+        }
+      }
+    }
+  },
+  "model": {
+    "main": "bigmodel/glm-5.3",
+    "lite": "bigmodel/glm-5-turbo"
+  },
+  "modelCatalog": {
+    "overrides": {}
+  },
+  "modelStream": {
+    "idleTimeoutMs": 60000
+  },
+  "permission": {
+    "mode": "build",
+    "allowedTools": [],
+    "disallowedTools": [],
+    "autoApproveHighRisk": false,
+    "allowMediumRiskInAuto": false
+  },
+  "storage": {
+    "dir": "~/.zcode",
+    "sessionDbPath": "~/.zcode/cli/db/db.sqlite"
+  },
+  "network": {
+    "timeout": 180000
+  },
+  "features": {
+    "compact": true,
+    "rewind": true,
+    "subagent": true,
+    "memory": true,
+    "skill": true,
+    "mcp": true
+  },
+  "subagents": {
+    "autoBackgroundMs": 1000
+  },
+  "memory": {
+    "use": true,
+    "write": true,
+    "autoConsolidate": true,
+    "summaryMaxBytes": 8192
+  },
+  "mcp": {
+    "servers": {}
+  },
+  "plugins": {
+    "enabled": true,
+    "dirs": [],
+    "enabledPlugins": {},
+    "options": {},
+    "suppressedBuiltins": []
+  },
+  "skills": {
+    "enabled": true,
+    "includeInstructions": true,
+    "metadataBudget": 20000,
+    "roots": []
+  },
+  "skill": {},
+  "command": {},
+  "logging": {
+    "level": "info",
+    "format": "text"
+  },
+  "ui": {
+    "locale": "auto",
+    "theme": "auto",
+    "notifications": {
+      "method": "auto",
+      "condition": "unfocused"
+    }
+  },
+  "toolConcurrency": {
+    "maxConcurrency": 10
+  },
+  "modelAnomalyGuard": {
+    "repeatedToolCallWarningThreshold": 3,
+    "maxBudgetWarningsPerTurn": 3
+  },
+  "hooks": {
+    "enabled": false,
+    "timeoutMs": 60000,
+    "maxOutputBytes": 32768,
+    "events": {
+      "SessionStart": [],
+      "UserPromptSubmit": [],
+      "PreToolUse": [],
+      "PermissionRequest": [],
+      "PostToolUse": [],
+      "PostToolUseFailure": [],
+      "Stop": []
+    }
+  }
+}
