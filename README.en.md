@@ -89,7 +89,7 @@ download script once is enough to follow the official version.
 ## Complete usage guide (from zero to working)
 
 > Want to move faster? The project is published on npm — three commands to deploy:
-> `npm install -g zcode-webui` → `zcode-webui setup` (an interactive wizard that guides
+> `npm install -g @aixyzstudio/zcode-webui` → `zcode-webui setup` (an interactive wizard that guides
 > all preparation and configuration) → `zcode-webui start`. See
 > [zcode-webui command line (npm package)](#zcode-webui-command-line-npm-package)
 > alongside the manual steps below.
@@ -301,11 +301,11 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 
 ## zcode-webui command line (npm package)
 
-The project is published on npm (package name `zcode-webui`). After installing it, a wizard
+The project is published on npm (package name `@aixyzstudio/zcode-webui`). After installing it, a wizard
 covers the whole "prepare → configure → deploy" flow:
 
 ```bash
-npm install -g zcode-webui      # requires Node.js ≥ 18
+npm install -g @aixyzstudio/zcode-webui      # requires Node.js ≥ 18
 zcode-webui setup               # interactive wizard (see below)
 zcode-webui start               # run the service (foreground, Ctrl-C stops)
 ```
@@ -322,7 +322,7 @@ zcode-webui start               # run the service (foreground, Ctrl-C stops)
 After an npm install, all mutable data (config, renderer, device id, logs) lives in the data
 directory `~/.zcode-webui` (override with `ZCODE_WEBUI_HOME`; git deployments keep using the
 project directory), so the package directory stays read-only. Upgrade with
-`npm update -g zcode-webui`.
+`npm update -g @aixyzstudio/zcode-webui`.
 
 ## Official CLI headless usage (optional)
 

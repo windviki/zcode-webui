@@ -83,7 +83,7 @@ zcode-webui **尽可能依托官方实现，不重复造轮子**：
 
 ## 完整使用指南（从零到可用）
 
-> 想更快上手？项目已发布为 npm 包，三步完成部署：`npm install -g zcode-webui` →
+> 想更快上手？项目已发布为 npm 包，三步完成部署：`npm install -g @aixyzstudio/zcode-webui` →
 > `zcode-webui setup`（交互式向导引导全部准备工作与配置）→ `zcode-webui start`。
 > 详见 [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包) 与下面的手动步骤。
 
@@ -285,10 +285,10 @@ location /zcode/ {
 
 ## zcode-webui 命令行（npm 包）
 
-项目已发布到 npm（包名 `zcode-webui`）。安装后可用向导完成「准备工作 → 配置 → 部署」全流程：
+项目已发布到 npm（包名 `@aixyzstudio/zcode-webui`）。安装后可用向导完成「准备工作 → 配置 → 部署」全流程：
 
 ```bash
-npm install -g zcode-webui      # 需要 Node.js ≥ 18
+npm install -g @aixyzstudio/zcode-webui      # 需要 Node.js ≥ 18
 zcode-webui setup               # 交互式向导（见下）
 zcode-webui start               # 启动服务（前台，Ctrl-C 停止）
 ```
@@ -304,7 +304,7 @@ zcode-webui start               # 启动服务（前台，Ctrl-C 停止）
 
 npm 安装后，所有可变数据（配置、渲染层、设备标识、日志）存放在数据目录
 `~/.zcode-webui`（可用 `ZCODE_WEBUI_HOME` 覆盖；git 部署时自动沿用项目目录），
-包目录本身保持只读，升级用 `npm update -g zcode-webui`。
+包目录本身保持只读，升级用 `npm update -g @aixyzstudio/zcode-webui`。
 
 ## 官方 CLI 直连（可选）
 
