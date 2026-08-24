@@ -411,6 +411,18 @@ node scripts/dev/reattach-ui-test.mjs   # 真实 UI：任务中途刷新页面�
 node scripts/dev/reattach-close-test.mjs # 真实 UI：任务中途关闭标签页，后台继续执行，新标签页接管
 ```
 
+**Docker 真机全链路验证**（在真实容器里走完「npm 包安装 → 向导配置 → 服务启动 → 桥接 → 真实模型调用」）：
+
+```bash
+bash scripts/docker/verify.sh              # 打包本地产物 → 构建镜像 → 容器内全链路 → 清理
+ZCODE_VERIFY_SKIP_FETCH=1 bash scripts/docker/verify.sh   # 复用已有渲染层，跳过容器内 CDN 下载
+ZCODE_VERIFY_REGISTRY=1 bash scripts/docker/verify.sh     # 包发布后改为从 npmjs registry 安装
+```
+
+验证脚本会在运行时把本机 `~/.zcode`（官方运行时 + 凭据）**复制到临时沙箱**注入容器，
+用完即删；镜像层与仓库内**不含任何凭据**。可用 `ZCODE_VERIFY_SOURCE/PROXY/NETWORK/KEEP`
+等环境变量覆盖默认值（默认自动寻找 glash 代理所在网络）。
+
 `scripts/dev/` 下附带一组 Playwright 端到端脚本（真实登录态下驱动官方界面：
 发送会话、目录选择、两种部署模式回归等），可用 `ZCODE_WEBUI_TEST_URL`、
 `ZCODE_WEBUI_TEST_DIR` 等环境变量指向自己的服务与目录。

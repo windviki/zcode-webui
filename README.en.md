@@ -440,6 +440,20 @@ node scripts/dev/reattach-ui-test.mjs   # real UI: reload mid-turn, re-attach, t
 node scripts/dev/reattach-close-test.mjs # real UI: close tab mid-turn, background turn completes, new tab adopts
 ```
 
+**Docker full-chain verification** (npm package install → wizard config → service start → bridges →
+real model call, all inside a real container):
+
+```bash
+bash scripts/docker/verify.sh              # pack local artifact → build image → verify in container → cleanup
+ZCODE_VERIFY_SKIP_FETCH=1 bash scripts/docker/verify.sh   # reuse an existing renderer, skip the in-container CDN download
+ZCODE_VERIFY_REGISTRY=1 bash scripts/docker/verify.sh     # install from the npmjs registry instead (after publishing)
+```
+
+The script copies your local `~/.zcode` (official runtime + credentials) into a **temporary sandbox**
+at run time, injects it into the container and deletes it afterwards — no credentials ever enter the
+image layers or this repository. Override the defaults with
+`ZCODE_VERIFY_SOURCE/PROXY/NETWORK/KEEP` (the proxy and its docker network are auto-detected).
+
 `scripts/dev/` also contains a set of Playwright end-to-end scripts (driving the official UI in a real
 logged-in state: sending sessions, directory picking, both deployment-mode regressions, …).
 Point them at your own service/directory with `ZCODE_WEBUI_TEST_URL` / `ZCODE_WEBUI_TEST_DIR`.
