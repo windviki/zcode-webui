@@ -297,7 +297,9 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_WEBUI_HOME` | — | `~/.zcode-webui` (npm install) / project dir (git deploy) | Data directory of this service: `config.json`, the downloaded renderer and the device id. Git deployments automatically use the project dir when it already contains `config.json` or `vendor/renderer` (backward compatible) |
 | `ZCODE_APP_VERSION` | — | renderer version (auto-detected) | Override the version passed to the runtime; normally not needed |
 | `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.8.1` / `x64` | Version and architecture for `npm run fetch-renderer` |
-| `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `0` (never) | Auto-terminate background sessions (no tab connected) after this many milliseconds; `0` keeps them until the task ends / the service restarts |
+| `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` (30 min) | Idle background sessions are auto-reaped after being detached this long, when no task is running and no frames are flowing; `0` = keep forever |
+| `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` (10 min) | Reap precondition: no host→browser frames within this window (working turns stream frames; idle hosts are silent) |
+| `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` (2 h) | Global reaper safety: while the tasks index has a "running" task updated within this window, NOTHING is reaped (hosts waiting for user input are protected too) |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | off | Set `1` to log protocol message previews server-side (for debugging) |
 
 ## zcode-webui command line (npm package)
@@ -392,9 +394,11 @@ data as the WebUI):
 **Q: Will a task keep running after I close the tab?**
 Yes. The task keeps executing server-side until it finishes or waits for your input; reopening the
 page (reload or a new tab) automatically re-attaches to the background session so you can watch
-progress. Restarting the service process interrupts background tasks; if you want periodic cleanup of
-long-disconnected sessions set `ZCODE_WEBUI_DETACHED_TTL_MS` (default 0 = never), or use
-`POST /api/sessions/terminate` to terminate everything manually.
+progress. Idle background sessions are auto-reaped (by default after 30 minutes detached with no
+running task and no frame activity; running or waiting-for-input sessions are never reaped). Tune or
+disable with `ZCODE_WEBUI_DETACHED_TTL_MS` (`0` = keep forever), or use
+`POST /api/sessions/terminate` to terminate everything manually. Restarting the service process
+still interrupts background tasks.
 
 **Q: One of my tabs says "session taken over by another tab"?**
 Multiple tabs of the same browser run independently; the notice only appears when a new tab took over

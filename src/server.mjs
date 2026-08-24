@@ -87,9 +87,47 @@ function sessionKey(clientKey, tabId) {
   return (clientKey || ('tab:' + tabId)) + ':' + (tabId || 'untabbed');
 }
 
-// Detached hosts (tab closed) are kept alive so their tasks can finish. Set a TTL to
-// reap hosts that have been detached for longer than this (0 = keep forever).
-const DETACHED_TTL_MS = Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS || 0);
+// Detached hosts (tab closed) are kept alive so their tasks can finish. Auto-reap
+// them ONLY when they are verifiably idle, guarded three ways so in-progress
+// sessions (including ones waiting for user input) are never interrupted:
+//   1. detached for at least ZCODE_WEBUI_DETACHED_TTL_MS (default 30 min; 0 = never)
+//   2. no host->client frames for at least ZCODE_WEBUI_FRAME_QUIET_MS (default 10 min;
+//      idle hosts are silent, working turns stream frames)
+//   3. no task marked "running" in the official tasks index (updated within the
+//      staleness window, default 2 h) — a global guard that also protects hosts
+//      parked in a wait-for-user-input state
+const DETACHED_TTL_MS = process.env.ZCODE_WEBUI_DETACHED_TTL_MS === undefined
+  ? 30 * 60 * 1000
+  : Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS) || 0;
+const FRAME_QUIET_MS = Number(process.env.ZCODE_WEBUI_FRAME_QUIET_MS || 10 * 60 * 1000);
+const RUNNING_TASK_STALE_MS = Number(process.env.ZCODE_WEBUI_RUNNING_TASK_STALE_MS || 2 * 60 * 60 * 1000);
+
+function tasksIndexPath() {
+  const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
+  return path.join(zhome, 'v2', 'tasks-index.sqlite');
+}
+
+let sqliteWarningShown = false;
+async function hasRunningTask(dbPath) {
+  // true when the index says a task is running, or when the index cannot be read
+  // (fail-safe: never reap when in doubt)
+  try {
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare(
+        "SELECT COUNT(*) AS n FROM tasks WHERE task_status = 'running' AND updated_at > ?"
+      ).get(Date.now() - RUNNING_TASK_STALE_MS);
+      return (row && row.n) > 0;
+    } finally { db.close(); }
+  } catch (_e) {
+    if (!sqliteWarningShown) {
+      sqliteWarningShown = true;
+      console.error('[zcode-webui] auto-reap: cannot read tasks index (' + ((_e && _e.message) || _e) + '); reaping disabled (safe mode)');
+    }
+    return true;
+  }
+}
 
 // persistent device id for the renderer
 const DEVICE_FILE = PATHS.deviceFile;
@@ -295,7 +333,7 @@ function createSession(clientKey, tabId) {
   }
   const session = {
     id: randomUUID(), clientKey, tabId, child, hello: null,
-    ws: null, wsAttachedAt: 0, detachedAt: 0,
+    ws: null, wsAttachedAt: 0, detachedAt: 0, lastFrameAt: 0,
     framesIn: 0, framesOut: 0, pendingInbound: [], closed: false,
   };
   console.error('[zcode-webui] host spawned pid=' + child.pid + ' client=' + (clientKey || '(no-cookie)') + '/' + (tabId || '').slice(0, 8));
@@ -308,6 +346,7 @@ function createSession(clientKey, tabId) {
   // fills up and blocks the host while it keeps working in the background.
   const parser = new FrameParser((payload) => {
     session.framesOut++;
+    session.lastFrameAt = Date.now();
     // remember the host's Initialize frame (the first thing it pushes after the
     // stdio handshake) so we can replay it to a freshly re-attached renderer —
     // the renderer only starts its boot sequence after receiving it.
@@ -428,17 +467,24 @@ function attachRelay(ws, session) {
   ws.on('error', () => { /* close follows */ });
 }
 
-// Optional reaper for hosts that stay detached for a long time (off by default).
+// Idle-session reaper: on by default with a 30-minute TTL and triple safety guards
+// (detached-for, frame-quiet, no running task). Set ZCODE_WEBUI_DETACHED_TTL_MS=0
+// to keep detached hosts forever.
 if (DETACHED_TTL_MS > 0) {
-  setInterval(() => {
+  setInterval(async () => {
     const now = Date.now();
+    // global busy-guard: any live task (including waits for user input) blocks reaping
+    if (await hasRunningTask(tasksIndexPath())) return;
     for (const s of [...sessions.values()]) {
-      if (!s.closed && !s.ws && s.detachedAt && now - s.detachedAt > DETACHED_TTL_MS) {
-        console.error('[zcode-webui] reaping host detached for ' + Math.round((now - s.detachedAt) / 1000) + 's pid=' + s.child.pid);
-        terminateSession(s, 'detached ttl');
-      }
+      if (s.closed || s.ws || !s.detachedAt) continue;
+      if (now - s.detachedAt <= DETACHED_TTL_MS) continue;
+      if (s.lastFrameAt && now - s.lastFrameAt <= FRAME_QUIET_MS) continue;
+      console.error('[zcode-webui] reaping idle detached host pid=' + s.child.pid +
+        ' (detached ' + Math.round((now - s.detachedAt) / 1000) + 's, quiet ' +
+        Math.round((now - s.lastFrameAt) / 1000) + 's)');
+      terminateSession(s, 'idle reap');
     }
-  }, 30000).unref();
+  }, 60000).unref();
 }
 
 // ---------- http server ----------
@@ -476,6 +522,7 @@ const server = http.createServer((req, res) => {
         attached: all.filter((s) => !s.closed && s.ws).length,
         detached: all.filter((s) => !s.closed && !s.ws).length,
       },
+      reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS },
       httpRelays: httpRelays.size,
     });
   }

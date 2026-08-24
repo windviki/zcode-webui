@@ -281,7 +281,9 @@ location /zcode/ {
 | `ZCODE_WEBUI_HOME` | — | `~/.zcode-webui`（npm 安装）/ 项目目录（git 部署） | 本服务的数据目录：`config.json`、下载的渲染层与设备标识。git 部署且项目根存在 `config.json` 或 `vendor/renderer` 时自动使用项目目录（向后兼容） |
 | `ZCODE_APP_VERSION` | — | 渲染层版本（自动读取） | 覆盖传给运行时版本号，一般不需要 |
 | `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.8.1` / `x64` | `npm run fetch-renderer` 的下载版本与架构 |
-| `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `0`（永不清理） | 后台会话（已无标签页连接）在断开超过该毫秒数后自动终止；`0` 表示一直保留到任务结束/重启服务 |
+| `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000`（30 分钟） | 空闲后台会话自动回收：脱离标签页超过该时长且无任务运行、无帧活动时终止；`0` = 永不回收 |
+| `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000`（10 分钟） | 回收前置条件之一：最近该时长内无 host→浏览器帧（工作中的回合会持续发帧，空闲主机静默） |
+| `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000`（2 小时） | 回收的全局保险：任务索引中存在「running」且在该窗口内更新过的任务时，**不回收任何**后台会话（等待用户输入的会话也受此保护） |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | 关 | 设 `1` 在服务端日志打印协议消息预览（联调用） |
 
 ## zcode-webui 命令行（npm 包）
@@ -368,8 +370,9 @@ chmod 600 ~/.zcode/cli/config.json
 
 **Q：关闭标签页后任务还会继续吗？**
 会。任务在服务端后台持续执行，直到完成或停在等待你的输入；重新打开页面（刷新或新标签页）会自动
-接管后台会话查看进度。服务进程重启会中断后台任务；若需要定时清理长期无连接的后台会话，
-可设置 `ZCODE_WEBUI_DETACHED_TTL_MS`（默认 0 = 不清理），也可用 `POST /api/sessions/terminate` 手动全部终止。
+接管后台会话查看进度。空闲的后台会话会被自动回收（默认脱离标签页 30 分钟且无任务运行、无帧活动时；
+等待输入或运行中的会话永不回收），可用 `ZCODE_WEBUI_DETACHED_TTL_MS` 调整或设为 `0` 关闭回收，
+也可用 `POST /api/sessions/terminate` 手动全部终止。服务进程重启仍会中断后台任务。
 
 **Q：打开两个标签页时其中一个提示「已被另一个标签页接管」？**
 同一浏览器的多个标签页各自独立运行，只有在新标签页主动接管了空闲会话、或页面刷新重新夺回自己会话时
