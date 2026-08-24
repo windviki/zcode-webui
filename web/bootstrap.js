@@ -71,9 +71,8 @@
     };
   })();
 
-  // superseded by another tab: park this page with an explicit take-back control
-  function parkWithNotice() {
-    mode = 'parked';
+  // banner with an action button (parked tab / lost connection)
+  function showNotice(text, buttonText, onClick) {
     try {
       var el = document.getElementById('zcode-webui-error');
       if (!el) {
@@ -84,20 +83,26 @@
       }
       el.innerHTML = '';
       var t = document.createElement('div');
-      t.textContent = '[zcode-webui] 本页面的会话已被另一个标签页接管，此页面已暂停。';
+      t.textContent = '[zcode-webui] ' + text;
       var b = document.createElement('button');
-      b.textContent = '接管回来';
+      b.textContent = buttonText;
       b.style.cssText = 'margin-top:8px;background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;';
-      b.addEventListener('click', function () {
-        try {
-          var q = new URLSearchParams(window.location.search);
-          q.set('takeover', '1');
-          window.location.search = q.toString();
-        } catch (e) { window.location.reload(); }
-      });
+      b.addEventListener('click', onClick);
       el.appendChild(t);
       el.appendChild(b);
     } catch (e) { /* ignore */ }
+  }
+
+  // superseded by another tab: park this page with an explicit take-back control
+  function parkWithNotice() {
+    mode = 'parked';
+    showNotice('本页面的会话已被另一个标签页接管，此页面已暂停。', '接管回来', function () {
+      try {
+        var q = new URLSearchParams(window.location.search);
+        q.set('takeover', '1');
+        window.location.search = q.toString();
+      } catch (e) { window.location.reload(); }
+    });
   }
 
   // ---- URL params for the official renderer ----
@@ -289,14 +294,14 @@
       // host gone (terminated/exit): a fresh page load will spawn a new host
       if (ev.code === 4000 || ev.code === 1011) {
         reloadAttempts++;
-        if (reloadAttempts > 6) { report('ws-closed', 'bridge closed ' + reloadAttempts + ' times, stopped reloading (wsUrl=' + wsUrl + ')'); return; }
+        if (reloadAttempts > 6) { showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); }); return; }
         setTimeout(function () { window.location.reload(); }, 1500);
         return;
       }
       // ordinary close / network drop: the backend keeps the host running in the
       // background; reload and re-attach to the same session (same tab id).
       reloadAttempts++;
-      if (reloadAttempts > 6) { report('ws-closed', 'bridge closed ' + reloadAttempts + ' times, stopped reloading (wsUrl=' + wsUrl + ')'); return; }
+      if (reloadAttempts > 6) { showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); }); return; }
       setTimeout(function () { window.location.reload(); }, 1500);
     };
     ws.onerror = function () { /* onclose follows */ };
