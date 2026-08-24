@@ -17,6 +17,9 @@
 - 🔍 桌面级缩放：Ctrl+滚轮或触控板/触屏**双指捏合**即可缩放界面（50%–200%，按浏览器记忆）
 - ⏳ **任务与标签页解耦**：关闭标签页/断网不中断任务——任务在服务端后台持续执行直到完成或等待你的输入；
   重新打开页面自动接管后台会话，查看进度、继续交互（同浏览器多标签页互不干扰，被接管的页面会给出提示并可一键夺回）
+- ♻️ 会话自动维护：空闲的后台会话按「脱离时长 + 帧静默 + 无运行中任务」三重条件自动回收，
+  运行中/等待输入的会话永不回收；掉线自动重连失败时页面给出「重新连接」按钮
+- 🧭 npm 向导一键部署：`npm i -g` 后运行 `zcode-webui setup`，交互式引导完成全部准备、配置与启动
 - 📦 不打包、不修改、不分发任何官方代码：渲染层资产由部署者在本地执行一个脚本、从官方 CDN 自行下载
 
 ---
@@ -162,6 +165,12 @@ OAuth，凭据自动写入服务器的 `~/.zcode/v2/credentials.json`。服务�
 
 ### 第 4 步 · 部署 zcode-webui
 
+**方式一（推荐新手）· npm 安装 + 向导**：`npm install -g @aixyzstudio/zcode-webui` →
+`zcode-webui setup`（交互式向导按顺序引导：环境检查 → 官方运行时检查与获取引导 → 登录凭据检查 →
+渲染层下载 → 生成配置 → 可选 systemd/立即启动），然后 `zcode-webui start`。
+详见 [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包)。
+
+**方式二 · git clone 手动部署**：
 ```bash
 # 1. 获取代码
 git clone https://github.com/windviki/zcode-webui.git
@@ -261,7 +270,9 @@ location /zcode/ {
 **关于标签页与任务的生命周期**（重要）：每个浏览器标签页连接到一个服务端「会话」（官方运行时进程）。
 **关闭标签页不会结束任务**——运行时进程会留在后台继续执行，直到任务完成或停在等待你输入的状态；
 期间随时重新打开页面（同标签页刷新或新开标签页均可）会自动接管该后台会话，继续查看进度或作答。
-同一浏览器的多个标签页同时打开时各自独立运行；若某标签页的会话被新标签页接管，旧页面会显示提示并提供一个「接管回来」按钮。
+页面在线的会话（哪怕长时间不操作）**永远不会被回收**；短暂断网页面会自动重连，
+连续重连失败时页面会显示「重新连接」按钮。同一浏览器的多个标签页同时打开时各自独立运行；
+若某标签页的会话被新标签页接管，旧页面会显示提示并提供一个「接管回来」按钮。
 注意：**zcode-webui 服务进程重启会中断正在后台运行的任务**（与官方桌面端重启行为一致），长任务期间请勿重启服务。
 
 ## 配置参考
@@ -296,9 +307,26 @@ zcode-webui setup               # 交互式向导（见下）
 zcode-webui start               # 启动服务（前台，Ctrl-C 停止）
 ```
 
+**`setup` 向导按顺序引导**（每步都有检测与提示，缺什么告诉你怎么办）：
+
+1. **环境检查**：Node / curl / dpkg-deb 是否就绪；
+2. **官方运行时**：检测 `~/.zcode/server/zcode-server.cjs`；缺失时给出获取路径（安装一次官方桌面端，
+   或从已运行过桌面端的机器 `scp -r user@host:~/.zcode/server ~/.zcode/server`），
+   也可用 `ZCODE_SERVER_RUNTIME_ROOT` 指向别处；
+3. **登录凭据**：检测 `~/.zcode/v2/credentials.json`；缺失时提示启动后用 `/login` 登录或
+   `/export-credentials.html` 从桌面端导入；
+4. **渲染层**：从官方 CDN 下载官方安装包并提取界面（`ZCODE_VERSION` 可换版本）；
+5. **服务配置**：询问端口 / 工作区 / 语言 / 反代前缀 / 两个代理，写入 `config.json`（0600，自动合并已有值）；
+6. **顺带生成官方 CLI 直连配置**（若桌面端已有 Coding Plan key，自动重建 `~/.zcode/cli/config.json`，
+   见 [官方 CLI 直连](#官方-cli-直连可选)）；
+7. **可选**：生成 systemd 用户单元（免 sudo，`systemctl --user enable --now zcode-webui`）或立即后台启动。
+
+`--yes` 可跳过所有提问（全部默认值、不启动）；常用参数：`--port/--workspace/--locale/--base-path/
+--oauth-proxy/--host-proxy`、`--no-fetch`、`--no-start`、`--no-systemd`。
+
 | 命令 | 作用 |
 |---|---|
-| `zcode-webui setup` | 向导：环境检查（curl/dpkg-deb）→ 官方运行时 `~/.zcode/server` 检查与获取引导 → 登录凭据检查 → 从官方 CDN 下载渲染层 → 生成 `config.json` → 可选生成 systemd 用户单元 → 可选立即启动。支持 `--yes`（全部默认，不启动）与 `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`、`--no-fetch`、`--no-start`、`--no-systemd` 等参数 |
+| `zcode-webui setup` | 交互式向导（步骤见上）。支持 `--yes`（全部默认，不启动）与 `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`、`--no-fetch`、`--no-start`、`--no-systemd` 等参数 |
 | `zcode-webui start` | 前台启动服务（等价于 `node src/server.mjs`，参数透传） |
 | `zcode-webui fetch-renderer` | 下载/更新官方渲染层（`ZCODE_VERSION`/`ZCODE_ARCH` 可选覆盖） |
 | `zcode-webui doctor [--net]` | 环境与就绪状态检查（`--net` 附带 CDN/云 API 连通性检查） |
@@ -341,7 +369,7 @@ chmod 600 ~/.zcode/cli/config.json
 
 ## HTTP API
 
-- `GET <base>/api/health` — 服务状态（renderer / 运行时目录 / 登录态 / 会话数：总数、在线、后台运行中）
+- `GET <base>/api/health` — 服务状态（renderer / 运行时目录 / 登录态 / 会话数：总数、在线、后台运行中 / 自动回收开关与 TTL）
 - `POST <base>/api/sessions/terminate` — 立即终止全部会话（含后台运行中的会话，慎用）
 - `POST <base>/api/login/start` — 启动官方 CLI OAuth 登录（后台子进程）
 - `GET <base>/api/login/status` — 登录状态、授权链接、实时输出
@@ -378,6 +406,10 @@ chmod 600 ~/.zcode/cli/config.json
 同一浏览器的多个标签页各自独立运行，只有在新标签页主动接管了空闲会话、或页面刷新重新夺回自己会话时
 才会出现该提示。被接管的页面已暂停，点击提示中的「接管回来」即可把会话夺回当前标签页。
 
+**Q：如何缩放界面？**
+Ctrl+滚轮、触控板/触屏双指捏合（应用级缩放 50%–200%，按浏览器记忆）；键盘 Ctrl/⌘ + `+`/`-`/`0`
+仍是浏览器整页缩放，两者可并存。
+
 **Q：发送消息提示「当前没有可用的模型供应商和模型，请先登录或配置 API Key」？**
 先确认 `/login` 显示已登录；再确认 `ZCODE_SERVER_RUNTIME_ROOT` 指向的运行时与渲染层版本一致
 （`npm run fetch-renderer` 会写入版本戳并自动同步）。旧版本的本项目存在一个已知缺陷会导致该报错，
@@ -413,6 +445,7 @@ ZCODE_WEBUI_BASE_PATH=/zcode npm run smoke -- /zcode
 node scripts/dev/reattach-test.mjs      # 会话解耦协议回归：断开保持存活/重连接管/顶替/终止
 node scripts/dev/reattach-ui-test.mjs   # 真实 UI：任务中途刷新页面，接管后继续执行并显示结果
 node scripts/dev/reattach-close-test.mjs # 真实 UI：任务中途关闭标签页，后台继续执行，新标签页接管
+node scripts/dev/zoom-test.mjs           # 缩放回归：ctrl+滚轮/双指捏合/普通滚动/缩放订阅通道
 ```
 
 **Docker 真机全链路验证**（在真实容器里走完「npm 包安装 → 向导配置 → 服务启动 → 桥接 → 真实模型调用」）：
@@ -463,7 +496,8 @@ cli-config.example.json    官方 CLI 模型配置模板（脱敏样例）
 scripts/fetch-renderer.sh  从官方 CDN 下载官方客户端并提取渲染层（vendor/renderer，不入库）
 scripts/extract-asar.cjs   安装包解包工具
 scripts/smoke-test.mjs     冒烟测试
-scripts/dev/*.mjs          Playwright 端到端联调脚本
+scripts/docker/            Docker 真机全链路验证（verify.sh + container-verify.sh）
+scripts/dev/*.mjs          Playwright 端到端联调脚本（含会话接管与缩放回归）
 ```
 
 ## 许可证与声明

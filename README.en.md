@@ -18,6 +18,8 @@ sessions and credentials stay on your own server.
 - 🔑 Flexible sign-in: built-in OAuth login, or import credentials exported from a logged-in official desktop app — shares the official credential store
 - 🔍 Desktop-grade zoom: Ctrl+wheel or trackpad/touchscreen **two-finger pinch** zooms the UI (50%–200%, remembered per browser)
 - ⏳ **Tasks are decoupled from tabs**: closing a tab / losing the network does NOT stop a task — it keeps running server-side until it finishes or waits for your input; reopening the page automatically re-attaches to the background session (multiple tabs of the same browser run independently; a superseded tab shows a notice with a one-click take-back)
+- ♻️ Automatic session maintenance: idle background sessions are auto-reaped under a triple guard (detached duration + frame silence + no running task); running or waiting-for-input sessions are never reaped; when auto-reconnect gives up, the page shows a one-click "reconnect" button
+- 🧭 One-command npm deployment: `npm i -g` then `zcode-webui setup` walks you through all preparation, configuration and startup
 - 📦 No official code is bundled, modified, or redistributed: renderer assets are downloaded by the deployer from the official CDN with a local script
 
 ---
@@ -174,6 +176,12 @@ If the server has already run the official CLI (`zcode login`) or the official d
 
 ### Step 4 · Deploy zcode-webui
 
+**Option 1 (recommended for newcomers) · npm install + wizard**: `npm install -g @aixyzstudio/zcode-webui`
+→ `zcode-webui setup` (the interactive wizard guides in order: environment checks → official runtime
+check and how to obtain it → credential check → renderer download → config → optional systemd/immediate
+start) → `zcode-webui start`. See [zcode-webui command line (npm package)](#zcode-webui-command-line-npm-package).
+
+**Option 2 · git clone, manual deployment**:
 ```bash
 # 1. Get the code
 git clone https://github.com/windviki/zcode-webui.git
@@ -275,10 +283,12 @@ location /zcode/ {
 runtime process). **Closing a tab does NOT end the task** — the runtime keeps executing in the
 background until the task completes or waits for your input; reopening the page (reload the same tab
 or open a new one) automatically re-attaches to that background session so you can watch progress or
-answer. Multiple tabs of the same browser run independently; if a tab's session is taken over by
-another tab, the old page shows a notice with a "take back" button. Note: **restarting the zcode-webui
-service process interrupts background tasks** (same as restarting the official desktop app) — do not
-restart the service during long tasks.
+answer. Sessions with an online page are **never reaped**, no matter how long they sit idle; short
+network drops trigger automatic reconnects, and if reconnecting gives up the page shows a one-click
+"reconnect" button. Multiple tabs of the same browser run independently; if a tab's session is taken
+over by another tab, the old page shows a notice with a "take back" button. Note: **restarting the
+zcode-webui service process interrupts background tasks** (same as restarting the official desktop
+app) — do not restart the service during long tasks.
 
 ## Configuration reference
 
@@ -313,9 +323,29 @@ zcode-webui setup               # interactive wizard (see below)
 zcode-webui start               # run the service (foreground, Ctrl-C stops)
 ```
 
+**What `setup` walks you through** (each step checks and tells you exactly what is missing):
+
+1. **Environment**: Node / curl / dpkg-deb readiness;
+2. **Official runtime**: checks `~/.zcode/server/zcode-server.cjs`; if missing it explains how to
+   obtain it (run the official desktop once, or `scp -r user@host:~/.zcode/server ~/.zcode/server`),
+   or point `ZCODE_SERVER_RUNTIME_ROOT` elsewhere;
+3. **Credentials**: checks `~/.zcode/v2/credentials.json`; if missing it points you to the `/login`
+   page or the `/export-credentials.html` desktop import tool;
+4. **Renderer**: downloads the official installer from the official CDN and extracts the UI
+   (`ZCODE_VERSION` selects a version);
+5. **Service config**: asks for port / workspace / locale / reverse-proxy prefix / the two proxies,
+   writes `config.json` (mode 0600, existing values are merged);
+6. **Bonus**: rebuilds the official CLI headless config `~/.zcode/cli/config.json` when the desktop
+   already has a Coding Plan key (see [Official CLI headless usage](#official-cli-headless-usage-optional));
+7. **Optional**: generate a systemd user unit (no sudo, `systemctl --user enable --now zcode-webui`)
+   or start the service immediately in the background.
+
+`--yes` skips all prompts (defaults, no start); common flags: `--port/--workspace/--locale/
+--base-path/--oauth-proxy/--host-proxy`, `--no-fetch`, `--no-start`, `--no-systemd`.
+
 | Command | What it does |
 |---|---|
-| `zcode-webui setup` | Wizard: environment checks (curl/dpkg-deb) → official runtime `~/.zcode/server` check + guidance on how to obtain it → credential check → downloads the renderer from the official CDN → writes `config.json` → optional systemd user unit → optional immediate start. Supports `--yes` (all defaults, no start) plus `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`, `--no-fetch`, `--no-start`, `--no-systemd` |
+| `zcode-webui setup` | Interactive wizard (steps above). Supports `--yes` (all defaults, no start) plus `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`, `--no-fetch`, `--no-start`, `--no-systemd` |
 | `zcode-webui start` | Run the service in the foreground (equals `node src/server.mjs`; args pass through) |
 | `zcode-webui fetch-renderer` | Download/update the official renderer (`ZCODE_VERSION`/`ZCODE_ARCH` override available) |
 | `zcode-webui doctor [--net]` | Environment and readiness checks (`--net` adds CDN/cloud API reachability checks) |
@@ -363,7 +393,7 @@ data as the WebUI):
 
 ## HTTP API
 
-- `GET <base>/api/health` — service status (renderer / runtime dir / login state / session counts: total, attached, background)
+- `GET <base>/api/health` — service status (renderer / runtime dir / login state / session counts: total, attached, background / reaper switch and TTL)
 - `POST <base>/api/sessions/terminate` — terminate ALL sessions immediately (including background sessions; use with care)
 - `POST <base>/api/login/start` — start the official CLI OAuth login (background subprocess)
 - `GET <base>/api/login/status` — login status, authorization URL, live output
@@ -405,6 +435,10 @@ Multiple tabs of the same browser run independently; the notice only appears whe
 an idle session or a page reload took its own session back. The parked page is paused — click the
 "take back" button in the notice to reclaim the session for that tab.
 
+**Q: How do I zoom the UI?**
+Ctrl+wheel or trackpad/touchscreen two-finger pinch (app zoom 50%–200%, remembered per browser);
+keyboard Ctrl/⌘ + `+`/`-`/`0` remains the browser page zoom — the two coexist.
+
 **Q: Sending a message fails with "no usable model provider/model — please log in or configure an API key"?**
 First confirm `/login` shows logged in, then make sure the runtime pointed to by
 `ZCODE_SERVER_RUNTIME_ROOT` matches the renderer version (`npm run fetch-renderer` writes a version
@@ -443,6 +477,7 @@ ZCODE_WEBUI_BASE_PATH=/zcode npm run smoke -- /zcode
 node scripts/dev/reattach-test.mjs      # session-decoupling protocol regression: detach-keeps-alive / reattach / adopt / supersede / terminate
 node scripts/dev/reattach-ui-test.mjs   # real UI: reload mid-turn, re-attach, turn continues and result renders
 node scripts/dev/reattach-close-test.mjs # real UI: close tab mid-turn, background turn completes, new tab adopts
+node scripts/dev/zoom-test.mjs           # zoom regression: ctrl+wheel / pinch / normal scroll / zoom channel
 ```
 
 **Docker full-chain verification** (npm package install → wizard config → service start → bridges →
@@ -499,7 +534,8 @@ cli-config.example.json    official CLI model config template (sanitized sample)
 scripts/fetch-renderer.sh  downloads the official client from the official CDN and extracts the renderer (vendor/renderer, not committed)
 scripts/extract-asar.cjs   installer unpacker
 scripts/smoke-test.mjs     smoke test
-scripts/dev/*.mjs          Playwright end-to-end dev scripts
+scripts/docker/            Docker full-chain verification (verify.sh + container-verify.sh)
+scripts/dev/*.mjs          Playwright end-to-end dev scripts (session takeover + zoom regressions included)
 ```
 
 ## License and notices
