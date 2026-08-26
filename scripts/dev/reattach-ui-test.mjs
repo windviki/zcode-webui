@@ -1,6 +1,7 @@
-// Real-renderer test for session detachment/reattach:
+// Real-renderer test for session detachment/clean reload:
 // start a real turn, reload the page mid-turn, and verify that
-// 1) the new page re-attaches to the SAME host ('host reattached' log),
+// 1) the new page gets a FRESH host ('host spawned' log again; the old pipe is
+//    never shared with a second renderer),
 // 2) the UI renders (no parked banner / no error banner),
 // 3) the turn keeps running to completion and the reply is visible.
 // Costs one tiny model call. Usage: node scripts/dev/reattach-ui-test.mjs
@@ -60,12 +61,12 @@ try {
   // ---- reload mid-turn: the page must re-attach to the same host ----
   console.log('>>> reloading mid-turn');
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-  let reattached = false;
-  for (let i = 0; i < 60 && !reattached; i++) {
+  let respawned = false;
+  for (let i = 0; i < 60 && !respawned; i++) {
     await page.waitForTimeout(1000);
-    reattached = logs.some((t) => t.indexOf('host reattached') >= 0);
+    respawned = logs.filter((t) => t.indexOf('host spawned') >= 0).length >= 2;
   }
-  check('page re-attached to the same host', reattached);
+  check('page got a fresh host after reload', respawned);
 
   await page.waitForTimeout(5000);
   const afterReload = await page.evaluate(() => ({

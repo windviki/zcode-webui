@@ -1,8 +1,11 @@
-// Reattach/adopt/supersede tests for the host session registry:
-// 1. close ws normally -> host is DETACHED (kept alive), same tab re-attaches to it
-// 2. a new tab of the same browser adopts a detached host
-// 3. a second ws for the same tab supersedes the first (4001)
-// 4. close code 4000 terminates the host
+// Session lifecycle regression: ONE host per renderer for the host's whole life.
+// All assertions are DELTA-based so the test coexists with real user tabs.
+// 1. closing a ws detaches the host (kept alive)
+// 2. reloading the same tab spawns a FRESH host (new pid, fresh Initialize) and
+//    keeps the recently active old host in the background (no pipe sharing)
+// 3. a second live tab gets its own fresh host
+// 4. a second ws for the same tab parks the first (4001) and gets a fresh host
+// 5. close code 4000 terminates the host
 // Usage: node scripts/dev/reattach-test.mjs [baseURL]
 import WebSocket from 'ws';
 
@@ -22,7 +25,7 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function waitFor(fn, timeoutMs, label) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
-    const v = fn();
+    const v = await fn();
     if (v) return v;
     await sleep(120);
   }
@@ -31,10 +34,6 @@ async function waitFor(fn, timeoutMs, label) {
 async function health() {
   return await fetch(BASE + 'api/health').then((r) => r.json());
 }
-
-// start from a clean slate (terminate any hosts left over from earlier runs)
-await fetch(BASE + 'api/sessions/terminate', { method: 'POST' }).catch(() => {});
-await sleep(500);
 
 const idx = await fetch(BASE).then((r) => r.text());
 const m = /window\.__ZCODE_WEBUI_CONFIG__ = (\{.*?\});/.exec(idx);
@@ -76,57 +75,58 @@ function openWs(tab, client) {
 }
 
 try {
-  // ---- case 1: detach + reattach on the same tab ----
-  let wsA = openWs('t1', 'client-a');
+  // ---- case 1: close -> detached (kept alive) ----
+  const beforeA = (await health()).sessions;
+  const wsA = openWs('t1', 'client-a');
   await wsA.openPromise;
   await waitFor(() => wsA.initSeen && wsA.replies > 0, 25000, 'wsA init+reply');
   const pidA = wsA.pid;
-  check('wsA spawned host (pid=' + pidA + ')', !!pidA);
+  check('wsA fresh host (pid=' + pidA + ')', !!pidA);
   wsA.close(1000, 'tab closed');
-  await waitFor(async () => (await health()).sessions.detached >= 1, 8000, 'detach reflected in health');
+  await waitFor(async () => (await health()).sessions.detached >= beforeA.detached + 1, 8000, 'detach reflected in health');
   const h1 = await health();
-  check('wsA close -> host detached (kept alive)', h1.sessions.total >= 1 && h1.sessions.detached >= 1 && h1.sessions.attached === 0, JSON.stringify(h1.sessions));
+  check('wsA close -> host detached (kept alive)', h1.sessions.detached >= beforeA.detached + 1, JSON.stringify(h1.sessions));
 
+  // ---- case 2: reloading the tab spawns a FRESH host; the recently active old
+  // host is kept in the background instead of being shared with the new renderer ----
+  const beforeB = (await health()).sessions;
   const wsB = openWs('t1', 'client-a');
   await wsB.openPromise;
-  await waitFor(() => wsB.ready, 10000, 'wsB ready');
-  const reattachLine = wsB.texts.find((t) => t.includes('reattached'));
-  check('wsB re-attached to the same host', !!reattachLine && wsB.pid === pidA, 'line=' + String(reattachLine));
-  wsB.send(REQ);
-  await waitFor(() => wsB.replies > 0, 25000, 'wsB round-trip');
-  check('wsB can drive the re-attached host (round-trip)', wsB.replies > 0);
-  wsB.close(4000, 'terminate');
-  await waitFor(async () => (await health()).sessions.total === 0, 8000, 'terminate reflected in health');
-  check('code 4000 terminates the host', true);
+  await waitFor(() => wsB.ready && wsB.initSeen, 25000, 'wsB fresh host ready');
+  check('wsB got a FRESH host (new pid)', !!wsB.pid && wsB.pid !== pidA, 'pidB=' + wsB.pid + ' pidA=' + pidA);
+  await waitFor(async () => (await health()).sessions.total >= beforeB.total + 1, 8000, 'old host kept, new host added');
+  const h2 = await health();
+  check('old host kept in background (no pipe sharing)', h2.sessions.total >= beforeB.total + 1 && h2.sessions.detached >= 1, JSON.stringify(h2.sessions));
+  check('wsB round-trip on fresh host', wsB.replies > 0);
 
-  // ---- case 2: another tab of the same browser adopts a detached host ----
-  const wsC = openWs('t2', 'client-b');
+  // ---- case 3: a second live tab is independent ----
+  const beforeC = (await health()).sessions;
+  const wsC = openWs('t2', 'client-a');
   await wsC.openPromise;
-  await waitFor(() => wsC.initSeen && wsC.replies > 0, 25000, 'wsC init+reply');
-  const pidC = wsC.pid;
-  wsC.close(1000, 'tab closed');
-  await sleep(800);
-  const wsD = openWs('t3', 'client-b'); // different tab, same browser cookie
-  await wsD.openPromise;
-  await waitFor(() => wsD.pid, 10000, 'wsD attached');
-  check('new tab adopted the detached host', wsD.pid === pidC, 'pidD=' + wsD.pid + ' pidC=' + pidC);
-  wsD.send(REQ);
-  await waitFor(() => wsD.replies > 0, 25000, 'wsD round-trip');
-  check('adopted host still answers', wsD.replies > 0);
-  wsD.close(4000, 'terminate');
+  await waitFor(() => wsC.ready && wsC.initSeen, 25000, 'wsC fresh host ready');
+  await waitFor(async () => (await health()).sessions.attached >= beforeC.attached + 1, 8000, 'wsC host attached');
+  check('second live tab gets its own fresh host', wsC.pid && wsC.pid !== wsB.pid && wsC.replies > 0, 'pidC=' + wsC.pid);
+  wsC.close(4000, 'terminate');
 
-  // ---- case 3: second ws for the same tab supersedes the first ----
+  // ---- case 4: second ws for the same tab parks the first (4001) ----
+  const wsD = openWs('t4', 'client-c');
+  await wsD.openPromise;
+  await waitFor(() => wsD.initSeen, 25000, 'wsD init');
   const wsE = openWs('t4', 'client-c');
   await wsE.openPromise;
-  await waitFor(() => wsE.initSeen, 25000, 'wsE init');
-  const wsF = openWs('t4', 'client-c');
+  await waitFor(() => wsE.initSeen && wsD.closedCode !== null, 25000, 'wsD parked, wsE fresh');
+  check('wsD was parked with 4001', wsD.closedCode === 4001, 'code=' + wsD.closedCode);
+  check('wsE got a fresh host (no pipe sharing)', wsE.pid && wsE.pid !== wsD.pid, 'pidE=' + wsE.pid + ' pidD=' + wsD.pid);
+  wsE.close(4000, 'terminate');
+
+  // ---- case 5: code 4000 terminates ----
+  const beforeF = (await health()).sessions;
+  const wsF = openWs('t5', 'client-c');
   await wsF.openPromise;
-  await waitFor(() => wsF.pid, 10000, 'wsF attached');
-  await waitFor(() => wsE.closedCode !== null, 8000, 'wsE closed by supersede');
-  check('wsE was superseded with 4001', wsE.closedCode === 4001, 'code=' + wsE.closedCode);
-  check('wsF took over the same host', wsF.pid === wsE.pid, 'pidF=' + wsF.pid + ' pidE=' + wsE.pid);
+  await waitFor(() => wsF.initSeen, 25000, 'wsF init');
   wsF.close(4000, 'terminate');
-  await waitFor(async () => (await health()).sessions.total === 0, 8000, 'cleanup');
+  await waitFor(async () => (await health()).sessions.total <= beforeF.total, 8000, 'host terminated');
+  check('code 4000 terminates the host', true);
 
   const failed = checks.filter((c) => !c.ok).length;
   console.log(failed === 0 ? 'REATTACH OK' : 'REATTACH FAILED (' + failed + ')');

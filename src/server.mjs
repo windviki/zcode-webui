@@ -8,7 +8,7 @@
 
 import http from 'node:http';
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,6 +71,13 @@ const WS_READY = '{"kind":"zcode-webui-ready"}';
 // tab id identifies one tab across reloads. Together they let us re-attach a tab to
 // the host process it was using before a reload / disconnect, so tasks keep running
 // in the background instead of dying with the tab.
+//
+// Sessions are keyed by a stable USER key (derived from the shared ZCode
+// credentials) instead of the cookie: the same account opening the WebUI from
+// different browsers/devices sequentially reuses the same detached host instead
+// of spawning a second one for the same session — which prevents one session
+// being executed twice. The cookie remains the fallback when no credentials
+// exist (per-browser, as before).
 function parseCookies(header) {
   const out = {};
   if (!header) return out;
@@ -83,8 +90,37 @@ function parseCookies(header) {
   return out;
 }
 const CLIENT_COOKIE = 'zwebui_client';
-function sessionKey(clientKey, tabId) {
-  return (clientKey || ('tab:' + tabId)) + ':' + (tabId || 'untabbed');
+function sessionKey(userKey, tabId) {
+  return (userKey || ('tab:' + tabId)) + ':' + (tabId || 'untabbed');
+}
+
+// stable per-account key (in-memory only, never logged in full; the account id
+// itself stays out of logs by using a short hash)
+let userKeyCache = { key: '', at: 0 };
+function resolveUserKey(clientKey) {
+  const now = Date.now();
+  if (userKeyCache.key && now - userKeyCache.at < 30000) return userKeyCache.key;
+  let key = '';
+  try {
+    const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
+    const raw = JSON.parse(readFileSync(path.join(zhome, 'v2', 'credentials.json'), 'utf8'));
+    for (const k of ['oauth:bigmodel:user_info', 'oauth:zai:user_info']) {
+      if (!raw[k]) continue;
+      let info = raw[k];
+      if (typeof info === 'string') { try { info = JSON.parse(info); } catch (_e) { /* keep raw */ } }
+      const id = (info && (info.id || info.sub || info.userId || info.user_id)) || (typeof info === 'string' ? info : '');
+      if (id) { key = (k.indexOf('bigmodel') >= 0 ? 'bm:' : 'zai:') + String(id); break; }
+    }
+    if (!key && raw.zcodejwttoken) {
+      key = 'jwt:' + createHash('sha256').update(String(raw.zcodejwttoken)).digest('hex').slice(0, 16);
+    }
+  } catch (_e) { /* ignore */ }
+  if (!key) key = 'cookie:' + (clientKey || 'anon');
+  userKeyCache = { key, at: now };
+  return key;
+}
+function shortUserKey(userKey) {
+  return createHash('sha256').update(userKey).digest('hex').slice(0, 8);
 }
 
 // Detached hosts (tab closed) are kept alive so their tasks can finish. Auto-reap
@@ -271,12 +307,12 @@ function openHostPipe() {
 }
 
 // ---------- host sessions ----------
-// One host process per (clientKey, tabId) session. Hosts are NOT killed when the
+// One host process per (userKey, tabId) session. Hosts are NOT killed when the
 // browser tab / websocket goes away: they keep running their turns in the background
 // and can be re-attached by a later tab (same tab id after a reload, or any tab of
 // the same browser adopting a detached host).
 const sessions = new Map();       // sessionKey -> session
-const clientSessions = new Map(); // clientKey -> Set(session)
+const userSessions = new Map();   // userKey -> Set(session)
 const httpRelays = new Map();     // id -> {pipe, queue, waiter, waiterTimer, lastSeen} (HTTP long-poll fallback)
 
 function rpcLogOut(payload) {
@@ -303,10 +339,10 @@ function writeToHost(session, payload) {
 
 function removeSession(session) {
   for (const [k, s] of sessions) if (s === session) sessions.delete(k);
-  const set = clientSessions.get(session.clientKey);
+  const set = userSessions.get(session.userKey);
   if (set) {
     set.delete(session);
-    if (set.size === 0) clientSessions.delete(session.clientKey);
+    if (set.size === 0) userSessions.delete(session.userKey);
   }
 }
 
@@ -323,7 +359,7 @@ function terminateSession(session, reason) {
   removeSession(session);
 }
 
-function createSession(clientKey, tabId) {
+function createSession(userKey, tabId) {
   let child;
   try {
     const host = spawnHost({ serverRoot, log: (l) => console.error(l) });
@@ -332,14 +368,14 @@ function createSession(clientKey, tabId) {
     throw new Error('failed to spawn host: ' + err.message);
   }
   const session = {
-    id: randomUUID(), clientKey, tabId, child, hello: null,
+    id: randomUUID(), userKey, tabId, child, hello: null,
     ws: null, wsAttachedAt: 0, detachedAt: 0, lastFrameAt: 0,
     framesIn: 0, framesOut: 0, pendingInbound: [], closed: false,
   };
-  console.error('[zcode-webui] host spawned pid=' + child.pid + ' client=' + (clientKey || '(no-cookie)') + '/' + (tabId || '').slice(0, 8));
-  sessions.set(sessionKey(clientKey, tabId), session);
-  let set = clientSessions.get(clientKey);
-  if (!set) { set = new Set(); clientSessions.set(clientKey, set); }
+  console.error('[zcode-webui] host spawned pid=' + child.pid + ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
+  sessions.set(sessionKey(userKey, tabId), session);
+  let set = userSessions.get(userKey);
+  if (!set) { set = new Set(); userSessions.set(userKey, set); }
   set.add(session);
 
   // stdout must be drained forever — even with no tab attached — so the pipe never
@@ -347,10 +383,6 @@ function createSession(clientKey, tabId) {
   const parser = new FrameParser((payload) => {
     session.framesOut++;
     session.lastFrameAt = Date.now();
-    // remember the host's Initialize frame (the first thing it pushes after the
-    // stdio handshake) so we can replay it to a freshly re-attached renderer —
-    // the renderer only starts its boot sequence after receiving it.
-    if (session.framesOut === 1) session.initializePayload = Buffer.from(payload);
     if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogOut(payload);
     const ws = session.ws;
     if (!session.closed && ws && ws.readyState === 1) {
@@ -358,7 +390,6 @@ function createSession(clientKey, tabId) {
     }
   });
   session.parser = parser;
-  session.initializePayload = null;
   child.on('exit', (code, signal) => {
     session.closed = true;
     if (session.ws) { try { session.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ } }
@@ -397,43 +428,61 @@ function createSession(clientKey, tabId) {
   return session;
 }
 
-function rebindSession(session, clientKey, tabId) {
+function rebindSession(session, userKey, tabId) {
   for (const [k, s] of sessions) if (s === session) sessions.delete(k);
-  let set = clientSessions.get(session.clientKey);
+  let set = userSessions.get(session.userKey);
   if (set) {
     set.delete(session);
-    if (set.size === 0) clientSessions.delete(session.clientKey);
+    if (set.size === 0) userSessions.delete(session.userKey);
   }
-  session.clientKey = clientKey;
+  session.userKey = userKey;
   session.tabId = tabId;
-  sessions.set(sessionKey(clientKey, tabId), session);
-  set = clientSessions.get(clientKey);
-  if (!set) { set = new Set(); clientSessions.set(clientKey, set); }
+  sessions.set(sessionKey(userKey, tabId), session);
+  set = userSessions.get(userKey);
+  if (!set) { set = new Set(); userSessions.set(userKey, set); }
   set.add(session);
 }
 
+// Retire a host whose tab is being reloaded/taken over. The official protocol
+// pipe is single-client: a second renderer MUST NEVER attach to it (message-id
+// spaces collide and stale replies crash the renderer, and one session can end
+// up being driven twice). So the old host either:
+//   - terminates immediately when idle, or
+//   - keeps running DETACHED in the background when it looks busy (fresh frames
+//     or a running task in the index), moved out of the tab key so no renderer
+//     can ever attach to it again; the reaper cleans it up when it goes idle.
+async function retireSession(session, reason) {
+  if (session.closed) return;
+  if (session.ws) {
+    try { session.ws.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
+    session.ws = null;
+  }
+  const framesFresh = session.lastFrameAt && Date.now() - session.lastFrameAt < FRAME_QUIET_MS;
+  const busy = framesFresh || await hasRunningTask(tasksIndexPath());
+  if (busy) {
+    session.detachedAt = Date.now();
+    rebindSession(session, 'bg:' + randomUUID(), (session.tabId || 'tab') + '-bg');
+    console.error('[zcode-webui] retiring busy host to background pid=' + session.child.pid + ' reason=' + reason);
+  } else {
+    console.error('[zcode-webui] retiring idle host pid=' + session.child.pid + ' reason=' + reason);
+    terminateSession(session, reason);
+  }
+}
+
 function attachRelay(ws, session) {
-  // reload race: a previous websocket for the same (client, tab) may still be open;
-  // park it so only one connection drives the host at a time.
-  const prev = session.ws;
-  if (prev && prev !== ws) {
-    try { prev.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
+  // one renderer per host, for the host's whole lifetime (fresh host per page load)
+  if (session.ws) {
+    try { session.ws.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
   }
   session.ws = ws;
   session.wsAttachedAt = Date.now();
-  const reattach = !!session.detachedAt;
   session.detachedAt = 0;
-  console.error('[zcode-webui] host ' + (reattach ? 'REATTACHED' : 'attached') + ' pid=' + session.child.pid + ' client=' + (session.clientKey || '(no-cookie)') + '/' + (session.tabId || '').slice(0, 8));
+  console.error('[zcode-webui] host attached pid=' + session.child.pid + ' user=' + shortUserKey(session.userKey) + '/' + (session.tabId || '').slice(0, 8));
 
   const log = (line) => {
     try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
   };
-  log('[zcode-webui] host ' + (reattach ? 'reattached' : 'spawned') + ' pid=' + session.child.pid);
-  if (reattach && session.initializePayload) {
-    // kick the fresh renderer's boot sequence by replaying the host Initialize
-    try { ws.send(session.initializePayload, { binary: true }); } catch (_e) { /* ignore */ }
-    console.error('[zcode-webui] replayed host initialize to re-attached renderer pid=' + session.child.pid);
-  }
+  log('[zcode-webui] host spawned pid=' + session.child.pid);
 
   ws.on('message', (data, isBinary) => {
     if (session.closed) return;
@@ -460,7 +509,7 @@ function attachRelay(ws, session) {
       return;
     }
     // DETACH: the host keeps running in the background until its task finishes,
-    // waits for user input, or is re-attached by another tab.
+    // waits for user input, or is reaped as idle.
     session.detachedAt = Date.now();
     console.error('[ws] DETACHED (host keeps running) pid=' + session.child.pid + ' frames in=' + session.framesIn + ' out=' + session.framesOut);
   });
@@ -767,46 +816,44 @@ server.on('upgrade', (req, socket, head) => {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     return socket.destroy();
   }
-  // resolve the host session this connection should drive:
-  // 1. same (client, tab) as an existing session          -> re-attach (page reload)
-  // 2. ?takeover=1 with an active session for this client -> steal it (parked tab takes back over)
-  // 3. a detached session of this client                  -> adopt it (tab reopened after close)
-  // 4. otherwise                                          -> spawn a fresh host
+  // One host pipe serves exactly ONE renderer for its whole lifetime (the
+  // official protocol is single-client). Every page load / tab takeover gets a
+  // FRESH host; the previous host of the same (user, tab) — or any host of this
+  // user when ?takeover=1 — is parked (4001) and retired: idle hosts terminate
+  // immediately, busy hosts keep running detached in the background. Session
+  // data lives in the shared store, so the new page sees the same sessions.
   const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+  const userKey = resolveUserKey(clientKey);
   const tabId = (q.get('tab') || '').slice(0, 128);
   const takeover = q.get('takeover') === '1';
-  let session = sessions.get(sessionKey(clientKey, tabId));
-  if (session && session.closed) session = null;
-  if (!session && takeover && clientKey) {
-    const actives = [...(clientSessions.get(clientKey) || [])].filter((s) => !s.closed && s.ws);
-    if (actives.length) {
-      session = actives[0];
-      console.error('[zcode-webui] takeover: tab ' + tabId.slice(0, 8) + ' steals active host pid=' + session.child.pid);
-      rebindSession(session, clientKey, tabId);
+
+  (async () => {
+    const prev = sessions.get(sessionKey(userKey, tabId));
+    if (prev && !prev.closed) {
+      console.error('[zcode-webui] page reload for tab ' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + '): retiring previous host pid=' + prev.child.pid);
+      await retireSession(prev, 'page reload');
     }
-  }
-  if (!session && clientKey) {
-    const detached = [...(clientSessions.get(clientKey) || [])]
-      .filter((s) => !s.closed && !s.ws)
-      .sort((a, b) => (b.detachedAt || 0) - (a.detachedAt || 0));
-    if (detached.length) {
-      session = detached[0];
-      console.error('[zcode-webui] adopt detached host pid=' + session.child.pid + ' for tab ' + tabId.slice(0, 8));
-      rebindSession(session, clientKey, tabId);
+    if (takeover) {
+      for (const s of [...(userSessions.get(userKey) || [])]) {
+        if (s.closed || s === prev) continue;
+        if (s.ws) {
+          console.error('[zcode-webui] takeover: tab ' + tabId.slice(0, 8) + ' parks host pid=' + s.child.pid + ' (user ' + shortUserKey(userKey) + ')');
+          await retireSession(s, 'takeover');
+        }
+      }
     }
-  }
-  if (!session) {
+    let session = null;
     try {
-      session = createSession(clientKey, tabId);
+      session = createSession(userKey, tabId);
     } catch (err) {
       console.error('[ws] host spawn failed: ' + err.message);
       socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
       return socket.destroy();
     }
-  }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req, session);
-  });
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req, session);
+    });
+  })();
 });
 wss.on('connection', (ws, req, session) => {
   console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));

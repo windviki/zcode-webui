@@ -17,7 +17,7 @@ sessions and credentials stay on your own server.
 - 🌐 Any device, no client install: just open the URL (falls back to HTTP long-polling when reverse proxies block WebSocket upgrades)
 - 🔑 Flexible sign-in: built-in OAuth login, or import credentials exported from a logged-in official desktop app — shares the official credential store
 - 🔍 Desktop-grade zoom: Ctrl+wheel or trackpad/touchscreen **two-finger pinch** zooms the UI (50%–200%, remembered per browser)
-- ⏳ **Tasks are decoupled from tabs**: closing a tab / losing the network does NOT stop a task — it keeps running server-side until it finishes or waits for your input; reopening the page automatically re-attaches to the background session (multiple tabs of the same browser run independently; a superseded tab shows a notice with a one-click take-back)
+- ⏳ **Tasks are decoupled from tabs**: closing a tab / losing the network does NOT stop a task — it keeps running server-side until it finishes or waits for your input; reopening the page loads the latest data of the same session automatically (session data is persisted to the shared store; **every page load uses a brand-new runtime process** that is never shared with other devices/tabs — no double execution, no protocol cross-talk; a busy old process keeps running in the background, an idle one retires immediately)
 - ♻️ Automatic session maintenance: idle background sessions are auto-reaped under a triple guard (detached duration + frame silence + no running task); running or waiting-for-input sessions are never reaped; when auto-reconnect gives up, the page shows a one-click "reconnect" button
 - 🧭 One-command npm deployment: `npm i -g` then `zcode-webui setup` walks you through all preparation, configuration and startup
 - 📦 No official code is bundled, modified, or redistributed: renderer assets are downloaded by the deployer from the official CDN with a local script
@@ -280,13 +280,16 @@ location /zcode/ {
 5. Phones and tablets just open the same address to continue sessions and dispatch tasks.
 
 **Tab/task lifecycle** (important): each browser tab connects to one server-side "session" (an official
-runtime process). **Closing a tab does NOT end the task** — the runtime keeps executing in the
-background until the task completes or waits for your input; reopening the page (reload the same tab
-or open a new one) automatically re-attaches to that background session so you can watch progress or
-answer. Sessions with an online page are **never reaped**, no matter how long they sit idle; short
-network drops trigger automatic reconnects, and if reconnecting gives up the page shows a one-click
-"reconnect" button. Multiple tabs of the same browser run independently; if a tab's session is taken
-over by another tab, the old page shows a notice with a "take back" button. Note: **restarting the
+runtime process), and **one process serves exactly one page for its whole lifetime**. **Closing a tab
+does NOT end the task** — the runtime keeps executing in the background until the task completes or
+waits for your input; reopening the page (reload the same tab or open a new one) spawns a **fresh
+process** that loads the latest data of the same session (sessions and tasks live in the shared
+server-side store, so progress is visible immediately). A just-departed old process keeps running in
+the background when it is busy (mid-task / waiting for input) and retires immediately when idle.
+Sessions with an online page are **never reaped**, no matter how long they sit idle; short network
+drops trigger automatic reconnects, and if reconnecting gives up the page shows a one-click
+"reconnect" button. Multiple tabs/devices of the same account use independent processes; if a tab is
+superseded, the old page shows a notice with a "take back" button. Note: **restarting the
 zcode-webui service process interrupts background tasks** (same as restarting the official desktop
 app) — do not restart the service during long tasks.
 
@@ -474,9 +477,10 @@ billed per the official subscription rules.
 ```bash
 npm run smoke                 # static serving + base path + WS/HTTP dual-bridge smoke test
 ZCODE_WEBUI_BASE_PATH=/zcode npm run smoke -- /zcode
-node scripts/dev/reattach-test.mjs      # session-decoupling protocol regression: detach-keeps-alive / reattach / adopt / supersede / terminate
-node scripts/dev/reattach-ui-test.mjs   # real UI: reload mid-turn, re-attach, turn continues and result renders
-node scripts/dev/reattach-close-test.mjs # real UI: close tab mid-turn, background turn completes, new tab adopts
+node scripts/dev/reattach-test.mjs      # session lifecycle regression: detach-keeps-alive / fresh host per load / background busy host / supersede / terminate
+node scripts/dev/reattach-ui-test.mjs   # real UI: reload mid-turn, fresh host loads the session, turn continues and result renders
+node scripts/dev/reattach-close-test.mjs # real UI: close tab mid-turn, background turn completes, new tab loads the same session
+node scripts/dev/reload-crash-test.mjs  # regression: no official-renderer "reading 'kind'" crash after reload
 node scripts/dev/zoom-test.mjs           # zoom regression: ctrl+wheel / pinch / normal scroll / zoom channel
 ```
 

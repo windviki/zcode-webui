@@ -1,6 +1,7 @@
 // Close-tab-mid-turn test: the exact scenario the user reported.
-// Start a real turn, CLOSE the page, open a NEW page, verify it adopts the
-// background host and the turn keeps running to completion.
+// Start a real turn, CLOSE the page, open a NEW page: the new tab gets a FRESH
+// host (pipes are never shared between renderers) and the background turn keeps
+// running to completion.
 // Costs one tiny model call. Usage: node scripts/dev/reattach-close-test.mjs
 import { chromium } from 'playwright-core';
 import { DatabaseSync } from 'node:sqlite';
@@ -74,22 +75,23 @@ try {
   await page.waitForTimeout(6000);
 
   // ---- close the tab completely (the host must keep running detached) ----
+  const beforeClose = (await fetch(BASE + 'api/health').then((r) => r.json())).sessions;
   await page.close();
   await new Promise((r) => setTimeout(r, 3000));
   const h1 = await fetch(BASE + 'api/health').then((r) => r.json());
-  check('host detached (kept alive) after tab close', h1.sessions.detached >= 1 && h1.sessions.attached === 0, JSON.stringify(h1.sessions));
+  check('host detached (kept alive) after tab close', h1.sessions.detached >= beforeClose.detached + 1, JSON.stringify(h1.sessions));
 
-  // ---- open a brand new tab: it must adopt the background host ----
+  // ---- open a brand new tab: it must get a FRESH host (no pipe sharing) ----
   const page2 = await ctx.newPage();
   attachConsole(page2, 'tab2');
-  console.log('>>> tab2 goto (adopt expected)');
+  console.log('>>> tab2 goto (fresh host expected)');
   await page2.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  let adopted = false;
-  for (let i = 0; i < 60 && !adopted; i++) {
+  let spawned = false;
+  for (let i = 0; i < 60 && !spawned; i++) {
     await page2.waitForTimeout(1000);
-    adopted = logs.some((t) => t.indexOf('tab2') >= 0 && t.indexOf('host reattached') >= 0);
+    spawned = logs.some((t) => t.indexOf('tab2') >= 0 && t.indexOf('host spawned') >= 0);
   }
-  check('new tab adopted the detached host', adopted);
+  check('new tab got a fresh host', spawned);
 
   await page2.waitForTimeout(8000);
   const st = await page2.evaluate(() => ({
