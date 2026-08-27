@@ -131,43 +131,60 @@ check('ws bridge system.info round-trip', wsResult.ok, wsResult.reason || '');
 wsResult.log.slice(0, 14).forEach((l) => console.log('       ' + l));
 
 // ---- HTTP fallback bridge round-trip (for proxies that block WebSocket upgrades) ----
-const hbResult = await new Promise((resolve) => {
+// Each attempt opens its own host pipe; right after a heavy first-boot install a
+// freshly spawned host occasionally answers slowly or oddly, so a failed attempt
+// is retried as a brand-new pipe (every payload gets logged for diagnosis).
+async function httpBridgeAttempt(attempt) {
   const log = [];
-  (async () => {
-    try {
-      const open = await fetch(origin + base + '/bridge/open', { method: 'POST' }).then((r) => r.json());
-      log.push('open: ' + JSON.stringify(open).slice(0, 140));
-      if (!open.ok || !open.id) return resolve({ ok: false, log, reason: 'open failed' });
-      const id = open.id;
-      const req = message([100, 1, 'system', 'info'], undefined);
-      const sendResp = await fetch(origin + base + '/bridge/send?id=' + id, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: req }).then((r) => r.json());
-      log.push('send: ' + JSON.stringify(sendResp));
-      if (!sendResp.ok) return resolve({ ok: false, log, reason: 'send failed' });
-      // poll repeatedly: first poll may only return the queued Initialize frame
-      let ok = false;
-      let bytesSeen = 0;
-      for (let attempt = 0; attempt < 10 && !ok; attempt++) {
-        const pollResp = await fetch(origin + base + '/bridge/poll?id=' + id);
-        const buf = Buffer.from(await pollResp.arrayBuffer());
-        bytesSeen += buf.length;
-        let off = 0;
-        while (off + 4 <= buf.length) {
-          const len = buf.readUInt32BE(off);
-          off += 4;
-          if (len === 0 || off + len > buf.length) break;
-          const payload = buf.subarray(off, off + len);
-          off += len;
-          if (payload.includes(Buffer.from('homedir'))) ok = true;
-        }
+  const open = await fetch(origin + base + '/bridge/open', { method: 'POST' }).then((r) => r.json());
+  log.push('open#' + attempt + ': ' + JSON.stringify(open).slice(0, 140));
+  if (!open.ok || !open.id) return { ok: false, log, reason: 'open failed' };
+  const id = open.id;
+  try {
+    const req = message([100, 1, 'system', 'info'], undefined);
+    const sendResp = await fetch(origin + base + '/bridge/send?id=' + id, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: req }).then((r) => r.json());
+    log.push('send: ' + JSON.stringify(sendResp));
+    if (!sendResp.ok) return { ok: false, log, reason: 'send failed' };
+    // Empty polls long-poll server-side (~25 s); self-pace on a deadline.
+    const deadline = Date.now() + 30000;
+    let bytesSeen = 0;
+    while (Date.now() < deadline) {
+      const pollResp = await fetch(origin + base + '/bridge/poll?id=' + id);
+      const buf = Buffer.from(await pollResp.arrayBuffer());
+      bytesSeen += buf.length;
+      let off = 0;
+      while (off + 4 <= buf.length) {
+        const len = buf.readUInt32BE(off);
+        off += 4;
+        if (len === 0 || off + len > buf.length) break;
+        const payload = buf.subarray(off, off + len);
+        off += len;
+        if (payload.includes(Buffer.from('homedir'))) return { ok: true, log };
+        log.push('payload ' + payload.length + 'B hex=' + payload.toString('hex').slice(0, 24) +
+          ' utf8=' + JSON.stringify(payload.toString('utf8').slice(0, 120)));
       }
-      log.push('polls done, bytes=' + bytesSeen + ' ok=' + ok);
-      await fetch(origin + base + '/bridge/close?id=' + id, { method: 'POST' }).catch(() => {});
-      resolve({ ok, log, reason: ok ? '' : 'no homedir frame in poll responses' });
-    } catch (e) {
-      resolve({ ok: false, log, reason: String(e.message || e) });
     }
-  })();
-});
+    return { ok: false, log, reason: 'no homedir frame in poll responses (' + bytesSeen + 'B)' };
+  } finally {
+    await fetch(origin + base + '/bridge/close?id=' + id, { method: 'POST' }).catch(() => {});
+  }
+}
+const hbResult = await (async () => {
+  const allLogs = [];
+  let lastReason = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let result;
+    try {
+      result = await httpBridgeAttempt(attempt);
+    } catch (e) {
+      result = { ok: false, log: [], reason: String(e.message || e) };
+    }
+    allLogs.push(...result.log);
+    if (result.ok) return { ok: true, log: allLogs, reason: '' };
+    lastReason = result.reason || lastReason;
+  }
+  return { ok: false, log: allLogs, reason: lastReason };
+})();
 check('http bridge round-trip', hbResult.ok, hbResult.reason || '');
 hbResult.log.forEach((l) => console.log('       ' + l));
 

@@ -23,6 +23,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PATHS = resolvePaths(ROOT);
 
+let pkgVersion = '0.0.0';
+try { pkgVersion = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version || pkgVersion; } catch (_e) { /* ignore */ }
+
 // ---------- config ----------
 function argValue(name, fallback) {
   const args = process.argv.slice(2);
@@ -36,7 +39,10 @@ try {
   fileConfig = JSON.parse(readFileSync(PATHS.configFile, 'utf8'));
 } catch (_e) { /* ignore */ }
 
-const PORT = Number(process.env.ZCODE_WEBUI_PORT || argValue('port', fileConfig.port) || 3102);
+const PORT = (() => {
+  const n = Math.floor(Number(process.env.ZCODE_WEBUI_PORT || argValue('port', fileConfig.port) || 3102));
+  return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : 3102;
+})();
 const WORKSPACE = process.env.ZCODE_WEBUI_WORKSPACE || argValue('workspace', fileConfig.workspace) || os.homedir();
 const OAUTH_PROXY = process.env.ZCODE_WEBUI_OAUTH_PROXY || argValue('oauth-proxy', fileConfig.oauthProxy) || '';
 // proxy used by the spawned host/agent processes for ZCode cloud + model APIs
@@ -137,6 +143,9 @@ const DETACHED_TTL_MS = process.env.ZCODE_WEBUI_DETACHED_TTL_MS === undefined
   : Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS) || 0;
 const FRAME_QUIET_MS = Number(process.env.ZCODE_WEBUI_FRAME_QUIET_MS || 10 * 60 * 1000);
 const RUNNING_TASK_STALE_MS = Number(process.env.ZCODE_WEBUI_RUNNING_TASK_STALE_MS || 2 * 60 * 60 * 1000);
+// "a sibling host is actively driving turns" heuristic: protocol frames flowing
+// this recently mean the agent is mid-execution (streaming, tool calls, thinking)
+const ACTIVE_FRAME_MS = Math.max(Number(process.env.ZCODE_WEBUI_ACTIVE_FRAME_MS) || 120000, 15000);
 
 function tasksIndexPath() {
   const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
@@ -197,22 +206,29 @@ function send(res, status, body, headers = {}) {
 function sendJson(res, status, obj) {
   send(res, status, JSON.stringify(obj), { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
 }
+// %zz and other malformed escapes must not take the process down
+function safeDecode(s) {
+  try { return decodeURIComponent(s); } catch (_e) { return s; }
+}
 function safeJoin(dir, rel) {
   const p = path.normalize(path.join(dir, rel));
   if (!p.startsWith(dir + path.sep) && p !== dir) return null;
   return p;
 }
 function serveFile(res, filePath) {
-  if (!existsSync(filePath)) return send(res, 404, 'not found');
+  let st;
+  try { st = statSync(filePath); } catch (_e) { return send(res, 404, 'not found'); }
+  if (!st.isFile()) return send(res, 404, 'not found');
   const ext = path.extname(filePath).toLowerCase();
   const mime = MIME[ext] || 'application/octet-stream';
-  const size = statSync(filePath).size;
   res.writeHead(200, {
     'Content-Type': mime,
-    'Content-Length': String(size),
+    'Content-Length': String(st.size),
     'Cache-Control': 'no-cache',
   });
-  createReadStream(filePath).pipe(res);
+  const stream = createReadStream(filePath);
+  stream.on('error', () => { try { res.destroy(); } catch (_e) { /* ignore */ } });
+  stream.pipe(res);
 }
 
 // ---------- index.html transform ----------
@@ -346,6 +362,32 @@ function removeSession(session) {
   }
 }
 
+// Describe the OTHER hosts of this account — used to warn a freshly loaded page
+// that somewhere else (another device/tab closed earlier) an agent may still be
+// mid-turn on the same shared session data. Without this, a second device shows
+// stale persisted state ("looks stopped"), inviting a duplicate "continue"
+// message and two agents racing on the same workspace.
+function siblingSnapshot(userKey, { exceptSession = null, exceptTab = '' } = {}) {
+  const now = Date.now();
+  const out = [];
+  for (const s of [...(userSessions.get(userKey) || [])]) {
+    if ((exceptSession && s === exceptSession) || s.closed || !s.child) continue;
+    if (exceptTab && s.tabId === exceptTab) continue;
+    const lastFrameAgeMs = s.lastFrameAt ? now - s.lastFrameAt : Infinity;
+    out.push({
+      pid: s.child.pid,
+      attached: !!s.ws,
+      detachedAgoSec: s.detachedAt ? Math.round((now - s.detachedAt) / 1000) : null,
+      lastFrameAgeSec: Number.isFinite(lastFrameAgeMs) ? Math.round(lastFrameAgeMs / 1000) : null,
+      active: lastFrameAgeMs < ACTIVE_FRAME_MS,
+    });
+  }
+  return {
+    activeCount: out.filter((x) => x.active).length,
+    hosts: out.sort((a, b) => (a.lastFrameAgeSec ?? 1e9) - (b.lastFrameAgeSec ?? 1e9)),
+  };
+}
+
 function terminateSession(session, reason) {
   if (!session) return;
   session.closed = true;
@@ -357,6 +399,20 @@ function terminateSession(session, reason) {
     setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
   }
   removeSession(session);
+}
+
+// Release frames buffered while an adopting renderer was still mounting.
+function releaseHold(session) {
+  if (!session || !session.holdFrames) return;
+  session.holdFrames = false;
+  const ws = session.ws;
+  if (ws && ws.readyState === 1) {
+    for (const p of session.holdBuf.splice(0)) {
+      try { ws.send(p, { binary: true }); } catch (_e) { break; }
+    }
+  } else {
+    session.holdBuf.length = 0;
+  }
 }
 
 function createSession(userKey, tabId) {
@@ -371,6 +427,8 @@ function createSession(userKey, tabId) {
     id: randomUUID(), userKey, tabId, child, hello: null,
     ws: null, wsAttachedAt: 0, detachedAt: 0, lastFrameAt: 0,
     framesIn: 0, framesOut: 0, pendingInbound: [], closed: false,
+    firstDownstream: null, initForwarded: false,
+    holdFrames: false, holdBuf: [],
   };
   console.error('[zcode-webui] host spawned pid=' + child.pid + ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
   sessions.set(sessionKey(userKey, tabId), session);
@@ -383,9 +441,36 @@ function createSession(userKey, tabId) {
   const parser = new FrameParser((payload) => {
     session.framesOut++;
     session.lastFrameAt = Date.now();
+    if (!session.firstDownstream) {
+      // the host emits exactly one Initialize at startup; remember it so a later
+      // ADOPTING renderer can be replayed the full bootstrap even mid-stream
+      session.firstDownstream = Buffer.from(payload);
+      if (session.holdFrames && session.replayInitOnCapture) {
+        // adopter attached before the host had said anything: replay this frame
+        session.replayInitOnCapture = false;
+        session.holdBuf.push(Buffer.from(payload));
+        session.holdSkipOnce = true;
+      }
+    }
     if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogOut(payload);
+    // Mirror the official startup sequencing: the host emits Initialize and only
+    // afterwards accepts stdin traffic. Flush any client frames that arrived
+    // while the handshake was still in flight here — flushing them earlier
+    // (straight after hello-ack) demonstrably wedges the runtime's startup.
+    if (!session.initForwarded) {
+      session.initForwarded = true;
+      for (const p of session.pendingInbound.splice(0)) writeToHost(session, p);
+    }
     const ws = session.ws;
     if (!session.closed && ws && ws.readyState === 1) {
+      if (session.holdFrames) {
+        // adopted mid-stream: gate downstream frames until the fresh renderer
+        // finished mounting (its "port-ready" ack), so the first bytes it ever
+        // sees are our replayed Initialize, not an arbitrary stream chunk
+        if (session.holdSkipOnce) { session.holdSkipOnce = false; return; }
+        if (session.holdBuf.length < 256) session.holdBuf.push(Buffer.from(payload));
+        return;
+      }
       try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
     }
   });
@@ -406,7 +491,13 @@ function createSession(userKey, tabId) {
       // otherwise the hello JSON would contaminate the frame parser's buffer
       parser.push(rest);
       child.stdout.on('data', (d) => parser.push(d));
-      for (const p of session.pendingInbound.splice(0)) writeToHost(session, p);
+      // safety net in case this runtime flavor emits no Initialize-like leading frame
+      setTimeout(() => {
+        if (!session.closed && !session.initForwarded && session.pendingInbound.length) {
+          session.initForwarded = true;
+          for (const p of session.pendingInbound.splice(0)) writeToHost(session, p);
+        }
+      }, 3000).unref();
       if (session.ws && session.ws.readyState === 1) {
         try { session.ws.send('[zcode-webui] handshake ok, host version=' + hello.version); } catch (_e) { /* ignore */ }
       }
@@ -479,14 +570,16 @@ function attachRelay(ws, session) {
   session.detachedAt = 0;
   console.error('[zcode-webui] host attached pid=' + session.child.pid + ' user=' + shortUserKey(session.userKey) + '/' + (session.tabId || '').slice(0, 8));
 
-  const log = (line) => {
-    try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
-  };
-  log('[zcode-webui] host spawned pid=' + session.child.pid);
-
+  // Register inbound handling BEFORE any first-byte notice goes out below:
+  // clients that answer the ready signal instantly would otherwise race this
+  // registration and their first protocol frame would be dropped.
   ws.on('message', (data, isBinary) => {
     if (session.closed) return;
-    if (!isBinary) return; // string messages are reserved for future control
+    if (!isBinary) {
+      // control text from our own bootstrap bridge
+      if (String(data) === '{"kind":"zcode-webui-port-ready"}') releaseHold(session);
+      return;
+    }
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (session.hello) writeToHost(session, payload);
     else session.pendingInbound.push(payload);
@@ -538,6 +631,15 @@ if (DETACHED_TTL_MS > 0) {
 
 // ---------- http server ----------
 const server = http.createServer((req, res) => {
+  try {
+    handleRequest(req, res);
+  } catch (err) {
+    console.error('[http] handler error: ' + ((err && err.stack) || err));
+    try { sendJson(res, 500, { ok: false, error: 'internal error' }); } catch (_e) { /* headers sent */ }
+  }
+});
+
+function handleRequest(req, res) {
   // request logging (diagnostics)
   if (!req.url.startsWith('/assets/') && !req.url.startsWith('/material-icons/') && !req.url.startsWith('/pdfjs/')) {
     console.error('[http] ' + new Date().toISOString() + ' ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' ' + req.method + ' ' + req.url + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
@@ -546,7 +648,7 @@ const server = http.createServer((req, res) => {
   if (!parseCookies(req.headers.cookie)[CLIENT_COOKIE]) {
     res.setHeader('Set-Cookie', CLIENT_COOKIE + '=' + randomUUID() + '; Path=/; SameSite=Lax; HttpOnly; Max-Age=31536000');
   }
-  let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  let urlPath = safeDecode((req.url || '/').split('?')[0]);
   if (base) {
     if (urlPath === base) {
       res.writeHead(302, { Location: base + '/' });
@@ -561,7 +663,7 @@ const server = http.createServer((req, res) => {
   if (urlPath === '/api/health') {
     const all = [...sessions.values()];
     return sendJson(res, 200, {
-      ok: true, name: 'zcode-webui', base,
+      ok: true, name: 'zcode-webui', version: pkgVersion, base,
       dataHome: PATHS.dataHome,
       rendererLoaded: existsSync(path.join(RENDERER_DIR, 'index.html')),
       serverRoot: serverRoot || null, workspace: WORKSPACE,
@@ -691,14 +793,36 @@ const server = http.createServer((req, res) => {
   }
 
   if (urlPath === '/api/sessions/terminate' && req.method === 'POST') {
-    // ops endpoint: terminate every host session (attached + detached) immediately
-    const n = sessions.size;
-    for (const s of [...sessions.values()]) terminateSession(s, 'api terminate');
-    for (const [, entry] of httpRelays) {
-      try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+    // ops endpoint: terminate every host session (attached + detached) immediately.
+    // ?user=1 limits it to the CALLER's account hosts, and &keepTab=<tabId>
+    // spares the caller's own live page (used by the "stop background execution"
+    // banner action so a second device can clear a duplicate driver safely).
+    const url2 = new URL(req.url, 'http://x');
+    const scopeUser = url2.searchParams.get('user') === '1';
+    const keepTab = (url2.searchParams.get('keepTab') || '').slice(0, 128);
+    let targets = [...sessions.values()];
+    if (scopeUser) {
+      const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+      const callerKey = resolveUserKey(clientKey);
+      targets = targets.filter((s) => s.userKey === callerKey && !(keepTab && s.tabId === keepTab));
     }
-    httpRelays.clear();
-    return sendJson(res, 200, { ok: true, terminated: n });
+    for (const s of targets) terminateSession(s, scopeUser ? 'user terminate' : 'api terminate');
+    if (!scopeUser) {
+      for (const [, entry] of httpRelays) {
+        try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+      }
+      httpRelays.clear();
+    }
+    return sendJson(res, 200, { ok: true, terminated: targets.length });
+  }
+
+  // background-execution visibility for the current account: lets a freshly
+  // loaded second device learn whether another host is still mid-turn
+  if (urlPath === '/api/background' && req.method === 'GET') {
+    const q2 = new URL(req.url, 'http://x').searchParams;
+    const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+    const userKey = resolveUserKey(clientKey);
+    return sendJson(res, 200, siblingSnapshot(userKey, { exceptTab: (q2.get('tab') || '').slice(0, 128) }));
   }
 
   // import credentials (e.g. exported from an already-logged-in ZCode desktop)
@@ -797,12 +921,24 @@ const server = http.createServer((req, res) => {
   }
   const f = safeJoin(RENDERER_DIR, urlPath.slice(1));
   return f ? serveFile(res, f) : send(res, 404, 'not found');
-});
+}
 
 // ---------- websocket ----------
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
+  (async () => {
+    try {
+      handleUpgrade(req, socket, head);
+    } catch (err) {
+      console.error('[ws] upgrade error: ' + ((err && err.stack) || err));
+      try { socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n'); } catch (_e) { /* ignore */ }
+      socket.destroy();
+    }
+  })();
+});
+
+function handleUpgrade(req, socket, head) {
+  let urlPath = safeDecode((req.url || '/').split('?')[0]);
   if (base) {
     if (urlPath === base) urlPath = base + '/';
     if (!urlPath.startsWith(base + '/')) return socket.destroy();
@@ -829,39 +965,77 @@ server.on('upgrade', (req, socket, head) => {
 
   (async () => {
     const prev = sessions.get(sessionKey(userKey, tabId));
-    if (prev && !prev.closed) {
-      console.error('[zcode-webui] page reload for tab ' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + '): retiring previous host pid=' + prev.child.pid);
-      await retireSession(prev, 'page reload');
+
+    // CONTINUITY POLICY: whichever device the user is on becomes the LIVE view.
+    // Pick the best existing host of this account (own tab first, else the most
+    // recently active one) and adopt it — even when another page currently holds
+    // it: that page is demoted with the standard 4001 "take back" affordance,
+    // which is a much smaller disruption than forking a blind second driver.
+    const pool = [...(userSessions.get(userKey) || [])]
+      .filter((s) => !s.closed && s.child && s.child.exitCode === null);
+    let victim = null;
+    if (prev && !prev.closed && prev.child && prev.child.exitCode === null) victim = prev;
+    else {
+      pool.sort((a, b) => (b.lastFrameAt || 0) - (a.lastFrameAt || 0));
+      victim = pool[0] || null;
     }
-    if (takeover) {
-      for (const s of [...(userSessions.get(userKey) || [])]) {
-        if (s.closed || s === prev) continue;
-        if (s.ws) {
-          console.error('[zcode-webui] takeover: tab ' + tabId.slice(0, 8) + ' parks host pid=' + s.child.pid + ' (user ' + shortUserKey(userKey) + ')');
-          await retireSession(s, 'takeover');
-        }
+
+    let session = null;
+    let adopted = false;
+    if (victim) {
+      session = victim;
+      adopted = true;
+      rebindSession(session, userKey, tabId);       // page identity follows the adopting page
+      session.detachedAt = 0;
+      console.error('[zcode-webui] ADOPTED host pid=' + session.child.pid +
+        ' by tab ' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + ', last frame ' +
+        (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')' +
+        (session.ws ? ' — demoting previous live page' : ''));
+    } else {
+      try {
+        session = createSession(userKey, tabId);
+      } catch (err) {
+        console.error('[ws] host spawn failed: ' + err.message);
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        return socket.destroy();
       }
     }
-    let session = null;
-    try {
-      session = createSession(userKey, tabId);
-    } catch (err) {
-      console.error('[ws] host spawn failed: ' + err.message);
-      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-      return socket.destroy();
-    }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req, session);
+      wss.emit('connection', ws, req, session, { adopted });
     });
   })();
-});
-wss.on('connection', (ws, req, session) => {
+}
+
+wss.on('connection', (ws, req, session, meta) => {
+  const adopted = !!(meta && meta.adopted);
   console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
-  ws.send(WS_READY);
+  // listeners FIRST, so a client replying instantly to the ready signal cannot
+  // have its first frame dropped; announcements go out right after
+  if (adopted) {
+    // gate downstream until this fresh renderer finished mounting; its port-ready
+    // ack (or an 8s failsafe) releases everything in order
+    session.holdFrames = true;
+    session.holdBuf = [];
+    if (session.firstDownstream) session.holdBuf.push(Buffer.from(session.firstDownstream));
+    else session.replayInitOnCapture = true;
+    setTimeout(() => releaseHold(session), 8000).unref();
+  }
   attachRelay(ws, session);
+  try { ws.send(WS_READY); } catch (_e) { /* ignore */ }
+  const announce = (line) => {
+    try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
+  };
+  announce((adopted ? '[zcode-webui] host adopted pid=' : '[zcode-webui] host spawned pid=') + session.child.pid);
 });
 
 // ---------- start ----------
+// Bind failures (EADDRINUSE…) are STARTUP errors: unlike request-path faults
+// they leave a process that can never serve, so exit loudly instead of relying
+// on the keep-running guard below.
+server.on('error', (err) => {
+  console.error('[zcode-webui] fatal server error: ' + ((err && err.stack) || err));
+  process.exit(2);
+});
 server.listen(PORT, '0.0.0.0', () => {
   console.log('[zcode-webui] listening on http://0.0.0.0:' + PORT + base + '/');
   console.log('[zcode-webui] base path : ' + (base || '(root)'));
@@ -873,6 +1047,35 @@ server.listen(PORT, '0.0.0.0', () => {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// Stall watchdog: if wall-clock jumps far ahead of the timer cadence, the whole
+// process was frozen (system suspend, SIGSTOP, VM pause). Logged so that
+// "session stopped" reports can be correlated with real suspend windows.
+{
+  let lastTick = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const drift = now - lastTick - 60000;
+    if (drift > 30000) {
+      console.error('[zcode-webui] process stall of ~' + Math.round(drift / 1000) +
+        's detected (system suspend/VM pause?) ended at ' + new Date(now).toISOString() +
+        ' — in-flight agent turns may have been interrupted');
+    }
+    lastTick = now;
+  }, 60000).unref();
+}
+
+
+// Last-resort guards: log unexpected errors but keep serving — crashing would
+// take every background task down with it. Realistic error sources (malformed
+// URLs, fs races) are already handled locally; this is the safety net.
+process.on('uncaughtException', (err) => {
+  console.error('[zcode-webui] uncaught exception (service keeps running): ' + ((err && err.stack) || err));
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[zcode-webui] unhandled rejection (service keeps running): ' + ((reason && reason.stack) || reason));
+});
+
 function shutdown() {
   console.log('[zcode-webui] shutting down');
   for (const s of [...sessions.values()]) {

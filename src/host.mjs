@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_VERSION } from './upgrade.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -22,10 +23,16 @@ export function rendererVersion(fallback = '') {
   return fallback;
 }
 
+// Default runtime location follows the official data directory convention:
+// ZCODE_SERVER_RUNTIME_ROOT > ZCODE_HOME/server > ~/.zcode/server. Honoring
+// ZCODE_HOME matters for sandboxing/tests and matches src/login.mjs.
 export function resolveServerRoot(override) {
-  const root = (override || process.env.ZCODE_SERVER_RUNTIME_ROOT || path.join(os.homedir(), '.zcode', 'server')).trim();
+  const fallback = process.env.ZCODE_HOME
+    ? path.join(process.env.ZCODE_HOME, 'server')
+    : path.join(os.homedir(), '.zcode', 'server');
+  const root = (override || process.env.ZCODE_SERVER_RUNTIME_ROOT || fallback).trim();
   if (!existsSync(path.join(root, 'zcode-server.cjs'))) {
-    throw new Error('zcode-server.cjs not found under ' + root + ' (run the ZCode desktop remote connect once, or set ZCODE_SERVER_RUNTIME_ROOT)');
+    throw new Error('zcode-server.cjs not found under ' + root + ' (run zcode-webui setup to install it, or set ZCODE_SERVER_RUNTIME_ROOT)');
   }
   return root;
 }
@@ -37,6 +44,15 @@ export function resolveServerRoot(override) {
 // "no usable model provider". Without the mode, the host uses its own local
 // registry (credentials + settings + api keys) and syncs it to the client.
 export function buildHostEnv(serverRoot, extra = {}) {
+  // The official desktop resolves the ZCode agent server through its Electron
+  // runtime (process.execPath + agents/glm/zcode.cjs). zcode-webui runs
+  // zcode-server.cjs under plain Node, so point the host at the bundled agent
+  // entry explicitly — otherwise sessions fail with "ZCode agent server command
+  // is not configured". Users may override both env vars.
+  const agentCommand = process.env.ZCODE_AGENT_SERVER_COMMAND || path.join(serverRoot, 'node');
+  const agentArgsJson = process.env.ZCODE_AGENT_SERVER_COMMAND
+    ? process.env.ZCODE_AGENT_SERVER_ARGS_JSON
+    : JSON.stringify([path.join(serverRoot, 'agents', 'glm', 'zcode.cjs'), 'app-server', '--stdio']);
   return {
     ...process.env,
     ZCODE_SERVER_RUNTIME_ROOT: serverRoot,
@@ -46,7 +62,9 @@ export function buildHostEnv(serverRoot, extra = {}) {
     ZAI_BUSINESS_BASE_URL: process.env.ZAI_BUSINESS_BASE_URL || 'https://api.z.ai',
     ZAI_OAUTH_CLIENT_ID: process.env.ZAI_OAUTH_CLIENT_ID || 'client_P8X5CMWmlaRO9gyO-KSqtg',
     ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED: '0',
-    ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION || rendererVersion('3.8.1'),
+    ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION || rendererVersion(DEFAULT_VERSION),
+    ZCODE_AGENT_SERVER_COMMAND: agentCommand,
+    ...(process.env.ZCODE_AGENT_SERVER_COMMAND ? {} : { ZCODE_AGENT_SERVER_ARGS_JSON: agentArgsJson }),
     ...extra,
   };
 }
@@ -75,9 +93,20 @@ export function spawnHost({ serverRoot, log = console.error.bind(console), extra
 }
 
 // Wait for the hello line, answer with hello-ack, then resolve with the leftover bytes.
+// On any failure the half-started child is killed so failed handshakes never leave
+// orphaned hosts behind.
 export function handshake(child) {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('host handshake timeout (no zcode-hello within 10s)')), 10000);
+    let settled = false;
+    const cleanup = () => { clearTimeout(timeout); child.stdout.removeListener('data', onData); };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { if (child.exitCode === null) child.kill('SIGKILL'); } catch (_e) { /* ignore */ }
+      reject(err);
+    };
+    const timeout = setTimeout(() => fail(new Error('host handshake timeout (no zcode-hello within 10s)')), 10000);
     let buf = Buffer.alloc(0);
     const onData = (d) => {
       buf = Buffer.concat([buf, d]);
@@ -89,25 +118,19 @@ export function handshake(child) {
       try {
         hello = JSON.parse(line);
       } catch (_e) {
-        clearTimeout(timeout);
-        child.stdout.removeListener('data', onData);
-        reject(new Error('host hello is not valid JSON: ' + line.slice(0, 200)));
-        return;
+        return fail(new Error('host hello is not valid JSON: ' + line.slice(0, 200)));
       }
       if (!hello || hello.type !== 'zcode-hello') {
-        clearTimeout(timeout);
-        child.stdout.removeListener('data', onData);
-        reject(new Error('unexpected first stdout line: ' + line.slice(0, 200)));
-        return;
+        return fail(new Error('unexpected first stdout line: ' + line.slice(0, 200)));
       }
+      settled = true;
+      cleanup();
       const ack = JSON.stringify({
         type: 'zcode-hello-ack',
         version: String(hello.version || ''),
         clientId: 'zcode-webui-' + randomUUID(),
       }) + '\n';
-      child.stdin.write(ack);
-      clearTimeout(timeout);
-      child.stdout.removeListener('data', onData);
+      try { child.stdin.write(ack); } catch (_e) { /* stdio gone — exit handler will clean up */ }
       resolve({ hello, rest });
     };
     child.stdout.on('data', onData);

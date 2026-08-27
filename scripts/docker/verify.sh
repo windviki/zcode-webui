@@ -66,7 +66,7 @@ if [ "${ZCODE_VERIFY_REGISTRY:-0}" = "1" ]; then
   cat > "$CTX/Dockerfile" <<'EOF'
 FROM node:22-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends dpkg-dev curl ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /root/.zcode-webui/vendor/renderer
+RUN mkdir -p /root/.zcode-webui/vendor/renderer /root/.zcode/v2 /root/.zcode/cli
 ARG ZCODE_VERIFY_PKG
 RUN npm install -g "${ZCODE_VERIFY_PKG}" --registry=https://registry.npmjs.org
 COPY container-verify.sh /usr/local/bin/container-verify
@@ -83,7 +83,7 @@ else
   cat > "$CTX/Dockerfile" <<'EOF'
 FROM node:22-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends dpkg-dev curl ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /root/.zcode-webui/vendor/renderer
+RUN mkdir -p /root/.zcode-webui/vendor/renderer /root/.zcode/v2 /root/.zcode/cli
 COPY zcode-webui.tgz /tmp/zcode-webui.tgz
 RUN npm install -g /tmp/zcode-webui.tgz
 COPY container-verify.sh /usr/local/bin/container-verify
@@ -94,10 +94,24 @@ EOF
 fi
 cp "$ROOT/scripts/docker/container-verify.sh" "$CTX/container-verify.sh"
 
-# ---- sandbox copy of the local ZCode data (runtime + credentials), run-time only ----
-[ -d "$SOURCE" ] || { echo "ZCODE_VERIFY_SOURCE not found: $SOURCE"; exit 1; }
-echo "[verify] sandboxing $SOURCE -> $SANDBOX"
-cp -a "$SOURCE" "$SANDBOX"
+# ---- sandbox copy of the local ZCode data, injected with docker cp at run time ----
+# Default: copy the whole ~/.zcode (runtime + credentials) so the chain starts
+# from a known-good installation.
+# ZCODE_VERIFY_FRESH_RUNTIME=1: copy ONLY the credential/config files and let
+# the container prove the automated-setup path (runtime auto-install from the
+# official component channel) on a machine that never ran the desktop.
+if [ "${ZCODE_VERIFY_FRESH_RUNTIME:-0}" = "1" ]; then
+  echo "[verify] fresh-runtime sandbox: credentials only (no server/) -> $SANDBOX"
+  mkdir -p "$SANDBOX/v2" "$SANDBOX/cli"
+  for f in v2/credentials.json cli/config.json; do
+    [ -f "$SOURCE/$f" ] && cp -a "$SOURCE/$f" "$SANDBOX/$f"
+  done
+  [ -f "$SANDBOX/v2/credentials.json" ] || { echo "no credentials.json under $SOURCE/v2; cannot verify login state"; exit 1; }
+else
+  [ -d "$SOURCE" ] || { echo "ZCODE_VERIFY_SOURCE not found: $SOURCE"; exit 1; }
+  echo "[verify] sandboxing $SOURCE -> $SANDBOX"
+  cp -a "$SOURCE" "$SANDBOX"
+fi
 chmod -R u+rwX "$SANDBOX"
 
 # ---- build & run ----
@@ -108,11 +122,21 @@ docker build -t "$IMAGE" "${DOCKER_BUILD_ARGS[@]}" "$CTX"
 # where bind mounts silently appear as empty dirs. Inject the sandbox with
 # `docker cp` at run time instead — credentials still never enter the image.
 echo "[verify] creating container and copying the sandbox data…"
+FRESH="${ZCODE_VERIFY_FRESH_RUNTIME:-0}"
 CID="$(docker create --name zcode-webui-verify --network "$NET" \
   -e "ZCODE_VERIFY_PROXY=$PROXY" \
   -e "ZCODE_VERIFY_SKIP_FETCH=${ZCODE_VERIFY_SKIP_FETCH:-0}" \
+  -e "ZCODE_VERIFY_FRESH_RUNTIME=$FRESH" \
   "$IMAGE")"
-docker cp "$SANDBOX/." "$CID:/root/.zcode/"
+if [ "$FRESH" = "1" ]; then
+  # per-file injection so the parent dirs come pre-made from the image
+  docker cp "$SANDBOX/v2/." "$CID:/root/.zcode/v2/"
+  if [ -f "$SANDBOX/cli/config.json" ]; then
+    docker cp "$SANDBOX/cli/config.json" "$CID:/root/.zcode/cli/config.json"
+  fi
+else
+  docker cp "$SANDBOX/." "$CID:/root/.zcode/"
+fi
 if [ "${ZCODE_VERIFY_SKIP_FETCH:-0}" = "1" ]; then
   # seed the renderer from the repo checkout so the container skips the CDN download
   RSRC="${ZCODE_VERIFY_RENDERER_SRC:-$ROOT/vendor/renderer}"

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Fetch the official ZCode desktop client and extract its renderer (the web UI)
-# into vendor/renderer. Version pinned via ZCODE_VERSION (default 3.8.1).
+# into vendor/renderer. Version pinned via ZCODE_VERSION (default 3.9.2 — keep
+# in sync with DEFAULT_VERSION in src/upgrade.mjs).
 set -euo pipefail
 
-VERSION="${ZCODE_VERSION:-3.8.1}"
+VERSION="${ZCODE_VERSION:-3.9.2}"
 ARCH="${ZCODE_ARCH:-x64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ZCODE_WEBUI_HOME redirects all mutable state away from the package directory
@@ -11,6 +12,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_HOME="${ZCODE_WEBUI_HOME:-$ROOT}"
 WORK="$DATA_HOME/.fetch-tmp"
 DEST="$DATA_HOME/vendor/renderer"
+
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+for tool in curl dpkg-deb node; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' is required but not installed" >&2; exit 1; }
+done
 
 if [ -f "$DEST/index.html" ] && [ "${FORCE:-0}" != "1" ]; then
   echo "renderer already present at $DEST (set FORCE=1 to re-fetch)"
@@ -31,11 +39,9 @@ echo ">> extracting asar ($ASAR)"
 node "$ROOT/scripts/extract-asar.cjs" "$ASAR" "$WORK/app"
 
 echo ">> copying renderer"
-rm -rf "$DEST"
 mkdir -p "$(dirname "$DEST")"
+rm -rf "$DEST"
 cp -R "$WORK/app/out/renderer" "$DEST"
 printf '%s\n' "$VERSION" > "$DEST/.version"
 
-echo ">> cleaning up"
-rm -rf "$WORK"
 echo "renderer ready: $DEST ($(du -sh "$DEST" | cut -f1))"

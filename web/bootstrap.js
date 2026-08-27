@@ -96,6 +96,7 @@
   // superseded by another tab: park this page with an explicit take-back control
   function parkWithNotice() {
     mode = 'parked';
+    dismissBackground();
     showNotice('本页面的会话已被另一个标签页接管，此页面已暂停。', '接管回来', function () {
       try {
         var q = new URLSearchParams(window.location.search);
@@ -103,6 +104,66 @@
         window.location.search = q.toString();
       } catch (e) { window.location.reload(); }
     });
+  }
+
+  // ---- cross-device execution visibility ----
+  // When another host of this account is still mid-turn (e.g. a laptop that
+  // slept and resumed), a freshly loaded second device renders only persisted
+  // data — an interrupted-looking history invites a duplicate "continue" that
+  // makes TWO agents drive the same workspace. Surface it loudly instead.
+  var bgTimer = null;
+  function dismissBackground() {
+    if (bgTimer) { clearInterval(bgTimer); bgTimer = null; }
+    var el = document.getElementById('zcode-webui-background');
+    if (el) el.remove();
+  }
+  function paintBackground(hosts) {
+    var el = document.getElementById('zcode-webui-background');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'zcode-webui-background';
+      el.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2147483646;max-width:min(60%,460px);background:#26313f;color:#ffd479;font:12px/1.5 monospace;padding:10px 12px;border-radius:8px;box-shadow:0 2px 14px rgba(0,0,0,.35);';
+      document.body.appendChild(el);
+    }
+    el.textContent = '';
+    var t = document.createElement('div');
+    var ages = hosts.map(function (h) { return h.lastFrameAgeSec === null ? '?' : h.lastFrameAgeSec; });
+    t.textContent = '[zcode-webui] 另一处仍在执行任务：' + hosts.length + ' 个进程（pid ' +
+      hosts.map(function (h) { return h.pid; }).join(',') + '，最近活动 ' + ages.join('/') + ' 秒前）。' +
+      '本页看到的是已落库的历史状态——不要直接发「继续」，否则两个代理可能同时改同一批文件。';
+    var row = document.createElement('div');
+    row.style.cssText = 'margin-top:8px;display:flex;gap:8px;';
+    var btnKill = document.createElement('button');
+    btnKill.textContent = '终止后台执行并刷新';
+    btnKill.style.cssText = 'background:#c0392b;color:#fff;border:0;border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit;';
+    btnKill.onclick = function () {
+      btnKill.disabled = true;
+      // relative paths only — under the code-server /proxy/<port> mode the prefix
+      // is stripped before forwarding, so absolute paths would escape it
+      fetch('api/sessions/terminate?user=1&keepTab=' + encodeURIComponent(TAB_ID), { method: 'POST' })
+        .catch(function () {})
+        .then(function () { setTimeout(function () { window.location.reload(); }, 600); });
+    };
+    var btnDismiss = document.createElement('button');
+    btnDismiss.textContent = '忽略';
+    btnDismiss.style.cssText = 'background:transparent;color:#9fb3c8;border:1px solid #40536a;border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit;';
+    btnDismiss.onclick = function () { dismissBackground(); };
+    row.appendChild(btnKill); row.appendChild(btnDismiss);
+    el.appendChild(t); el.appendChild(row);
+  }
+  function updateBackground(info) {
+    try {
+      var active = (info && info.hosts || []).filter(function (h) { return h.active; });
+      if (!active.length) { dismissBackground(); return; }
+      paintBackground(active);
+    } catch (e) { /* never break the page over cosmetics */ }
+  }
+  function watchBackground(pushInfo) {
+    if (pushInfo) updateBackground(pushInfo);
+    if (bgTimer) return;
+    bgTimer = setInterval(function () {
+      fetch('api/background?tab=' + encodeURIComponent(TAB_ID)).then(function (r) { return r.json(); }).then(updateBackground).catch(function () {});
+    }, 45000);
   }
 
   // ---- URL params for the official renderer ----
@@ -157,6 +218,11 @@
         }
         portQueue = [];
         window.postMessage('zcode:service-port', '*', [channel.port1]);
+        // tell the backend this renderer is now wired: an ADOPTED mid-stream host
+        // releases its ordered frame buffer on this signal
+        try {
+          if (ws && ws.readyState === 1) ws.send('{"kind":"zcode-webui-port-ready"}');
+        } catch (e) { /* ignore */ }
         return;
       }
       setTimeout(waitReady, 50);
@@ -273,7 +339,16 @@
         }
         return;
       }
-      if (typeof ev.data === 'string') { console.debug('[zcode-webui]', ev.data); return; }
+      if (typeof ev.data === 'string') {
+        // server control message: another host of this account is mid-turn
+        try {
+          var ctrl = JSON.parse(ev.data);
+          if (ctrl && ctrl.kind === 'zcode-webui-background') { watchBackground(ctrl); return; }
+          if (ctrl && ctrl.kind === 'zcode-webui-background-cleared') { dismissBackground(); return; }
+        } catch (e) { /* not a control message */ }
+        console.debug('[zcode-webui]', ev.data);
+        return;
+      }
       // The official renderer's port transport accepts ONLY Uint8Array
       // (e.data instanceof Uint8Array); an ArrayBuffer is silently dropped.
       var u8 = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
@@ -377,6 +452,10 @@
     window.addEventListener('pointerup', onPointerEnd, { passive: true });
     window.addEventListener('pointercancel', onPointerEnd, { passive: true });
   })();
+
+  // covers the HTTP long-poll fallback (no ws control channel there) and makes
+  // the banner self-clear once the background host goes quiet
+  setTimeout(function () { watchBackground(null); }, 4000);
 
   connect();
 })();

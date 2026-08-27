@@ -27,7 +27,7 @@
     "fetch-renderer": "bash scripts/fetch-renderer.sh",
     "smoke": "node scripts/smoke-test.mjs",
     "cli": "node src/cli.mjs",
-    "prepublishOnly": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/dirs.mjs && bash -n scripts/fetch-renderer.sh"
+    "prepublishOnly": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/dirs.mjs && node --check src/upgrade.mjs && node --check web/bootstrap.js && bash -n scripts/fetch-renderer.sh"
   },
   "keywords": [
     "zcode",

@@ -2,201 +2,60 @@
 
 > 语言 / Language：**中文** | [English](./README.en.md)
 
-> 在浏览器里完整运行官方 ZCode 桌面端界面，并与 code-server 无缝协同。
-> Run the official ZCode desktop UI entirely in your browser, working side by side with code-server.
+在浏览器里完整运行官方 ZCode 桌面端界面，后端复用你机器上的官方运行时（`zcode-server` + GLM Agent）。
+它是对官方桌面端的补充：部署一次之后，手机、平板、瘦终端、任何有浏览器的设备都能随时打开同一个 ZCode，
+进行任务派发与会话推进——代码、会话和凭据始终留在你自己的服务器上。
 
-**zcode-webui** 是一个自托管的 Web 壳层：它把官方 ZCode（智谱 GLM 编码智能体的桌面客户端）的界面
-原样搬到浏览器中运行，后端直接复用你机器上的官方 ZCode 运行时（`zcode-server` + GLM Agent）。
-它是对官方桌面端的**补充与扩展**：部署一次之后，手机、平板、瘦终端、任何装有浏览器的设备都可以随时
-打开同一个 ZCode，进行任务管理、任务派发和会话推进——你的代码、会话和凭据始终留在自己的服务器上。
+- 🖥️ **官方界面原样呈现**：聊天、任务、文件树等能力与桌面端一致；官方界面升级只需重新执行一次下载脚本
+- 🤝 **与 code-server 天然协同**：挂在 `/proxy/<port>/` 即可，共用其登录鉴权；WebSocket 被拦截时自动降级 HTTP 长轮询
+- ⏳ **任务与标签页解耦**：关闭标签页/断网不中断任务；空闲的后台会话按三重条件自动回收，运行中的永不回收
+- 🔑 **登录灵活**：内置 OAuth 登录，或从已登录的桌面端导出凭据导入；与官方客户端共用同一凭据库
+- 🔍 Ctrl+滚轮 / 双指捏合应用级缩放（50%–200%）
+- 🧭 `zcode-webui setup` 一键部署：渲染层、官方运行时、配置、启动全自动
+- 📦 不打包、不修改、不分发任何官方代码；核心只有几个源文件
 
-- 🖥️ 官方界面原样呈现：聊天、任务、工作区文件树、Wiki、MCP 等能力与桌面端一致
-- 🤝 与 code-server 天然协同：可直接挂在 code-server 的 `/proxy/<port>/` 端口代理后，共用登录鉴权
-- 🌐 任何终端设备可用：无需安装客户端，浏览器打开即用（WebSocket 被反代拦截时自动降级 HTTP 长轮询）
-- 🔑 登录方式灵活：内置 OAuth 登录，或从已登录的官方桌面端导出凭据导入，与官方客户端共用同一凭据库
-- 🔍 桌面级缩放：Ctrl+滚轮或触控板/触屏**双指捏合**即可缩放界面（50%–200%，按浏览器记忆）
-- ⏳ **任务与标签页解耦**：关闭标签页/断网不中断任务——任务在服务端后台持续执行直到完成或等待你的输入；
-  重新打开页面自动加载同一会话的最新数据（会话数据实时落库共享；每次页面加载使用**全新运行时进程**，
-  绝不与其他设备/标签页共用，杜绝会话被两处执行和协议串扰；忙碌的旧进程转入后台继续跑完，
-  空闲的旧进程立即退役）
-- ♻️ 会话自动维护：空闲的后台会话按「脱离时长 + 帧静默 + 无运行中任务」三重条件自动回收，
-  运行中/等待输入的会话永不回收；掉线自动重连失败时页面给出「重新连接」按钮
-- 🧭 npm 向导一键部署：`npm i -g` 后运行 `zcode-webui setup`，交互式引导完成全部准备、配置与启动
-- 📦 不打包、不修改、不分发任何官方代码：渲染层资产由部署者在本地执行一个脚本、从官方 CDN 自行下载
+## 快速开始
 
----
+> 前提：Linux x64/arm64 · Node.js ≥ 18 · `curl`、`dpkg-deb`、`tar` · 磁盘 ≥ 2GB ·
+> 能访问 `cdn-zcode.z.ai`（下载）与 `zcode.z.ai`（登录）。
 
-## 目录
+```bash
+npm install -g @aixyzstudio/zcode-webui   # 需要 Node.js ≥ 18
+zcode-webui setup --yes                   # 全自动：渲染层下载 → 官方运行时安装 → 写配置 → 启动 → 健康检查
+```
 
-- [这个项目是什么](#这个项目是什么)
-- [与官方的关系：我们只做了中间层](#与官方的关系我们只做了中间层)
-- [完整使用指南（从零到可用）](#完整使用指南从零到可用)
-  - [第 0 步 · 前置条件](#第-0-步--前置条件)
-  - [第 1 步 · 注册 BigModel 账号并开通模型服务](#第-1-步--注册-bigmodel-账号并开通模型服务)
-  - [第 2 步 · 下载安装官方 ZCode 并完成认证](#第-2-步--下载安装官方-zcode-并完成认证)
-  - [第 3 步 · 提取认证信息（三种方式任选）](#第-3-步--提取认证信息三种方式任选)
-  - [第 4 步 · 部署 zcode-webui](#第-4-步--部署-zcode-webui)
-  - [第 5 步 · 与 code-server 协同（推荐）](#第-5-步--与-code-server-协同推荐)
-  - [第 6 步 · 独立部署 / 自有反代](#第-6-步--独立部署--自有反代)
-  - [第 7 步 · 开始使用](#第-7-步--开始使用)
-- [配置参考](#配置参考)
-- [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包)
-- [官方 CLI 直连（可选）](#官方-cli-直连可选)
-- [HTTP API](#http-api)
-- [安全须知](#安全须知)
-- [常见问题（FAQ）](#常见问题faq)
-- [测试](#测试)
-- [已知限制](#已知限制)
-- [目录结构](#目录结构)
-- [许可证与声明](#许可证与声明)
+完成后浏览器打开 `http://<服务器>:3102/`。未登录时先访问 `/login` 完成 OAuth（服务器无法直连
+`zcode.z.ai/api/v1` 时用 `setup --oauth-proxy <代理>` 或见 [FAQ](#常见问题faq)）。
 
----
-
-## 这个项目是什么
-
-官方 ZCode 是智谱出品的 Agentic Development Environment（ADE）桌面应用，把 GLM 编码模型、
-自研编码 Agent、任务管理和文件管理整合在一个 Electron 桌面客户端里。桌面客户端有两个天然限制：
-
-1. **必须在有图形界面的机器上安装运行**——服务器、容器、NAS 用不了；
-2. **任务与桌面绑定**——出门在外只能靠官方手机遥控等桌面端在场的能力，无法独立使用完整界面。
-
-zcode-webui 解决这两点：官方客户端的界面本身就是纯 Web 资产，我们把它交给一个轻量 Node 服务托管，
-在浏览器侧注入一个极薄的适配层，再把浏览器与官方运行时（`zcode-server.cjs` + GLM Agent，仍运行在你自己的
-机器上）用 WebSocket 桥接起来。于是：
-
-- 你在**服务器/容器**里启动一个服务，浏览器打开 URL 就是完整 ZCode；
-- 搭配 **code-server** 时，它就是你现有云端开发环境里的一个应用，和其他端口服务一样挂在
-  `https://<你的域名>/proxy/3102/` 后面；
-- 手机、平板、电视浏览器都能开箱即用，随时**查看任务进度、派发新任务、继续会话**；
-- 桌面端与 WebUI 可同时存在：同一台机器、同一份 `~/.zcode` 凭据与数据，桌面端在家里用，
-  WebUI 在路上用，互不冲突。
+git 部署方式见[手动部署](#手动部署git-clone)；想省事也可以只跑 `zcode-webui setup` 进入交互式向导。
 
 ## 与官方的关系：我们只做了中间层
-
-zcode-webui **尽可能依托官方实现，不重复造轮子**：
 
 | 环节 | 谁来实现 |
 |---|---|
 | 界面（renderer） | 官方客户端原样，由部署者通过本项目脚本从官方 CDN 下载，**不进入本仓库、不二次分发** |
 | Agent / 模型调用 / 会话存储 | 官方运行时 `zcode-server.cjs` 与 GLM Agent，**未做任何修改** |
-| 登录认证 | 官方 CLI 的 OAuth 流程，凭据写入官方凭据库 `~/.zcode/v2/credentials.json`（与官方客户端共用） |
-| **zcode-webui 负责的中间层** | ① 静态托管官方界面并注入启动配置；② `window.zcode` 浏览器适配层（桌面端预加载脚本的浏览器等价物）；③ MessagePort ↔ WebSocket 桥（含 HTTP 长轮询降级）；④ 拉起官方运行时进程并转发消息；⑤ 登录页、凭据导入、Web 目录选择器等配套小工具 |
+| 登录认证 | 官方 CLI 的 OAuth 流程，凭据写入官方库 `~/.zcode/v2/credentials.json`（与官方客户端共用） |
+| **本项目的中间层** | 托管官方界面并注入启动配置；`window.zcode` 浏览器适配层；MessagePort ↔ WebSocket 桥；拉起官方运行时进程并转发消息 |
 
-因此本项目体积很小：核心只有几个源文件。官方界面升级时，只需重新执行一次下载脚本即可跟随官方版本。
+> **免责声明**：社区项目，与智谱 / Z.ai 无隶属关系；不含任何官方代码。请遵守官方服务条款，
+> 模型调用费用按你的订阅计费。
 
-> **免责声明**：本项目是社区项目，与智谱 / Z.ai 无隶属关系。它只提供与官方客户端的兼容层，
-> 不包含任何官方代码；请遵守官方服务条款，模型调用费用按你订阅的官方套餐计费。
+## 手动部署（git clone）
 
-## 完整使用指南（从零到可用）
-
-> 想更快上手？项目已发布为 npm 包，三步完成部署：`npm install -g @aixyzstudio/zcode-webui` →
-> `zcode-webui setup`（交互式向导引导全部准备工作与配置）→ `zcode-webui start`。
-> 详见 [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包) 与下面的手动步骤。
-
-### 第 0 步 · 前置条件
-
-**服务器/容器（运行 zcode-webui 的地方）需要：**
-
-- Linux x64 或 arm64（推荐 Ubuntu/Debian 系，或任意能跑 Node 的 Linux 发行版）
-- Node.js ≥ 18（本项目自身只依赖 Node）
-- `curl`、`dpkg-deb`（下载与解包官方安装包用）
-- 磁盘 ≥ 2GB 余量（官方渲染层资产 + 运行时）
-- 能访问官方域名：`cdn-zcode.z.ai`（下载）、`zcode.z.ai`（登录/云 API）。
-  若走模型 API 还需要 `api.z.ai`、`open.bigmodel.cn` 可达；网络受限环境见 [FAQ](#常见问题faq) 的代理配置。
-
-**桌面端机器（第 2 步认证用，之后可不用）需要：**
-
-- macOS（Apple Silicon / Intel）、Windows（x64 / ARM64）或 Linux x64 中的任意一台。
-
-### 第 1 步 · 注册 BigModel 账号并开通模型服务
-
-1. 打开 [智谱开放平台](https://open.bigmodel.cn)，点击右上角「注册/登录」，用手机号或邮箱完成注册；
-2. 登录后前往 [GLM Coding Plan 套餐页](https://bigmodel.cn/coding-plan) 选择适合的订阅套餐并完成开通
-   （个人版与团队版均有免费额度/试用可先体验，按官方页面为准）；
-3. 开通后创建 API Key（**自己妥善保管，不要提交到任何公开仓库**）：
-   - 个人版：`bigmodel.cn → 个人编程套餐 → 套餐概览 → 新建 API Key`；
-   - 团队版：`bigmodel.cn → 团队编程套餐 → 我的套餐 → 获取 API Key`（团队 Key 与平台其他 Key 不通用）。
-4. 如果你更习惯国际版：注册 [Z.ai](https://z.ai) 账号并开通对应订阅同样可用（ZCode 登录时选择
-   「连接 Z.ai」）。
-
-### 第 2 步 · 下载安装官方 ZCode 并完成认证
-
-到 [ZCode 官方文档 · 安装](https://zcode.z.ai/cn/docs/install) 下载对应平台的安装包（当前稳定版 3.8.1）：
-
-- macOS：下载 `.dmg`，拖入 Applications；若提示「已损坏」，执行
-  `xattr -dr com.apple.quarantine /Applications/ZCode.app`；
-- Windows：下载 `.exe` 双击安装；
-- Linux：下载 `.AppImage`（或 `.deb`），`chmod +x` 后运行。
-
-首次启动按引导完成设置，然后点击左下角「**连接使用**」进入登录页，任选其一完成接入：
-
-- **连接 Z.ai**：用 Z.ai 账号（或 BigModel 账号互通登录）走官方 OAuth；
-- **连接 BigModel**：绑定你在第 1 步开通的 BigModel 账号；
-- **使用 API Key**：直接填入第 1 步创建的 API Key。
-
-登录后选择任意项目目录作为工作区，发一句「列出当前目录的文件」验证回复正常，桌面端即就绪。
-这台桌面机在本流程里的作用：**生成官方凭据与官方运行时**，供第 3、4 步提取与复用（日常也可以继续使用桌面端）。
-
-> 桌面端有网络代理需求时，在「设置 → 常规 → 网络代理」里配置（注意该字段留空表示直连，不会自动读系统代理）。
-
-### 第 3 步 · 提取认证信息（三种方式任选）
-
-zcode-webui 与官方客户端共用 `~/.zcode` 凭据库。把认证信息带到服务器上有三种方式：
-
-**方式 A · 直接在 WebUI 里 OAuth 登录（最简单，需要服务器能访问 zcode.z.ai）**
-
-部署好服务后打开 `http://<服务器>:3102/login`，点「开始登录」，在弹出的授权链接里用浏览器完成 Z.ai
-OAuth，凭据自动写入服务器的 `~/.zcode/v2/credentials.json`。服务器到 `zcode.z.ai/api/v1` 不通时
-配置 `oauthProxy`（见 [FAQ](#常见问题faq)）。
-
-**方式 B · 从已登录的桌面端导出凭据导入（无需服务器出网，推荐内网环境）**
-
-1. 在**已登录的桌面电脑**上，用浏览器打开 zcode-webui 的凭据导出工具：
-   `http://<服务器>:3102/export-credentials.html`（该页面完全在浏览器本地运行，凭据不出本机）；
-2. 选择桌面端的凭据文件，或手动打开后粘贴内容：
-   - Windows：`%USERPROFILE%\.zcode\v2\credentials.json`
-   - macOS / Linux：`~/.zcode/v2/credentials.json`
-3. 按提示填好该机的 platform / 主目录 / 用户名（页面已按当前系统预填猜测值），点「解密并生成」；
-4. 把输出的 JSON 复制到 zcode-webui 登录页（`/login`）的「导入凭据」框，点「导入凭据」。
-   导入接口会以 0600 权限写入服务器的 `~/.zcode/v2/credentials.json`。
-
-**方式 C · 服务器上本来就装过官方 CLI 并已登录**
-
-如果服务器上已经跑过官方 CLI（`zcode login`）或官方桌面端并登录过，`~/.zcode` 已就绪，
-直接跳到第 4 步即可，无需再做任何认证操作。
-
-### 第 4 步 · 部署 zcode-webui
-
-**方式一（推荐新手）· npm 安装 + 向导**：`npm install -g @aixyzstudio/zcode-webui` →
-`zcode-webui setup`（交互式向导按顺序引导：环境检查 → 官方运行时检查与获取引导 → 登录凭据检查 →
-渲染层下载 → 生成配置 → 可选 systemd/立即启动），然后 `zcode-webui start`。
-详见 [zcode-webui 命令行（npm 包）](#zcode-webui-命令行npm-包)。
-
-**方式二 · git clone 手动部署**：
 ```bash
-# 1. 获取代码
 git clone https://github.com/windviki/zcode-webui.git
-cd zcode-webui
+cd zcode-webui && npm install          # 运行时依赖只有 ws
 
-# 2. 安装依赖（只有 ws 一个运行时依赖）
-npm install
+npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取界面
+                                       # （默认 3.9.2，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
 
-# 3. 下载官方渲染层资产（从官方 CDN 下载官方安装包并提取界面，
-#    默认版本 3.8.1，可用 ZCODE_VERSION=3.8.1 ZCODE_ARCH=x64 覆盖）
-npm run fetch-renderer
+cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
-# 4.（可选）创建本地配置；不创建则全部使用默认值
-cp config.example.json config.json
-#    常用字段：workspace（初始工作区目录，留空 = $HOME）、
-#             oauthProxy / hostProxy（服务器出网代理，见 FAQ）
-
-# 5. 启动
-npm start          # 等价于 node src/server.mjs，默认 http://0.0.0.0:3102/
+npm start                              # 等价于 node src/server.mjs，默认 http://0.0.0.0:3102/
 ```
 
-打开 `http://<服务器>:3102/`。已登录时直接进入 ZCode 界面；未登录会自动引导到 `/login`。
-
-**长期运行（systemd 示例）**，`/etc/systemd/system/zcode-webui.service`：
+长期运行建议用上面的 `zcode-webui setup --systemd`，或手写系统级单元：
 
 ```ini
 [Unit]
@@ -208,76 +67,46 @@ User=你的用户名
 WorkingDirectory=/opt/zcode-webui
 ExecStart=/usr/bin/node src/server.mjs
 Restart=on-failure
-Environment=ZCODE_WEBUI_PORT=3102
-# 容器出网需要代理时按需放开：
-# Environment=ZCODE_WEBUI_HOST_PROXY=http://127.0.0.1:7890
-# Environment=ZCODE_WEBUI_OAUTH_PROXY=http://127.0.0.1:7890
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### 第 5 步 · 与 code-server 协同（推荐）
+## 与 code-server 协同（推荐）
 
-如果你已经用 [code-server](https://github.com/coder/code-server) 搭建了云端开发环境，
-把 zcode-webui 作为它的一个端口服务即可，公网入口就是 `https://<你的code-server域名>/proxy/3102/`：
+以根路径模式启动（**不要设置 basePath**）：`node src/server.mjs --port 3102`。
+之后无需任何额外配置——公网入口就是 `https://<域名>/proxy/3102/`：
 
-```bash
-node src/server.mjs --port 3102    # 根路径模式（默认）：不要设置 basePath！
-```
+- 资源路径、API、WebSocket、登录页都按页面 URL 自动推导；缺斜杠的 `/proxy/3102` 自动补全重定向；
+- WebSocket 不通时前端自动降级为 HTTP 长轮询桥；
+- 共用 code-server 的登录鉴权，无需 nginx。
 
-什么都不用额外配置：
+自有反代的子路径部署：`ZCODE_WEBUI_BASE_PATH=/zcode npm start`（裸 `/zcode` 会 302 补斜杠）；
+nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI + 常规 Upgrade 头）。
 
-- code-server 会把 `/proxy/3102` 前缀剥掉后转发给本服务，本服务按根路径运行即可；
-- 页面里的静态资源、WebSocket、API、登录页路径全部**按当前页面 URL 自动推导**，
-  缺斜杠的 `/proxy/3102` 会被自动补全重定向；
-- WebSocket 会走 `/proxy/3102/ws` 并带一次性令牌握手；若你的 SSO/网关不支持 WebSocket 升级，
-  前端会自动降级为 HTTP 长轮询桥，功能不受影响；
-- 无需任何 nginx 配置，code-server 原生端口转发即可，并天然共用 code-server 的登录鉴权。
+## 登录与凭据（三种方式任选）
 
-### 第 6 步 · 独立部署 / 自有反代
+**A · 直接在 WebUI 里 OAuth 登录（最简单，需要服务器能访问 zcode.z.ai）**
+打开 `<服务地址>/login` 点「开始登录」，在授权链接里完成 Z.ai OAuth，凭据自动写入服务器的
+`~/.zcode/v2/credentials.json`。
 
-**根路径独立部署**（本地/内网测试）：`npm start`，访问 `http://127.0.0.1:3102/`。
+**B · 从已登录的桌面端导出凭据导入（无需服务器出网）**
+在桌面电脑上打开 `<服务地址>/export-credentials.html`（纯浏览器本地运行），选择该机的
+`~/.zcode/v2/credentials.json` 并填入 platform/主目录/用户名解密，把输出 JSON 粘贴到 WebUI 的
+`/login`「导入凭据」框。
 
-**带子路径独立部署**（挂到 `/zcode`，反代保留前缀）：
+**C · 服务器上本来就登录过官方 CLI / 桌面端**
+`~/.zcode` 已就绪，直接使用。
 
-```bash
-ZCODE_WEBUI_BASE_PATH=/zcode npm start
-# 访问 http://127.0.0.1:3102/zcode/（裸 /zcode 会自动 302 补斜杠）
-```
+## 任务生命周期（重要，30 秒读完）
 
-nginx 示例（保留前缀转发）：
-
-```nginx
-location /zcode/ {
-    proxy_pass http://127.0.0.1:3102;   # 注意：不带 URI，前缀原样透传
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_read_timeout 300s;
-}
-```
-
-### 第 7 步 · 开始使用
-
-1. 浏览器打开 WebUI 地址（经 code-server 则是 `https://<域名>/proxy/3102/`）；
-2. 未登录时先在 `/login` 完成登录（或导入凭据）；
-3. 进入后通过「添加项目 → 打开文件夹」选择工作区（浏览器里会弹出内置的 Web 目录选择器，
-   请允许本站弹窗）；
-4. 在输入框下发任务，或在任务面板新建/跟进任务——与桌面端操作一致；
-5. 手机、平板直接访问同一地址即可继续会话与派发任务。
-
-**关于标签页与任务的生命周期**（重要）：每个浏览器标签页连接到一个服务端「会话」（官方运行时进程），
-**一个进程在其生命周期内只服务一个页面**。**关闭标签页不会结束任务**——运行时进程留在后台继续执行，
-直到任务完成或停在等待你输入的状态；期间重新打开页面（刷新或新开标签页均可）会起一个**全新进程**并
-自动加载同一会话的最新数据（会话与任务都在服务端共享库中，进度实时可见）。刚离开的旧进程如果忙碌
-（正在跑任务/等待输入）会转入后台继续跑完，空闲则立即退役。页面在线的会话（哪怕长时间不操作）
-**永远不会被回收**；短暂断网页面会自动重连，连续重连失败时页面会显示「重新连接」按钮。
-同一账号的多个标签页/设备各自使用独立进程；若某标签页被新标签页顶替，旧页面会显示提示并提供
-「接管回来」按钮。注意：**zcode-webui 服务进程重启会中断正在后台运行的任务**（与官方桌面端重启
-行为一致），长任务期间请勿重启服务。
+每个标签页连接一个独立的服务端会话（官方运行时进程），一个进程一生只服务一个页面。
+**关闭标签页/切换设备不会结束任务**：进程转入后台继续执行直到完成或等待输入；重新打开页面会
+**优先收养那个仍在工作的进程**（同一进程、实时进度无缝续看），没有可收养的才起全新进程并从共享
+会话库加载最新落库状态。同一时刻只有你正在操作的页面是「实况视图」：切到哪台设备，那台就是实况；被切走的旧页面会显示
+「已被接管」并保留夺回按钮，绝不存在两个代理同时驱动的情况。空闲的后台
+进程默认 30 分钟后回收（等待输入或运行中的永不回收）；页面在线的会话永不被回收。
+**重启 zcode-webui 服务进程会中断后台任务**（与桌面端重启一致）。
 
 ## 配置参考
 
@@ -287,227 +116,169 @@ location /zcode/ {
 |---|---|---|---|
 | `ZCODE_WEBUI_PORT` / `--port` | `port` | `3102` | 监听端口 |
 | `ZCODE_WEBUI_BASE_PATH` / `--base-path` | `basePath` | 空（根路径） | URL 前缀，如 `/zcode`（code-server 代理模式**不要设置**） |
-| `ZCODE_WEBUI_WORKSPACE` / `--workspace` | `workspace` | `$HOME` | 注入给官方 UI 的初始工作区目录 |
+| `ZCODE_WEBUI_WORKSPACE` / `--workspace` | `workspace` | `$HOME` | 初始工作区目录 |
 | `ZCODE_WEBUI_LOCALE` | `locale` | `zh-CN` | 界面语言 |
-| `ZCODE_WEBUI_OAUTH_PROXY` / `--oauth-proxy` | `oauthProxy` | 空 | 登录（OAuth）流程使用的 HTTP 代理，服务器无法直连 `zcode.z.ai/api/v1` 时配置 |
-| `ZCODE_WEBUI_HOST_PROXY` / `--host-proxy` | `hostProxy` | 空 | 官方运行时与 Agent 访问云 API / 模型 API 的 HTTP 代理，容器直连 `api.z.ai`、`open.bigmodel.cn` 不通时配置 |
-| `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（`zcode-server.cjs` 所在，通常无需修改） |
+| `ZCODE_WEBUI_OAUTH_PROXY` / `--oauth-proxy` | `oauthProxy` | 空 | OAuth 登录用的 HTTP 代理（服务器直连 `zcode.z.ai/api/v1` 不通时） |
+| `ZCODE_WEBUI_HOST_PROXY` / `--host-proxy` | `hostProxy` | 空 | 运行时/Agent 访问云与模型 API 的 HTTP 代理（`api.z.ai`、`open.bigmodel.cn` 不通时） |
+| `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
-| `ZCODE_WEBUI_HOME` | — | `~/.zcode-webui`（npm 安装）/ 项目目录（git 部署） | 本服务的数据目录：`config.json`、下载的渲染层与设备标识。git 部署且项目根存在 `config.json` 或 `vendor/renderer` 时自动使用项目目录（向后兼容） |
-| `ZCODE_APP_VERSION` | — | 渲染层版本（自动读取） | 覆盖传给运行时版本号，一般不需要 |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.8.1` / `x64` | `npm run fetch-renderer` 的下载版本与架构 |
-| `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000`（30 分钟） | 空闲后台会话自动回收：脱离标签页超过该时长且无任务运行、无帧活动时终止；`0` = 永不回收 |
-| `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000`（10 分钟） | 回收前置条件之一：最近该时长内无 host→浏览器帧（工作中的回合会持续发帧，空闲主机静默） |
-| `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000`（2 小时） | 回收的全局保险：任务索引中存在「running」且在该窗口内更新过的任务时，**不回收任何**后台会话（等待用户输入的会话也受此保护） |
-| `ZCODE_WEBUI_DEBUG_RPC` | — | 关 | 设 `1` 在服务端日志打印协议消息预览（联调用） |
+| `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.9.2` / `x64` | `fetch-renderer` 的下载版本与架构 |
+| `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
+| `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | 回收条件之一：最近该时长内无 host→浏览器帧 |
+| `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | 回收的全局保险：索引里有窗口内的 running 任务时不回收任何会话 |
+| `ZCODE_WEBUI_DEBUG_RPC` | — | 关 | 设 `1` 在日志打印协议消息预览（联调用） |
 
-## zcode-webui 命令行（npm 包）
-
-项目已发布到 npm（包名 `@aixyzstudio/zcode-webui`）。安装后可用向导完成「准备工作 → 配置 → 部署」全流程：
-
-```bash
-npm install -g @aixyzstudio/zcode-webui      # 需要 Node.js ≥ 18
-zcode-webui setup               # 交互式向导（见下）
-zcode-webui start               # 启动服务（前台，Ctrl-C 停止）
-```
-
-**`setup` 向导按顺序引导**（每步都有检测与提示，缺什么告诉你怎么办）：
-
-1. **环境检查**：Node / curl / dpkg-deb 是否就绪；
-2. **官方运行时**：检测 `~/.zcode/server/zcode-server.cjs`；缺失时给出获取路径（安装一次官方桌面端，
-   或从已运行过桌面端的机器 `scp -r user@host:~/.zcode/server ~/.zcode/server`），
-   也可用 `ZCODE_SERVER_RUNTIME_ROOT` 指向别处；
-3. **登录凭据**：检测 `~/.zcode/v2/credentials.json`；缺失时提示启动后用 `/login` 登录或
-   `/export-credentials.html` 从桌面端导入；
-4. **渲染层**：从官方 CDN 下载官方安装包并提取界面（`ZCODE_VERSION` 可换版本）；
-5. **服务配置**：询问端口 / 工作区 / 语言 / 反代前缀 / 两个代理，写入 `config.json`（0600，自动合并已有值）；
-6. **顺带生成官方 CLI 直连配置**（若桌面端已有 Coding Plan key，自动重建 `~/.zcode/cli/config.json`，
-   见 [官方 CLI 直连](#官方-cli-直连可选)）；
-7. **可选**：生成 systemd 用户单元（免 sudo，`systemctl --user enable --now zcode-webui`）或立即后台启动。
-
-`--yes` 可跳过所有提问（全部默认值、不启动）；常用参数：`--port/--workspace/--locale/--base-path/
---oauth-proxy/--host-proxy`、`--no-fetch`、`--no-start`、`--no-systemd`。
+## 命令行参考（npm 包）
 
 | 命令 | 作用 |
 |---|---|
-| `zcode-webui setup` | 交互式向导（步骤见上）。支持 `--yes`（全部默认，不启动）与 `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy`、`--no-fetch`、`--no-start`、`--no-systemd` 等参数 |
-| `zcode-webui start` | 前台启动服务（等价于 `node src/server.mjs`，参数透传） |
-| `zcode-webui fetch-renderer` | 下载/更新官方渲染层（`ZCODE_VERSION`/`ZCODE_ARCH` 可选覆盖） |
-| `zcode-webui doctor [--net]` | 环境与就绪状态检查（`--net` 附带 CDN/云 API 连通性检查） |
-| `zcode-webui status` | 打印服务健康状态（未运行返回非 0） |
-| `zcode-webui version` / `help` | 版本号 / 帮助 |
+| `zcode-webui setup` | 一键部署向导：目标版本解析 → 环境检查 → **官方运行时自动安装**（缺失时，来自官方组件通道）→ 凭据检查 → 渲染层下载 → 写 `config.json`（0600）→ 可选 systemd 用户单元 → 启动并等健康检查通过。`--yes` 非交互全默认并启动（配 `--no-start` 只装不启）；其它参数 `--port/--workspace/--locale/--base-path/--oauth-proxy/--host-proxy/--server-root/--version/--arch/--fetch/--no-fetch/--systemd/--no-systemd` |
+| `zcode-webui start` | 前台启动（Ctrl-C 停止；参数透传给 server.mjs） |
+| `zcode-webui stop` | 停止后台实例或 systemd 服务（前台进程请 Ctrl-C） |
+| `zcode-webui upgrade` | 一键升级官方渲染层 + 官方运行时（见下节） |
+| `zcode-webui fetch-renderer` | 仅下载/更新渲染层（`ZCODE_VERSION`/`ZCODE_ARCH` 覆盖） |
+| `zcode-webui doctor [--net]` | 就绪检查：node/curl/dpkg-deb、运行时+agent 入口、凭据、渲染层、**渲染层↔运行时版本对齐**、服务状态；`--net` 附带连通性检查 |
+| `zcode-webui status` | 打印健康 JSON（未运行返回非 0） |
+| `zcode-webui version` / `help` | 版本 / 帮助 |
 
-npm 安装后，所有可变数据（配置、渲染层、设备标识、日志）存放在数据目录
-`~/.zcode-webui`（可用 `ZCODE_WEBUI_HOME` 覆盖；git 部署时自动沿用项目目录），
-包目录本身保持只读，升级用 `npm update -g @aixyzstudio/zcode-webui`。
+所有可变数据存放在数据目录（`~/.zcode-webui`，可 `ZCODE_WEBUI_HOME` 覆盖；git 部署沿用项目目录），
+包目录保持只读。
+
+### 一键升级
+
+```bash
+zcode-webui upgrade                    # 自动探测官网最新版，同步升级渲染层 + 官方运行时
+zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启服务
+```
+
+流程：从[更新日志](https://zcode.z.ai/cn/changelog)取最新版本号 → 重提取渲染层 →
+下载官方组件清单中的运行时组件（逐一 SHA256 校验）在新目录组装后**原子替换**
+（旧目录备份为 `~/.zcode/server.bak-<版本>-<时间戳>`，仅留最近一份）。服务运行中默认询问是否先停
+（`--yes` 跳过询问但不停止）。其它参数：`--version X.Y.Z`（指定版本）、`--arch x64|arm64`、
+`--renderer-only` / `--server-only`、`--force`（同版本强制重装）、`--no-backup`。
+注意：`upgrade` 只升官方组件；zcode-webui 自身用 `npm update -g @aixyzstudio/zcode-webui` 升级。
 
 ## 官方 CLI 直连（可选）
 
-zcode-webui 服务本身**不需要** CLI 配置（它直接驱动官方运行时）。但如果你想绕过浏览器、
-用官方 CLI 直接干活（SSH 终端、系统 cron 定时任务、脚本化续跑会话），CLI 需要一份自己的模型配置
-`~/.zcode/cli/config.json`：
+WebUI 服务本身不需要 CLI 配置。若想在终端里 headless 使用官方 CLI（与 WebUI 共用凭据与会话库）：
 
 ```bash
-cp cli-config.example.json ~/.zcode/cli/config.json
-chmod 600 ~/.zcode/cli/config.json
-# 编辑文件：把 provider.bigmodel.options.apiKey 换成你的 Coding Plan API Key
-# （bigmodel.cn → 个人编程套餐 → 套餐概览 → 新建 API Key；或直接跑官方 CLI 的 zcode login 自动生成）
-```
+cp cli-config.example.json ~/.zcode/cli/config.json && chmod 600 ~/.zcode/cli/config.json
+# 把 provider.bigmodel.options.apiKey 换成你的 Coding Plan API Key（或直接 zcode login 生成）
 
-之后即可在终端里 headless 使用（与 WebUI 共用同一凭据库与会话数据）：
-
-```bash
-# 给指定会话发送一条消息并继续执行（无 TUI）
-~/.zcode/server/node ~/.zcode/server/agents/glm/zcode.cjs \
-  --cwd /path/to/workspace \
-  --resume sess_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
-  --prompt '继续' --locale zh-CN
-
-# 或运行一个新的一次性指令（--max-turns 限制回合数）
 ~/.zcode/server/node ~/.zcode/server/agents/glm/zcode.cjs \
   --cwd /path/to/workspace --prompt '列出当前目录的文件' --max-turns 1
+# 续跑某个会话：加 --resume sess_xxx --prompt '继续'
 ```
 
-> 注意：`cli-config.example.json` 是**脱敏样例**，其中的 apiKey 是占位符；请勿把填好真实密钥的
-> 配置文件提交到任何仓库（`~/.zcode/cli/config.json` 应在仓库之外，并保持 0600 权限）。
+> 密钥文件保持 0600 且在仓库之外；需要代理时设 `ZCODE_HTTP_PROXY`/`ZCODE_NO_PROXY`。
 
 ## HTTP API
 
-- `GET <base>/api/health` — 服务状态（renderer / 运行时目录 / 登录态 / 会话数：总数、在线、后台运行中 / 自动回收开关与 TTL）
-- `POST <base>/api/sessions/terminate` — 立即终止全部会话（含后台运行中的会话，慎用）
-- `POST <base>/api/login/start` — 启动官方 CLI OAuth 登录（后台子进程）
-- `GET <base>/api/login/status` — 登录状态、授权链接、实时输出
-- `POST <base>/api/login/cancel` — 取消登录
+- `GET <base>/api/health` — 服务状态（版本 / renderer / 运行时 / 登录态 / 会话数 / 回收开关）
+- `POST <base>/api/sessions/terminate` — 立即终止全部会话（含后台运行中的，慎用）
+- `POST <base>/api/login/start` · `GET /api/login/status` · `POST /api/login/cancel` — OAuth 登录流
 - `POST <base>/api/login/import` — 导入凭据 JSON（写入官方凭据库）
-- `GET <base>/api/fs/list?path=<dir>` — Web 目录选择器用的目录列表
-- `POST <base>/bridge/open` / `GET <base>/bridge/poll` / `POST <base>/bridge/send` / `POST <base>/bridge/close` — HTTP 长轮询桥（前端自动使用）
-- `WS <base>/ws?token=<每次启动随机>` — 前端协议桥（令牌注入在页面里，浏览器自动使用）
+- `GET <base>/api/fs/list?path=<dir>` — Web 目录选择器的目录列表
+- `POST <base>/bridge/open` · `GET /bridge/poll` · `POST /bridge/send` · `POST /bridge/close` — HTTP 长轮询桥
+- `WS <base>/ws?token=<每次启动随机>` — 前端协议桥
 
 ## 安全须知
 
-- 服务默认监听 `0.0.0.0`，且**本服务自身不做用户鉴权**（与官方桌面的本地信任模型一致）：
-  任何能访问该端口的客户端都能以服务器上的 ZCode 账号身份运行 Agent。
-  **请务必把服务放在反向代理/登录网关之后**（code-server 登录、SSO、nginx basic auth 等），
-  不要将 3102 端口直接暴露到公网。
-- 浏览器身份通过一个 HttpOnly Cookie（`zwebui_client`）识别，用于「重新打开页面后接管后台会话」；
-  它不含任何账号信息，但不同浏览器访问同一服务会各自拥有独立会话。
-- 凭据以 0600 权限写入 `~/.zcode/v2/credentials.json`；`config.json` 已被 `.gitignore` 排除，
-  不要把含密钥/代理密码的配置提交进仓库。
-- `/api/login/import`、`/api/fs/list` 与 `/api/sessions/terminate` 可读取/写入服务器文件系统或
-  终止后台任务，同样依赖外层鉴权保护。
-- WebSocket 令牌每次启动随机生成，用于防止误连其他 WS 服务（如 code-server 自身的 `/ws`），
-  不是账号鉴权手段。
+- 服务默认监听 `0.0.0.0` 且**自身不做用户鉴权**（本地信任模型）：任何能访问端口的人都能以服务器上的
+  ZCode 账号身份运行 Agent。**务必放在反代/网关之后**（code-server 登录、SSO、basic auth 等），不要直接暴露公网。
+- `/api/fs/list`、`/api/login/import`、`/api/sessions/terminate` 能读文件系统/写凭据库/终止任务，同样依赖外层鉴权。
+- 凭据写入 `~/.zcode/v2/credentials.json`（0600）；`config.json` 不入库，不要提交含密钥的配置。
+- WS token 只是防误连其他 WS 服务，不是鉴权手段。
 
 ## 常见问题（FAQ）
 
 **Q：关闭标签页后任务还会继续吗？**
-会。任务在服务端后台持续执行，直到完成或停在等待你的输入；重新打开页面（刷新或新标签页）会自动
-接管后台会话查看进度。空闲的后台会话会被自动回收（默认脱离标签页 30 分钟且无任务运行、无帧活动时；
-等待输入或运行中的会话永不回收），可用 `ZCODE_WEBUI_DETACHED_TTL_MS` 调整或设为 `0` 关闭回收，
-也可用 `POST /api/sessions/terminate` 手动全部终止。服务进程重启仍会中断后台任务。
+会，后台持续执行到完成或等待输入；重开页面自动查看进度（见「任务生命周期」）。空闲后台会话默认 30 分钟回收，
+`ZCODE_WEBUI_DETACHED_TTL_MS=0` 关闭回收，`POST /api/sessions/terminate` 立即清空。
 
-**Q：打开两个标签页时其中一个提示「已被另一个标签页接管」？**
-同一浏览器的多个标签页各自独立运行，只有在新标签页主动接管了空闲会话、或页面刷新重新夺回自己会话时
-才会出现该提示。被接管的页面已暂停，点击提示中的「接管回来」即可把会话夺回当前标签页。
+**Q：界面缩放？** Ctrl+滚轮或双指捏合（50%–200%，按浏览器记忆）；Ctrl/⌘ +/- 是浏览器整页缩放，两者并存。
 
-**Q：如何缩放界面？**
-Ctrl+滚轮、触控板/触屏双指捏合（应用级缩放 50%–200%，按浏览器记忆）；键盘 Ctrl/⌘ + `+`/`-`/`0`
-仍是浏览器整页缩放，两者可并存。
+**Q：发送消息提示「当前没有可用的模型供应商和模型」？**
+先确认 `/login` 已登录；再跑 `zcode-webui doctor` 看渲染层与运行时的**版本对齐**是否 ok（不一致就
+`zcode-webui upgrade` 对齐）；仍报错说明是旧版本项目代码，请更新。
 
-**Q：发送消息提示「当前没有可用的模型供应商和模型，请先登录或配置 API Key」？**
-先确认 `/login` 显示已登录；再确认 `ZCODE_SERVER_RUNTIME_ROOT` 指向的运行时与渲染层版本一致
-（`npm run fetch-renderer` 会写入版本戳并自动同步）。旧版本的本项目存在一个已知缺陷会导致该报错，
-请升级到最新代码。
+**Q：OAuth 一直卡在「等待端点响应」？模型调用不通但登录正常？**
+前者设置 `oauthProxy`、后者设置 `hostProxy`（环境变量或 `config.json`，二者可同用），指向出口可达的 HTTP 代理后重启服务。
 
-**Q：服务器在容器/内网里，登录页一直卡在「等待 OAuth 端点响应」？**
-服务器到 `zcode.z.ai/api/v1` 的网络不通。设置 `ZCODE_WEBUI_OAUTH_PROXY`（或 `config.json` 的
-`oauthProxy`）指向一个出口网络可用的 HTTP 代理后重启服务；如果只是模型调用不通但登录正常，
-配置 `ZCODE_WEBUI_HOST_PROXY`（或 `hostProxy`）即可，二者可同时使用。
+**Q：「添加项目 → 打开文件夹」没反应？** 允许本站弹窗即可；目录选择器是内置 Web 页面。
 
-**Q：「添加项目 → 打开文件夹」没反应？**
-浏览器拦截了弹窗。允许本站弹窗即可；目录选择器是内置 Web 页面（`picker.html`），
-从服务端配置的默认工作区开始浏览。
+**Q：经 code-server 打开白屏？** 用带尾斜杠的 `/proxy/3102/`（会自动重定向）；WS 不通会自动降级长轮询；
+可开 `<base>/debug` 自检页看桥接状态。
 
-**Q：经 code-server 打开是白屏/一直转圈？**
-确认访问的是带尾斜杠的 `/proxy/3102/`（不带会自动重定向）；确认 code-server 代理转发
-WebSocket 正常（本项目会自动降级 HTTP 长轮询，正常来说两者任一可用即可）。
-可访问 `<base>/debug` 自检页查看桥接状态。
+**Q：点击会话提示 "ZCode agent server command is not configured"？**
+官方运行时找不到 agent 入口。新版本启动 host 时已自动注入定位环境变量，出现该报错先跑
+`zcode-webui doctor`（看 `agent server` 是否 ok），然后**重启服务**让新代码生效；自定义路径可用
+`ZCODE_AGENT_SERVER_COMMAND` / `ZCODE_AGENT_SERVER_ARGS_JSON` 覆盖。
 
-**Q：官方界面版本怎么升级？**
-执行 `ZCODE_VERSION=<新版本> npm run fetch-renderer` 后重启服务。注意渲染层版本应与服务器上
-`~/.zcode/server` 的运行时版本保持一致（与官方桌面端同版本最稳妥）。
+**Q：官方界面怎么升级？** 直接 `zcode-webui upgrade`（见「一键升级」）。
 
-**Q：定时任务/闲时任务能跑吗？**
-这两类由官方桌面端调度器驱动，WebUI 不重复实现。可以在服务器上用系统 cron 调用官方 CLI 的
-`zcode -p/--resume` 等方式实现类似效果（按官方订阅规则计费）。
+**Q：服务器休眠/断网后，进行中的任务停了？**
+分两种情况：
+
+- **其实还在跑（常见）**：原设备的任务在后台继续执行；任何设备重新打开页面都会**收养那个仍在工作
+  的进程——实时进度无缝续看**，原页面自动转为「已暂停+可夺回」状态。想看进度就换设备打开即可，
+  无需担心双代理冲突。
+- **真的断了**：挂起/断网掐断流式连接会让该回合以失败告终（服务日志可见 `process stall of ~Ns`）。
+  可用官方 CLI 无头续跑：
+  `~/.zcode/server/node ~/.zcode/server/agents/glm/zcode.cjs --cwd <工作区> --resume <会话ID> --prompt '继续'`；
+  刷新页面即加载最新落库状态。长任务期间请避免让服务器休眠。
+
+**Q：定时/闲时任务能跑吗？** 该调度器属官方桌面端专属；可在服务器上用系统 cron 调官方 CLI 的
+`--prompt/--resume` 实现，按订阅规则计费。
 
 ## 测试
 
 ```bash
-npm run smoke                 # 静态服务 + 基础路径 + WS/HTTP 双桥全链路冒烟
-ZCODE_WEBUI_BASE_PATH=/zcode npm run smoke -- /zcode
-node scripts/dev/reattach-test.mjs      # 会话生命周期回归：断开保活/全新进程/后台续跑/顶替/终止
-node scripts/dev/reattach-ui-test.mjs   # 真实 UI：任务中途刷新页面，全新进程接管会话数据，任务继续跑完
-node scripts/dev/reattach-close-test.mjs # 真实 UI：任务中途关闭标签页，后台继续执行，新标签页加载同一会话
-node scripts/dev/reload-crash-test.mjs  # 回归：刷新后不得出现官方 renderer 的 "reading 'kind'" 崩溃
-node scripts/dev/zoom-test.mjs           # 缩放回归：ctrl+滚轮/双指捏合/普通滚动/缩放订阅通道
+npm run smoke                            # 静态服务 + base path + WS/HTTP 双桥全链路冒烟
+bash scripts/docker/verify.sh            # Docker 真机全链路：npm 包 → 自动安装 → 服务 → 冒烟 → 真实模型调用
+ZCODE_VERIFY_FRESH_RUNTIME=1 bash scripts/docker/verify.sh   # 更严苛：容器里只有凭据、无官方运行时，
+                                                             # 验证 setup 从零自动安装（CDN 组件下载 + SHA256 校验）
 ```
 
-**Docker 真机全链路验证**（在真实容器里走完「npm 包安装 → 向导配置 → 服务启动 → 桥接 → 真实模型调用」）：
-
-```bash
-bash scripts/docker/verify.sh              # 打包本地产物 → 构建镜像 → 容器内全链路 → 清理
-ZCODE_VERIFY_SKIP_FETCH=1 bash scripts/docker/verify.sh   # 复用已有渲染层，跳过容器内 CDN 下载
-ZCODE_VERIFY_REGISTRY=1 bash scripts/docker/verify.sh     # 包发布后改为从 npmjs registry 安装
-```
-
-验证脚本会在运行时把本机 `~/.zcode`（官方运行时 + 凭据）**复制到临时沙箱**注入容器，
-用完即删；镜像层与仓库内**不含任何凭据**。可用 `ZCODE_VERIFY_SOURCE/PROXY/NETWORK/KEEP`
-等环境变量覆盖默认值（默认自动寻找 glash 代理所在网络）。
-
-`scripts/dev/` 下附带一组 Playwright 端到端脚本（真实登录态下驱动官方界面：
-发送会话、目录选择、两种部署模式回归等），可用 `ZCODE_WEBUI_TEST_URL`、
-`ZCODE_WEBUI_TEST_DIR` 等环境变量指向自己的服务与目录。
+Docker 验证会把本机 `~/.zcode` 复制进临时沙箱注入容器，用完即删；镜像层与仓库不含任何凭据。
+可用 `ZCODE_VERIFY_SOURCE/PROXY/NETWORK/KEEP/SKIP_FETCH` 覆盖默认行为。`scripts/dev/` 下另有一组
+Playwright 端到端脚本（真实登录态驱动官方界面的回归），可用 `ZCODE_WEBUI_TEST_URL/TEST_DIR` 指向自己的服务。
 
 ## 已知限制
 
-- 不支持 SSH / WSL / Docker 远程工作区的创建（服务本身就是服务器上的工作区；界面中相关入口会返回不支持）
-- 手机 Remote Control、嵌入式浏览器（Browser Use 图形通道）、系统托盘、自动更新等桌面专属通道不可用；
-  Browser Use 可走服务器上的无头 Chrome（Agent 自带支持）
+- 不支持 SSH/WSL/Docker 远程工作区创建（服务本身就运行在你的工作区机器上）
+- 手机 Remote Control、系统托盘、自动更新等桌面专属通道不可用（Browser Use 可走服务器无头 Chrome）
 - 定时/闲时任务依赖桌面端调度器（见 FAQ）
-- 任务的后台持续执行依赖 zcode-webui 服务进程存活；服务重启会中断后台任务
-- HTTP 长轮询降级模式（`?transport=http`）下关闭标签页后任务同样会在后台继续执行，但重新打开页面时
-  不能像 WebSocket 模式一样无缝接管该会话（结果仍可在任务面板中查看）
-- 官方界面随版本演进，个别新版本 UI 可能暂时出现兼容性问题；请优先使用与运行时匹配的版本
+- 服务进程重启会中断后台任务；HTTP 长轮询模式下重开页面不能无缝接管会话（结果仍可在任务面板看到）
+- 官方界面随版本演进，个别新 UI 可能暂时兼容性问题；渲染层与运行时务必同版本
 
 ## 目录结构
 
 ```
-src/server.mjs             HTTP 静态服务 + base path + WS 桥 + 登录 API
-src/cli.mjs                zcode-webui 命令行（setup 向导 / start / doctor / status 等）
+src/server.mjs             HTTP 静态服务 + base path + WS 桥 + 登录 API + 会话管理
+src/cli.mjs                zcode-webui 命令行（setup / start / stop / upgrade / doctor / status）
 src/dirs.mjs               数据目录解析（ZCODE_WEBUI_HOME / 仓库模式）
 src/frame.mjs              stdio 帧编解码（与官方运行时互通）
 src/host.mjs               官方运行时进程拉起与握手
+src/upgrade.mjs            版本探测 + 渲染层/官方运行时组件下载校验与原子替换
 src/login.mjs              官方 CLI OAuth 登录子进程管理
 src/rpclog.mjs             诊断日志（DEBUG_RPC 时使用）
 web/bootstrap.js           浏览器侧：URL 参数、MessagePort↔WebSocket 桥、长轮询降级
 web/zcode-bridge.js        window.zcode 浏览器适配层
-web/login.html             登录页（OAuth + 凭据导入）
-web/export-credentials.html  桌面端凭据导出工具（浏览器本地运行）
-web/picker.html            Web 目录选择器
-web/debug.html             桥接自检页
-config.example.json        zcode-webui 服务配置模板
-cli-config.example.json    官方 CLI 模型配置模板（脱敏样例）
-scripts/fetch-renderer.sh  从官方 CDN 下载官方客户端并提取渲染层（vendor/renderer，不入库）
-scripts/extract-asar.cjs   安装包解包工具
+web/{login,picker,debug}.html 等   登录页 / 目录选择器 / 自检页 / 凭据导出工具
+config.example.json        服务配置模板（脱敏）
+cli-config.example.json    官方 CLI 模型配置模板（脱敏）
+scripts/fetch-renderer.sh  从官方 CDN 下载客户端并提取渲染层（vendor/renderer，不入库）
 scripts/smoke-test.mjs     冒烟测试
 scripts/docker/            Docker 真机全链路验证（verify.sh + container-verify.sh）
-scripts/dev/*.mjs          Playwright 端到端联调脚本（含会话接管与缩放回归）
+scripts/dev/*.mjs          Playwright 端到端联调脚本
 ```
 
 ## 许可证与声明
 
-- 本项目代码以 [MIT](./LICENSE) 许可开源；
+- 代码以 [MIT](./LICENSE) 开源；
 - 官方 ZCode 名称、商标与客户端版权归其权利方所有；本项目不包含、不分发任何官方客户端文件；
 - 参考：[ZCode 官方文档](https://zcode.z.ai/cn/docs) · [智谱开放平台](https://open.bigmodel.cn) ·
   [GLM Coding Plan](https://docs.bigmodel.cn/cn/coding-plan/overview)。
