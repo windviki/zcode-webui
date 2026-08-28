@@ -15,7 +15,8 @@ Your code, sessions and credentials stay on your server.
   sessions are reaped under a triple safety condition, working ones never are
 - 🔑 **Flexible login**: built-in OAuth, or import credentials exported from a logged-in desktop client;
   shares the same credential store as official clients
-- 🔍 App-level zoom via Ctrl+wheel or pinch (50%–200%)
+- 🔍 App-level zoom via Ctrl+wheel or pinch (50%–200%): midpoint-anchored, finger-tracking pan,
+  composited transform preview during the gesture, crisp re-rasterized commit at the end
 - 🧭 `zcode-webui setup`: fully automated deploy of the renderer, the official runtime, config and startup
 - 📦 Ships no, modifies no, redistributes no official code; the core is just a few source files
 

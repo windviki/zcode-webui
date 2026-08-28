@@ -408,47 +408,151 @@
   }, 20000);
 
   // ---- desktop-style app zoom gestures ----
-  // Ctrl+wheel is how Chrome reports two-finger pinch on touchpads/touchscreens;
-  // a tiny two-pointer recognizer covers touchscreens whose regions set
-  // touch-action:none (pointer events still fire there). Both drive the zoom
-  // channel implemented in zcode-bridge.js (CSS zoom 50%..200%).
+  // Hybrid pinch pipeline (research-backed): DURING the gesture the page gets a
+  // composited transform preview — 60fps, no reflow, anchored at the pinch
+  // midpoint, panning with the fingers — and on gesture end the final scale is
+  // committed to the CSS-zoom channel in the same frame, so text re-rasterizes
+  // crisp at the new level. Trackpad pinch (ctrl+wheel) drives the same
+  // pipeline with a short idle-commit debounce and zooms toward the cursor.
+  // Native two-finger page pinch is disabled via touch-action:pan-x pan-y so
+  // the browser and the app zoom never fight (iOS ignores user-scalable=no).
   (function () {
     function zoomGet() { return (window.__zwebui_zoom && window.__zwebui_zoom.get()) || 1; }
     function zoomSet(l) { if (window.__zwebui_zoom) window.__zwebui_zoom.set(l); }
 
+    var Z_MIN = 0.5, Z_MAX = 2;
+    var EMA = 0.45;          // rendered-scale smoothing toward the target
+    var WHEEL_COMMIT_MS = 160;
+
+    try {
+      var st = document.createElement('style');
+      st.textContent = 'html { touch-action: pan-x pan-y; }';
+      document.head.appendChild(st);
+    } catch (e) { /* ignore */ }
+
+    var g = null;            // live gesture
+    var wheelTimer = 0;
+
+    function softClamp(v) {  // slight rubber-band beyond the limits while pinching
+      if (v < Z_MIN) return Z_MIN + (v - Z_MIN) * 0.35;
+      if (v > Z_MAX) return Z_MAX + (v - Z_MAX) * 0.35;
+      return v;
+    }
+    function hardClamp(v) { return Math.min(Z_MAX, Math.max(Z_MIN, v)); }
+
+    function begin(zoomBase, fx, fy) {
+      if (g) return;
+      g = {
+        z0: zoomBase,
+        touch: false,
+        f: { x: fx, y: fy },
+        A: { x: fx + window.scrollX, y: fy + window.scrollY }, // anchor (scroll space)
+        rs: 1, s: 1, raf: 0,
+      };
+      var de = document.documentElement;
+      de.style.willChange = 'transform';
+      de.style.transformOrigin = '0 0';
+      schedule();
+    }
+    function update(relTarget, fx, fy) {
+      if (!g) return;
+      // pan: the content anchor follows midpoint movement 1:1 (fingers drag content)
+      g.A.x -= (fx - g.f.x);
+      g.A.y -= (fy - g.f.y);
+      g.f.x = fx; g.f.y = fy;
+      g.rs = relTarget;
+      schedule();
+    }
+    function schedule() { if (g && !g.raf) g.raf = requestAnimationFrame(tick); }
+    function tick() {
+      if (!g) return;
+      g.raf = 0;
+      g.s += (g.rs - g.s) * EMA;
+      if (Math.abs(g.rs - g.s) < 0.0004) g.s = g.rs;
+      apply();
+    }
+    function apply() {
+      // t = f - (A - scroll) * s  → the anchor content point stays under the focal
+      var tX = g.f.x - (g.A.x - window.scrollX) * g.s;
+      var tY = g.f.y - (g.A.y - window.scrollY) * g.s;
+      document.documentElement.style.transform = 'translate(' + tX + 'px,' + tY + 'px) scale(' + g.s + ')';
+    }
+
+    function endGesture() {
+      if (!g) return;
+      if (g.raf) cancelAnimationFrame(g.raf);
+      g.s = g.rs; apply();                      // settle to the exact target first
+      var z1 = hardClamp(g.z0 * g.s);
+      zoomSet(z1);                              // reflow once, text re-rasterizes crisp
+      // keep the anchored content point under the focal after the zoom switch
+      // (z1/z0 only differs from g.s at the rubber-band clamp boundaries)
+      var ratio = z1 / (g.z0 || 1);
+      try {
+        window.scrollTo(g.A.x * ratio - g.f.x, g.A.y * ratio - g.f.y);
+      } catch (e) { /* ignore */ }
+      var de = document.documentElement;
+      de.style.transform = '';
+      de.style.willChange = '';
+      g = null;
+    }
+
+    // ---- trackpad / touchscreen pinch reported as ctrl+wheel ----
     window.addEventListener('wheel', function (ev) {
       if (!ev.ctrlKey || ev.defaultPrevented) return;
       ev.preventDefault();
-      // ~12% per wheel notch (deltaY ≈ ±100), finer on trackpad pinch deltas
-      zoomSet(zoomGet() * Math.exp(-ev.deltaY * 0.001));
+      if (g && g.touch) return;               // a touchscreen pinch owns the gesture
+      if (!g) begin(zoomGet(), ev.clientX, ev.clientY);
+      g.rs = softClamp(g.rs * Math.exp(-ev.deltaY * 0.001));
+      update(g.rs, ev.clientX, ev.clientY);     // zoom toward the cursor
+      clearTimeout(wheelTimer);
+      wheelTimer = setTimeout(endGesture, WHEEL_COMMIT_MS);
     }, { passive: false });
 
-    var pointers = {};
-    var pinchDist = 0;
+    // ---- two-finger touchscreen pinch (pointer events) ----
+    var pointers = {};       // first two touch pointers only
+    var pinch = null;        // { d0, f0 }
+    function tracked() { return Object.keys(pointers); }
+    function midpoint() {
+      var ids = tracked();
+      var a = pointers[ids[0]], b = pointers[ids[1]];
+      return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) };
+    }
     function onPointerDown(ev) {
       if (ev.pointerType !== 'touch') return;
+      var ids = tracked();
+      if (ids.length >= 2 || pointers[ev.pointerId]) return;   // ignore 3rd+ finger
       pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
-      pinchDist = 0;
+      ids = tracked();
+      if (ids.length === 2) {
+        var m = midpoint();
+        pinch = { d0: m.d };
+        begin(zoomGet(), m.x, m.y);
+        g.touch = true;
+      }
     }
     function onPointerMove(ev) {
-      if (ev.pointerType !== 'touch' || !pointers[ev.pointerId]) return;
-      pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
-      var ids = Object.keys(pointers);
-      if (ids.length !== 2) { pinchDist = 0; return; }
-      var a = pointers[ids[0]], b = pointers[ids[1]];
-      var d = Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
-      if (pinchDist > 0 && d > 0) {
-        ev.preventDefault();
-        zoomSet(zoomGet() * (d / pinchDist));
+      if (ev.pointerType !== 'touch' || !pointers[ev.pointerId] || tracked().length !== 2) return;
+      // high-frequency touch digitizers: fold the coalesced trail so the last
+      // stored position is the true latest sample (finer effective granularity)
+      var trail = ev.getCoalescedEvents ? ev.getCoalescedEvents() : null;
+      if (trail && trail.length) {
+        for (var i = 0; i < trail.length; i++) {
+          var c = trail[i];
+          if (pointers[c.pointerId]) pointers[c.pointerId] = { x: c.clientX, y: c.clientY };
+        }
       }
-      pinchDist = d;
+      pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
+      var m = midpoint();
+      if (pinch && m.d > 0) update(softClamp(m.d / pinch.d0), m.x, m.y);
     }
     function onPointerEnd(ev) {
+      if (!pointers[ev.pointerId]) return;
       delete pointers[ev.pointerId];
-      pinchDist = 0;
+      pinch = null;
+      if (tracked().length < 2) endGesture();   // commit (also covers pointercancel)
     }
     window.addEventListener('pointerdown', onPointerDown, { passive: true });
-    window.addEventListener('pointermove', onPointerMove, { passive: false });
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
     window.addEventListener('pointerup', onPointerEnd, { passive: true });
     window.addEventListener('pointercancel', onPointerEnd, { passive: true });
   })();

@@ -27,7 +27,7 @@
     get: function () { return zoomLevel; },
     set: function (lvl) {
       if (typeof lvl !== 'number' || !isFinite(lvl)) return;
-      lvl = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(lvl * 100) / 100));
+      lvl = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(lvl * 1000) / 1000));
       if (lvl === zoomLevel) return;
       zoomLevel = lvl;
       try { localStorage.setItem(ZOOM_KEY, String(lvl)); } catch (e) { /* ignore */ }

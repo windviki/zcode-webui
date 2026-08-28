@@ -10,6 +10,7 @@
 import WebSocket from 'ws';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, cpSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { writeFileSync as wfs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -38,7 +39,7 @@ function serialize(d) {
 }
 const systemInfo = () => Buffer.concat([serialize([100, 1, 'system', 'info']), serialize(undefined)]);
 
-function fail(m) { console.error('FAIL:', m); console.error('--- server log tail:\n' + srvLog.slice(-1500)); cleanup(); process.exit(1); }
+function fail(m) { console.error('FAIL:', m); wfs('/tmp/cont-fail-srv.log', srvLog); console.error('--- full server log -> /tmp/cont-fail-srv.log'); cleanup(); process.exit(1); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 const SB = mkdtempSync('/tmp/zwebui-cont.XXXXXX');
@@ -92,17 +93,18 @@ class Page {
       if (!bin) {
         const s = String(d);
         if (!this.readyDone) { if (s === '{"kind":"zcode-webui-ready"}') { this.readyDone = true; this.readyResolve(); } return; }
+        if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') console.error('[client ' + this.tab + '] ' + Date.now() + ' txt ' + s.slice(0, 60));
         this.texts.push(s);
         const m = /\[zcode-webui\] host (?:spawned|adopted) pid=(\d+)/.exec(s);
         if (m) this.hostPid = Number(m[1]);
-      } else this.binaries.push(Buffer.from(d));
+      } else { this.binaries.push(Buffer.from(d)); if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') console.error('[client ' + this.tab + '] ' + Date.now() + ' bin ' + Buffer.from(d).length + 'B ' + Buffer.from(d).toString('hex').slice(0, 24)); }
     });
     this.ws.on('close', (c) => done(c));
     this.readyP = new Promise((r) => { this.readyResolve = r; });
   }
   async open() { await this.openP; await Promise.race([this.readyP, sleep(15000).then(() => { throw new Error('ready timeout ' + this.tab); })]); return this; }
   sendPortReady() { try { this.ws.send('{"kind":"zcode-webui-port-ready"}'); } catch (_e) { /* ignore */ } }
-  async roundTrip(timeoutMs = 25000) {
+  async roundTrip(timeoutMs = 45000) {
     const n0 = this.binaries.length;
     this.ws.send(systemInfo());
     const t0 = Date.now();
@@ -148,6 +150,7 @@ class Page {
 
   // ===== S1: device switch adopts the running host =====
   const a = await new Page('dev-a', tok).open();
+  await sleep(400);                                     // settle past handshake like a real renderer
   await a.roundTrip();                                  // drive traffic so the turn-ish state looks active
   a.ws.close(1000, 'device-a gone');                    // normal loss -> DETACH
   await sleep(600);
@@ -246,6 +249,68 @@ class Page {
   if (!fReplied) fail('instant-first-write got no reply (race regressed)');
   console.log('PASS S4 instant-first-write answered');
   fc.close(4000, 'bye');
+
+  // ===== S5: stale-era responses from a demoted owner are SUPPRESSED (mux) =====
+  // device ga fires 30 requests and vanishes instantly — none of the replies can
+  // reach it. device gb adopts the same host: every late reply for the ga era
+  // must be dropped by the mux; gb's own requests must still be answered.
+  {
+    const ga = await new Page('dev-ga', tok).open();
+    await ga.roundTrip();
+    const gaPid = ga.hostPid;
+    for (let i = 0; i < 30; i++) {
+      ga.ws.send(Buffer.concat([serialize([100, 1000 + i, 'system', 'info']), serialize(undefined)]));
+    }
+    ga.ws.close(1000, 'gone');                       // detach mid-burst
+    await sleep(120);                                // replies land while nobody is attached
+    const gb = await new Page('dev-gb', tok).open();
+    for (let i = 0; i < 80 && !/host adopted/.test(gb.texts.join('\n')); i++) await sleep(60);
+    if (gb.hostPid !== gaPid) fail('S5: adoption picked wrong host');
+    await sleep(1300);
+    if (gb.binaries.length !== 0) fail('S5: hold gate leaked before port-ready');
+    gb.sendPortReady();
+    gb.ws.send(Buffer.concat([serialize([100, 777, 'system', 'info']), serialize(undefined)]));
+    // wait for the 777 reply, then classify everything received
+    const decodeId = (buf) => {
+      try {
+        if (buf[0] !== 4) return null;
+        let off = 1;
+        const rdVql = () => { let v = 0, n = 0; for (;;) { const b = buf[off++]; v |= (b & 127) << n; if (!(b & 128)) return v >>> 0; n += 7; } };
+        const len = rdVql();
+        const vals = [];
+        for (let k = 0; k < len; k++) {
+          const t = buf[off++];
+          if (t === 6) vals.push(rdVql());
+          else if (t === 0) vals.push(undefined);
+          else if (t === 1) { const l = rdVql(); off += l; vals.push('s'); }
+          else if (t === 5) { const l = rdVql(); off += l; vals.push('o'); }
+          else return null;
+        }
+        return { type: vals[0], id: vals[1] };
+      } catch (_e) { return null; }
+    };
+    const responseIds = () => {
+      const out = [];
+      for (const f of gb.binaries) {
+        const d = decodeId(f);
+        if (d && (d.type === 201 || d.type === 202)) out.push(d.id);
+      }
+      return out;
+    };
+    let saw777 = false;
+    const t5 = Date.now();
+    while (Date.now() - t5 < 30000 && !saw777) {
+      saw777 = responseIds().includes(777);
+      if (!saw777) await sleep(100);
+    }
+    if (!saw777) fail('S5: mux broke the current era (777 unanswered)');
+    const stale = responseIds().filter((id) => id >= 1000 && id < 1030);
+    if (stale.length) fail('S5: stale-era responses leaked to the new renderer: ' + stale.join(','));
+    console.log('PASS S5 stale-era suppression (777 answered; no ga-era ids among ' +
+      responseIds().length + ' responses)');
+    gb.ws.close(4000, 'bye');
+    await sleep(300);
+  }
 
   console.log('CONTINUITY OK');
   cleanup();

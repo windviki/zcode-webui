@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
-import { rpcLogLine } from './rpclog.mjs';
+import { rpcLogLine, decodeRpcHeader, rewriteRpcId } from './rpclog.mjs';
 import { spawnHost, handshake, resolveServerRoot } from './host.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
@@ -350,7 +350,35 @@ function writeToHost(session, payload) {
     return true;
   }
   if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
-  try { session.child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
+  // mux: translate the current renderer's request id into the stable global space
+  if (session.mux) {
+    const hdr = decodeRpcHeader(payload);
+    if (hdr && hdr.type === 100) {
+      const gid = ++session.mux.next;
+      const rewritten = rewriteRpcId(payload, gid);
+      if (rewritten) {
+        payload = rewritten;
+      } else {
+        // exotic header we cannot splice: pass through under its OWN id and
+        // whitelist that id so the response still reaches this renderer
+        session.mux.sent.add(hdr.id);
+      }
+      session.mux.sent.add(gid);
+      session.mux.pending.set(gid, hdr.id);
+    } else if (hdr && hdr.type === 101) {
+      // cancel: renderer refers to its original id — find the global twin
+      let gid = null;
+      for (const [g, o] of session.mux.pending) if (o === hdr.id) { gid = g; break; }
+      if (gid === null) return true;                        // cancel for a dead era
+      const rewritten = rewriteRpcId(payload, gid);
+      if (rewritten) payload = rewritten;
+    }
+  }
+  try {
+    const frame = encodeFrame(payload);
+    session.child.stdin.write(frame);
+    return true;
+  } catch (_e) { return false; }
 }
 
 function removeSession(session) {
@@ -402,13 +430,67 @@ function terminateSession(session, reason) {
 }
 
 // Release frames buffered while an adopting renderer was still mounting.
+// ---------- session multiplexer (adopted sessions only) ----------
+// The official protocol pipe is single-client: every renderer talks with its own
+// request-id space and the host answers with those ids. When session X changes
+// owner mid-flight (device switch), the PREVIOUS owner's requests are still in
+// the pipe — delivering their late responses to the NEW renderer is exactly
+// what produced fault.connection.clientChanged. The mux gives the host a
+// stable global id space and hands each response back only to the era that
+// asked for it:
+//   upstream  : [100, rendererId, …]  ->  [100, globalId, …]  (mapping kept)
+//   downstream: [201/202, globalId, …] -> rewritten to rendererId and delivered,
+//               DROPPED when the globalId was not sent by the CURRENT era.
+// Event frames (type 200, no id) pass through for every era — that is the live
+// stream. Kill switch: ZCODE_WEBUI_MUX=0.
+const MUX_ENABLED = process.env.ZCODE_WEBUI_MUX !== '0';
+
+function makeMux() {
+  return {
+    next: Number(process.env.ZCODE_MUX_START) || 0x10000,
+    sent: new Set(),     // globalIds sent by the CURRENT renderer era
+    pending: new Map(),  // globalId -> that renderer's original id
+    dropped: 0,
+  };
+}
+
+function forwardDownstream(session, payload) {
+  const ws = session.ws;
+  if (!ws || ws.readyState !== 1) return;
+  if (session.mux) {
+    const hdr = decodeRpcHeader(payload);
+    if (hdr && (hdr.type === 201 || hdr.type === 202)) {
+      if (!session.mux.sent.has(hdr.id)) {
+        session.mux.dropped++;
+        if (session.mux.dropped <= 5 || session.mux.dropped % 50 === 0) {
+          console.error('[mux] dropped stale response globalId=' + hdr.id +
+            ' (' + hdr.channel + '.' + hdr.method + ') era-mismatch, total=' + session.mux.dropped);
+        }
+        return;
+      }
+      const orig = session.mux.pending.get(hdr.id);
+      session.mux.sent.delete(hdr.id);
+      session.mux.pending.delete(hdr.id);
+      let out = payload;
+      if (orig !== undefined && orig !== hdr.id) {
+        // surgical: replace only the id varint, keep every other byte identical
+        out = rewriteRpcId(payload, orig) || payload;
+      }
+      try { ws.send(out, { binary: true }); } catch (_e) { /* ignore */ }
+      return;
+    }
+    // type 200 events and undecodable frames pass through untouched
+  }
+  try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
+}
+
 function releaseHold(session) {
   if (!session || !session.holdFrames) return;
   session.holdFrames = false;
   const ws = session.ws;
   if (ws && ws.readyState === 1) {
     for (const p of session.holdBuf.splice(0)) {
-      try { ws.send(p, { binary: true }); } catch (_e) { break; }
+      forwardDownstream(session, p);
     }
   } else {
     session.holdBuf.length = 0;
@@ -471,7 +553,7 @@ function createSession(userKey, tabId) {
         if (session.holdBuf.length < 256) session.holdBuf.push(Buffer.from(payload));
         return;
       }
-      try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
+      forwardDownstream(session, payload);
     }
   });
   session.parser = parser;
@@ -565,6 +647,12 @@ function attachRelay(ws, session) {
   if (session.ws) {
     try { session.ws.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
   }
+  // every attach starts a new renderer era: its in-flight responses are the only
+  // ones allowed through the mux from now on (stale-era replies get dropped)
+  if (session.mux) {
+    session.mux.sent.clear();
+    session.mux.pending.clear();
+  }
   session.ws = ws;
   session.wsAttachedAt = Date.now();
   session.detachedAt = 0;
@@ -581,7 +669,7 @@ function attachRelay(ws, session) {
       return;
     }
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (session.hello) writeToHost(session, payload);
+      if (session.hello) writeToHost(session, payload);
     else session.pendingInbound.push(payload);
   });
 
@@ -985,6 +1073,7 @@ function handleUpgrade(req, socket, head) {
     if (victim) {
       session = victim;
       adopted = true;
+      if (MUX_ENABLED && !session.mux) session.mux = makeMux();
       rebindSession(session, userKey, tabId);       // page identity follows the adopting page
       session.detachedAt = 0;
       console.error('[zcode-webui] ADOPTED host pid=' + session.child.pid +
