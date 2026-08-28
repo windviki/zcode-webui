@@ -1,6 +1,6 @@
 {
   "name": "@aixyzstudio/zcode-webui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run the official ZCode desktop UI in any browser, backed by the official zcode-server runtime, with code-server integration.",
   "type": "module",
   "main": "src/server.mjs",
