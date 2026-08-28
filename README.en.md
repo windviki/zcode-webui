@@ -16,7 +16,8 @@ Your code, sessions and credentials stay on your server.
 - 🔑 **Flexible login**: built-in OAuth, or import credentials exported from a logged-in desktop client;
   shares the same credential store as official clients
 - 🔍 App-level zoom via Ctrl+wheel or pinch (50%–200%): midpoint-anchored, finger-tracking pan,
-  composited transform preview during the gesture, crisp re-rasterized commit at the end
+  composited transform preview during the gesture, crisp re-rasterized commit at the end;
+  zoom-out commits directly so the page never detaches from the viewport (no blank edges)
 - 🧭 `zcode-webui setup`: fully automated deploy of the renderer, the official runtime, config and startup
 - 📦 Ships no, modifies no, redistributes no official code; the core is just a few source files
 
@@ -108,18 +109,19 @@ JSON into `/login` → import.
 **C · The server was already logged in via the official CLI/desktop**
 `~/.zcode` is ready — nothing to do.
 
-## Task lifecycle (important, 30 seconds)
+## Task lifecycle & multi-device live view (important, 30 seconds)
 
-Every tab connects to its own server-side session (an official runtime process), and one process serves
-exactly one page for its whole lifetime. **Closing a tab / switching devices does not end tasks**: the
-process parks in the background until its work finishes or waits for your input; a reopened page
-**adopts that still-running process first** — same pid, live progress continues seamlessly — and only
-spawns a fresh one when nothing is adoptable (loading the latest persisted state from the shared store).
-Only the page you are actively using is the LIVE view: switching devices moves it with you, while the
-page left behind shows a "taken over" notice with one-click take-back — two agents can never drive the
-same work simultaneously. Idle background processes are reaped after
-30 minutes by default (working / waiting-for-input ones never are); online pages are never reaped.
-**Restarting the zcode-webui service interrupts background tasks** (same as restarting the desktop app).
+One running host per account; **every device's page attaches to it as a view**:
+
+- **Simultaneous live view on all devices**: opening the page anywhere attaches you to the same
+  process — full history and live output, continuously pushed. Switch devices or keep several open:
+  no refreshes, no interference, no demotion;
+- **Closing a tab never ends tasks**: with the last view gone the process parks in the background
+  until its work finishes or waits for your input (idle ones reaped after 30 minutes by default);
+- **Caution**: sending a new instruction while another device's task still runs makes two agents work
+  the same files concurrently — wait for completion unless you truly want parallelism;
+- **Restarting the zcode-webui service interrupts background tasks** (same as the desktop app).
+
 
 ## Configuration reference
 
@@ -244,12 +246,19 @@ running. Custom paths: override `ZCODE_AGENT_SERVER_COMMAND` / `ZCODE_AGENT_SERV
 
 **Q: How do I upgrade the official UI?** Just run `zcode-webui upgrade` (see *One-command upgrade*).
 
+**Q: Switching to another app and back disconnects / asks me to reconnect?**
+That's the mobile browser freezing the page and recycling the network socket in the background (not a
+server timeout). The new version handles it transparently: a background drop **no longer reloads the
+page** — on recovery it hot-reconnects and re-adopts the same running host, replaying anything the task
+produced while you were away. No taps needed; the page self-heals when you come back. The server also
+pings attached clients every 30s so dead sockets are cleaned up and hosts park gracefully.
+
 **Q: My in-progress task stopped after the server slept / lost network?**
 Two distinct cases:
 
-- **It is actually still running (common)**: any device reopening the page **adopts the still-running
-  process first — live progress, seamless continuation**, and the previously active page demotes itself
-  to a paused state with one-click take-back. No duplicate-agent conflict by construction.
+- **It is actually still running (common)**: reopening the page anywhere attaches you to the running
+  host — **live progress on every device at once**, no refreshes. Only sending instructions from two
+  devices at the same time can cause concurrent agents — avoid that.-click take-back. No duplicate-agent conflict by construction.
 - **The turn really died**: suspend/network loss cuts the stream and that turn fails (the service
   log prints `process stall of ~Ns` for correlation). Resume headlessly with the official CLI:
   `~/.zcode/server/node ~/.zcode/server/agents/glm/zcode.cjs --cwd <workspace> --resume <sessionId> --prompt 'continue'`;

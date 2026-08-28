@@ -96,16 +96,16 @@ function parseCookies(header) {
   return out;
 }
 const CLIENT_COOKIE = 'zwebui_client';
-function sessionKey(userKey, tabId) {
-  return (userKey || ('tab:' + tabId)) + ':' + (tabId || 'untabbed');
-}
 
 // stable per-account key (in-memory only, never logged in full; the account id
 // itself stays out of logs by using a short hash)
-let userKeyCache = { key: '', at: 0 };
+// per-browser cache (a single global entry would cross-contaminate users)
+const userKeyCache = new Map();   // clientKey -> { key, at }
+function shortKey(k) { try { return createHash('sha256').update(k).digest('hex').slice(0, 8); } catch (_e) { return '?'; } }
 function resolveUserKey(clientKey) {
   const now = Date.now();
-  if (userKeyCache.key && now - userKeyCache.at < 30000) return userKeyCache.key;
+  const cached = userKeyCache.get(clientKey);
+  if (cached && now - cached.at < 30000) return cached.key;
   let key = '';
   try {
     const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
@@ -122,7 +122,12 @@ function resolveUserKey(clientKey) {
     }
   } catch (_e) { /* ignore */ }
   if (!key) key = 'cookie:' + (clientKey || 'anon');
-  userKeyCache = { key, at: now };
+  if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') console.error('[userkey] client=' + (clientKey || 'none').slice(0, 8) + ' key=' + shortKey(key) + ' creds=' + (key.indexOf('cookie:') !== 0));
+  userKeyCache.set(clientKey || 'anon', { key, at: now });
+  if (userKeyCache.size > 256) {
+    const cutoff = now - 30000;
+    for (const [k, v] of userKeyCache) if (v.at < cutoff) userKeyCache.delete(k);
+  }
   return key;
 }
 function shortUserKey(userKey) {
@@ -322,13 +327,16 @@ function openHostPipe() {
   });
 }
 
-// ---------- host sessions ----------
-// One host process per (userKey, tabId) session. Hosts are NOT killed when the
-// browser tab / websocket goes away: they keep running their turns in the background
-// and can be re-attached by a later tab (same tab id after a reload, or any tab of
-// the same browser adopting a detached host).
-const sessions = new Map();       // sessionKey -> session
-const userSessions = new Map();   // userKey -> Set(session)
+// ---------- host sessions (multi-device live view) ----------
+// ONE host process per ACCOUNT (userKey). Every browser tab/device attaches as
+// a VIEW of that session:
+//   - event frames (type 200) are broadcast to every view — all devices see the
+//     live stream simultaneously;
+//   - responses (201/202) are routed back to the view whose request produced
+//     them (the mux keeps per-view id spaces), so views never cross-contaminate;
+//   - a session with zero views parks detached and keeps running its turns
+//     (the reaper cleans idle ones); the first view to (re)attach adopts it.
+const sessions = new Map();       // userKey -> session
 const httpRelays = new Map();     // id -> {pipe, queue, waiter, waiterTimer, lastSeen} (HTTP long-poll fallback)
 
 function rpcLogOut(payload) {
@@ -340,7 +348,7 @@ function rpcLogIn(payload) {
   if (l) console.error('[rpc] ' + l);
 }
 
-function writeToHost(session, payload) {
+function writeToHost(session, view, payload) {
   if (session.closed) return false;
   session.framesIn++;
   // protect the host: only forward payloads that look like serialized channel
@@ -350,150 +358,109 @@ function writeToHost(session, payload) {
     return true;
   }
   if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
-  // mux: translate the current renderer's request id into the stable global space
+  // mux: translate this view's request id into the stable global space
   if (session.mux) {
     const hdr = decodeRpcHeader(payload);
     if (hdr && hdr.type === 100) {
       const gid = ++session.mux.next;
+      if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') console.error('[muxdbg] req view=' + view.tabId.slice(0, 6) + ' orig=' + hdr.id + ' gid=' + gid);
+      view.sent.add(gid);
+      session.mux.pending.set(gid, { view, origId: hdr.id });
       const rewritten = rewriteRpcId(payload, gid);
-      if (rewritten) {
-        payload = rewritten;
-      } else {
-        // exotic header we cannot splice: pass through under its OWN id and
-        // whitelist that id so the response still reaches this renderer
-        session.mux.sent.add(hdr.id);
-      }
-      session.mux.sent.add(gid);
-      session.mux.pending.set(gid, hdr.id);
+      if (rewritten) payload = rewritten;
     } else if (hdr && hdr.type === 101) {
       // cancel: renderer refers to its original id — find the global twin
       let gid = null;
-      for (const [g, o] of session.mux.pending) if (o === hdr.id) { gid = g; break; }
+      for (const [g, e] of session.mux.pending) if (e.view === view && e.origId === hdr.id) { gid = g; break; }
       if (gid === null) return true;                        // cancel for a dead era
       const rewritten = rewriteRpcId(payload, gid);
       if (rewritten) payload = rewritten;
     }
   }
-  try {
-    const frame = encodeFrame(payload);
-    session.child.stdin.write(frame);
-    return true;
-  } catch (_e) { return false; }
+  try { session.child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
 }
 
 function removeSession(session) {
-  for (const [k, s] of sessions) if (s === session) sessions.delete(k);
-  const set = userSessions.get(session.userKey);
-  if (set) {
-    set.delete(session);
-    if (set.size === 0) userSessions.delete(session.userKey);
-  }
+  session.closed = true;
+  sessions.delete(session.userKey);
 }
 
-// Describe the OTHER hosts of this account — used to warn a freshly loaded page
-// that somewhere else (another device/tab closed earlier) an agent may still be
-// mid-turn on the same shared session data. Without this, a second device shows
-// stale persisted state ("looks stopped"), inviting a duplicate "continue"
-// message and two agents racing on the same workspace.
-function siblingSnapshot(userKey, { exceptSession = null, exceptTab = '' } = {}) {
+// Per-view snapshot for observability endpoints
+function viewsSnapshot(session, exceptTab) {
   const now = Date.now();
   const out = [];
-  for (const s of [...(userSessions.get(userKey) || [])]) {
-    if ((exceptSession && s === exceptSession) || s.closed || !s.child) continue;
-    if (exceptTab && s.tabId === exceptTab) continue;
-    const lastFrameAgeMs = s.lastFrameAt ? now - s.lastFrameAt : Infinity;
-    out.push({
-      pid: s.child.pid,
-      attached: !!s.ws,
-      detachedAgoSec: s.detachedAt ? Math.round((now - s.detachedAt) / 1000) : null,
-      lastFrameAgeSec: Number.isFinite(lastFrameAgeMs) ? Math.round(lastFrameAgeMs / 1000) : null,
-      active: lastFrameAgeMs < ACTIVE_FRAME_MS,
-    });
+  for (const [tabId, v] of session.views) {
+    if (exceptTab && tabId === exceptTab) continue;
+    const age = v.lastFrameAt ? now - v.lastFrameAt : Infinity;
+    out.push({ tabId: tabId.slice(0, 8), attached: true, lastFrameAgeSec: Number.isFinite(age) ? Math.round(age / 1000) : null, active: age < ACTIVE_FRAME_MS });
   }
-  return {
-    activeCount: out.filter((x) => x.active).length,
-    hosts: out.sort((a, b) => (a.lastFrameAgeSec ?? 1e9) - (b.lastFrameAgeSec ?? 1e9)),
-  };
+  return { activeCount: out.filter((x) => x.active).length, hosts: out };
 }
 
 function terminateSession(session, reason) {
-  if (!session) return;
+  if (!session || session.closed) return;
   session.closed = true;
-  if (session.ws) { try { session.ws.close(1011, 'host terminated'); } catch (_e) { /* ignore */ } }
+  for (const [, v] of session.views) {
+    try { v.ws.close(1011, 'host terminated'); } catch (_e) { /* ignore */ }
+  }
+  session.views.clear();
   const child = session.child;
   if (child && child.exitCode === null) {
     console.error('[zcode-webui] terminating host pid=' + child.pid + ' reason=' + reason);
     child.kill('SIGTERM');
     setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
   }
-  removeSession(session);
+  sessions.delete(session.userKey);
 }
 
-// Release frames buffered while an adopting renderer was still mounting.
-// ---------- session multiplexer (adopted sessions only) ----------
-// The official protocol pipe is single-client: every renderer talks with its own
-// request-id space and the host answers with those ids. When session X changes
-// owner mid-flight (device switch), the PREVIOUS owner's requests are still in
-// the pipe — delivering their late responses to the NEW renderer is exactly
-// what produced fault.connection.clientChanged. The mux gives the host a
-// stable global id space and hands each response back only to the era that
-// asked for it:
-//   upstream  : [100, rendererId, …]  ->  [100, globalId, …]  (mapping kept)
-//   downstream: [201/202, globalId, …] -> rewritten to rendererId and delivered,
-//               DROPPED when the globalId was not sent by the CURRENT era.
-// Event frames (type 200, no id) pass through for every era — that is the live
-// stream. Kill switch: ZCODE_WEBUI_MUX=0.
-const MUX_ENABLED = process.env.ZCODE_WEBUI_MUX !== '0';
-
-function makeMux() {
-  return {
-    next: Number(process.env.ZCODE_MUX_START) || 0x10000,
-    sent: new Set(),     // globalIds sent by the CURRENT renderer era
-    pending: new Map(),  // globalId -> that renderer's original id
-    dropped: 0,
-  };
-}
-
-function forwardDownstream(session, payload) {
-  const ws = session.ws;
-  if (!ws || ws.readyState !== 1) return;
-  if (session.mux) {
-    const hdr = decodeRpcHeader(payload);
-    if (hdr && (hdr.type === 201 || hdr.type === 202)) {
-      if (!session.mux.sent.has(hdr.id)) {
-        session.mux.dropped++;
-        if (session.mux.dropped <= 5 || session.mux.dropped % 50 === 0) {
-          console.error('[mux] dropped stale response globalId=' + hdr.id +
-            ' (' + hdr.channel + '.' + hdr.method + ') era-mismatch, total=' + session.mux.dropped);
-        }
-        return;
+// Deliver one downstream frame: responses to their owning view, events to all.
+function routeDownstream(session, payload) {
+  const hdr = session.mux ? decodeRpcHeader(payload) : null;
+  if (hdr && (hdr.type === 201 || hdr.type === 202)) {
+    const entry = session.mux.pending.get(hdr.id);
+    if (!entry) {
+      session.mux.dropped++;
+      if (session.mux.dropped <= 5 || session.mux.dropped % 50 === 0) {
+        console.error('[mux] dropped stale response globalId=' + hdr.id +
+          ' (' + hdr.channel + '.' + hdr.method + ') owner gone, total=' + session.mux.dropped);
       }
-      const orig = session.mux.pending.get(hdr.id);
-      session.mux.sent.delete(hdr.id);
-      session.mux.pending.delete(hdr.id);
-      let out = payload;
-      if (orig !== undefined && orig !== hdr.id) {
-        // surgical: replace only the id varint, keep every other byte identical
-        out = rewriteRpcId(payload, orig) || payload;
-      }
-      try { ws.send(out, { binary: true }); } catch (_e) { /* ignore */ }
       return;
     }
-    // type 200 events and undecodable frames pass through untouched
+    session.mux.pending.delete(hdr.id);
+    const view = entry.view;
+    entry.view.sent.delete(hdr.id);
+    const ws = view.ws;
+    if (!ws || ws.readyState !== 1) return;
+    let out = payload;
+    if (entry.origId !== hdr.id) {
+      out = rewriteRpcId(payload, entry.origId) || payload;
+    }
+    try { ws.send(out, { binary: true }); } catch (_e) { /* ignore */ }
+    return;
   }
-  try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
+  // events (type 200, no id) and undecodable frames: broadcast to every view
+  for (const [, v] of session.views) {
+    if (v.holdFrames) {                         // still mounting: buffer in order
+      if (v.holdBuf.length < 512) v.holdBuf.push(Buffer.from(payload));
+      continue;
+    }
+    const ws = v.ws;
+    if (ws && ws.readyState === 1) {
+      try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
+    }
+  }
 }
 
-function releaseHold(session) {
-  if (!session || !session.holdFrames) return;
-  session.holdFrames = false;
-  const ws = session.ws;
+function releaseHold(view) {
+  if (!view || !view.holdFrames) return;
+  view.holdFrames = false;
+  const ws = view.ws;
   if (ws && ws.readyState === 1) {
-    for (const p of session.holdBuf.splice(0)) {
-      forwardDownstream(session, p);
+    for (const p of view.holdBuf.splice(0)) {
+      try { ws.send(p, { binary: true }); } catch (_e) { break; }
     }
   } else {
-    session.holdBuf.length = 0;
+    view.holdBuf.length = 0;
   }
 }
 
@@ -506,62 +473,45 @@ function createSession(userKey, tabId) {
     throw new Error('failed to spawn host: ' + err.message);
   }
   const session = {
-    id: randomUUID(), userKey, tabId, child, hello: null,
-    ws: null, wsAttachedAt: 0, detachedAt: 0, lastFrameAt: 0,
+    userKey, primaryTab: tabId, child, hello: null,
+    views: new Map(),                       // tabId -> view
+    detachedAt: 0, lastFrameAt: 0,
     framesIn: 0, framesOut: 0, pendingInbound: [], closed: false,
     firstDownstream: null, initForwarded: false,
-    holdFrames: false, holdBuf: [],
+    resumeBuf: [], resumeMode: false,
+    mux: MUX_ENABLED ? { next: 0x10000, pending: new Map(), dropped: 0 } : null,
   };
   console.error('[zcode-webui] host spawned pid=' + child.pid + ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
-  sessions.set(sessionKey(userKey, tabId), session);
-  let set = userSessions.get(userKey);
-  if (!set) { set = new Set(); userSessions.set(userKey, set); }
-  set.add(session);
+  sessions.set(userKey, session);
 
-  // stdout must be drained forever — even with no tab attached — so the pipe never
-  // fills up and blocks the host while it keeps working in the background.
+  // stdout must be drained forever — even with no view attached — so the pipe
+  // never fills up and blocks the host while it keeps working in the background.
   const parser = new FrameParser((payload) => {
     session.framesOut++;
     session.lastFrameAt = Date.now();
     if (!session.firstDownstream) {
-      // the host emits exactly one Initialize at startup; remember it so a later
-      // ADOPTING renderer can be replayed the full bootstrap even mid-stream
+      // the host emits exactly one Initialize at startup; remember it so later
+      // views can be replayed the full bootstrap
       session.firstDownstream = Buffer.from(payload);
-      if (session.holdFrames && session.replayInitOnCapture) {
-        // adopter attached before the host had said anything: replay this frame
-        session.replayInitOnCapture = false;
-        session.holdBuf.push(Buffer.from(payload));
-        session.holdSkipOnce = true;
-      }
     }
     if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogOut(payload);
-    // Mirror the official startup sequencing: the host emits Initialize and only
-    // afterwards accepts stdin traffic. Flush any client frames that arrived
-    // while the handshake was still in flight here — flushing them earlier
-    // (straight after hello-ack) demonstrably wedges the runtime's startup.
+    // official startup sequencing: flush frames queued during the handshake only
+    // after the Initialize has gone out (earlier flushes wedge the runtime)
     if (!session.initForwarded) {
       session.initForwarded = true;
-      for (const p of session.pendingInbound.splice(0)) writeToHost(session, p);
+      for (const p of session.pendingInbound.splice(0)) writeToHost(session, firstViewOf(session), p);
     }
-    const ws = session.ws;
-    if (!session.closed && ws && ws.readyState === 1) {
-      if (session.holdFrames) {
-        // adopted mid-stream: gate downstream frames until the fresh renderer
-        // finished mounting (its "port-ready" ack), so the first bytes it ever
-        // sees are our replayed Initialize, not an arbitrary stream chunk
-        if (session.holdSkipOnce) { session.holdSkipOnce = false; return; }
-        if (session.holdBuf.length < 256) session.holdBuf.push(Buffer.from(payload));
-        return;
-      }
-      forwardDownstream(session, payload);
-    }
+    routeDownstream(session, payload);
   });
   session.parser = parser;
   child.on('exit', (code, signal) => {
     session.closed = true;
-    if (session.ws) { try { session.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ } }
-    console.error('[zcode-webui] host exited pid=' + child.pid + ' code=' + code + ' signal=' + signal + (session.detachedAt ? ' (was detached)' : ''));
-    removeSession(session);
+    for (const [, v] of session.views) {
+      try { v.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ }
+    }
+    session.views.clear();
+    console.error('[zcode-webui] host exited pid=' + child.pid + ' code=' + code + ' signal=' + signal + (session.views.size ? '' : ''));
+    sessions.delete(session.userKey);
   });
 
   handshake(child)
@@ -573,140 +523,33 @@ function createSession(userKey, tabId) {
       // otherwise the hello JSON would contaminate the frame parser's buffer
       parser.push(rest);
       child.stdout.on('data', (d) => parser.push(d));
-      // safety net in case this runtime flavor emits no Initialize-like leading frame
-      setTimeout(() => {
-        if (!session.closed && !session.initForwarded && session.pendingInbound.length) {
-          session.initForwarded = true;
-          for (const p of session.pendingInbound.splice(0)) writeToHost(session, p);
-        }
-      }, 3000).unref();
-      if (session.ws && session.ws.readyState === 1) {
-        try { session.ws.send('[zcode-webui] handshake ok, host version=' + hello.version); } catch (_e) { /* ignore */ }
-      }
     })
     .catch((err) => {
       console.error('[zcode-webui] handshake failed pid=' + child.pid + ': ' + err.message);
-      if (session.ws) { try { session.ws.close(1011, 'host handshake failed'); } catch (_e) { /* ignore */ } }
       terminateSession(session, 'handshake failed');
     });
-
-  const timer = setInterval(() => {
-    if (session.closed) { clearInterval(timer); return; }
-    if (session.framesIn || session.framesOut) {
-      console.error('[relay] frames in=' + session.framesIn + ' out=' + session.framesOut + ' (pid=' + child.pid + (session.ws ? '' : ', detached') + ')');
-    }
-  }, 15000);
-  timer.unref();
 
   return session;
 }
 
-function rebindSession(session, userKey, tabId) {
-  for (const [k, s] of sessions) if (s === session) sessions.delete(k);
-  let set = userSessions.get(session.userKey);
-  if (set) {
-    set.delete(session);
-    if (set.size === 0) userSessions.delete(session.userKey);
-  }
-  session.userKey = userKey;
-  session.tabId = tabId;
-  sessions.set(sessionKey(userKey, tabId), session);
-  set = userSessions.get(userKey);
-  if (!set) { set = new Set(); userSessions.set(userKey, set); }
-  set.add(session);
+function firstViewOf(session) {
+  for (const [, v] of session.views) return v;
+  return null;
 }
 
-// Retire a host whose tab is being reloaded/taken over. The official protocol
-// pipe is single-client: a second renderer MUST NEVER attach to it (message-id
-// spaces collide and stale replies crash the renderer, and one session can end
-// up being driven twice). So the old host either:
-//   - terminates immediately when idle, or
-//   - keeps running DETACHED in the background when it looks busy (fresh frames
-//     or a running task in the index), moved out of the tab key so no renderer
-//     can ever attach to it again; the reaper cleans it up when it goes idle.
-async function retireSession(session, reason) {
-  if (session.closed) return;
-  if (session.ws) {
-    try { session.ws.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
-    session.ws = null;
-  }
-  const framesFresh = session.lastFrameAt && Date.now() - session.lastFrameAt < FRAME_QUIET_MS;
-  const busy = framesFresh || await hasRunningTask(tasksIndexPath());
-  if (busy) {
-    session.detachedAt = Date.now();
-    rebindSession(session, 'bg:' + randomUUID(), (session.tabId || 'tab') + '-bg');
-    console.error('[zcode-webui] retiring busy host to background pid=' + session.child.pid + ' reason=' + reason);
-  } else {
-    console.error('[zcode-webui] retiring idle host pid=' + session.child.pid + ' reason=' + reason);
-    terminateSession(session, reason);
-  }
+function rebindView(session, tabId) {
+  session.primaryTab = tabId;
 }
 
-function attachRelay(ws, session) {
-  // one renderer per host, for the host's whole lifetime (fresh host per page load)
-  if (session.ws) {
-    try { session.ws.close(4001, 'superseded'); } catch (_e) { /* ignore */ }
-  }
-  // every attach starts a new renderer era: its in-flight responses are the only
-  // ones allowed through the mux from now on (stale-era replies get dropped)
-  if (session.mux) {
-    session.mux.sent.clear();
-    session.mux.pending.clear();
-  }
-  session.ws = ws;
-  session.wsAttachedAt = Date.now();
-  session.detachedAt = 0;
-  console.error('[zcode-webui] host attached pid=' + session.child.pid + ' user=' + shortUserKey(session.userKey) + '/' + (session.tabId || '').slice(0, 8));
-
-  // Register inbound handling BEFORE any first-byte notice goes out below:
-  // clients that answer the ready signal instantly would otherwise race this
-  // registration and their first protocol frame would be dropped.
-  ws.on('message', (data, isBinary) => {
-    if (session.closed) return;
-    if (!isBinary) {
-      // control text from our own bootstrap bridge
-      if (String(data) === '{"kind":"zcode-webui-port-ready"}') releaseHold(session);
-      return;
-    }
-    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
-      if (session.hello) writeToHost(session, payload);
-    else session.pendingInbound.push(payload);
-  });
-
-  ws.on('close', (code) => {
-    if (session.ws !== ws) return; // superseded by a newer attachment
-    session.ws = null;
-    if (code === 4000) {
-      // explicit terminate request (tests / cleanup)
-      console.error('[ws] terminate (code 4000) pid=' + session.child.pid);
-      terminateSession(session, 'ws terminate');
-      return;
-    }
-    if (session.closed) return;
-    if (session.framesIn === 0 && session.framesOut === 0) {
-      // closed before any traffic: nothing was started, free the host
-      console.error('[ws] closed before traffic, terminating host pid=' + session.child.pid);
-      terminateSession(session, 'closed before traffic');
-      return;
-    }
-    // DETACH: the host keeps running in the background until its task finishes,
-    // waits for user input, or is reaped as idle.
-    session.detachedAt = Date.now();
-    console.error('[ws] DETACHED (host keeps running) pid=' + session.child.pid + ' frames in=' + session.framesIn + ' out=' + session.framesOut);
-  });
-  ws.on('error', () => { /* close follows */ });
-}
-
-// Idle-session reaper: on by default with a 30-minute TTL and triple safety guards
-// (detached-for, frame-quiet, no running task). Set ZCODE_WEBUI_DETACHED_TTL_MS=0
-// to keep detached hosts forever.
+// Idle-session reaper: a session whose views have ALL gone away parks detached;
+// after the TTL it is reaped unless it is verifiably still working (frames
+// flowing, or a recent running task in the official index).
 if (DETACHED_TTL_MS > 0) {
   setInterval(async () => {
     const now = Date.now();
-    // global busy-guard: any live task (including waits for user input) blocks reaping
-    if (await hasRunningTask(tasksIndexPath())) return;
+    if (await hasRunningTask(tasksIndexPath())) return;   // global busy-guard
     for (const s of [...sessions.values()]) {
-      if (s.closed || s.ws || !s.detachedAt) continue;
+      if (s.closed || s.views.size > 0 || !s.detachedAt) continue;
       if (now - s.detachedAt <= DETACHED_TTL_MS) continue;
       if (s.lastFrameAt && now - s.lastFrameAt <= FRAME_QUIET_MS) continue;
       console.error('[zcode-webui] reaping idle detached host pid=' + s.child.pid +
@@ -716,6 +559,9 @@ if (DETACHED_TTL_MS > 0) {
     }
   }, 60000).unref();
 }
+
+// mux kill switch lives here so both parser and writer see one definition
+const MUX_ENABLED = process.env.ZCODE_WEBUI_MUX !== '0';
 
 // ---------- http server ----------
 const server = http.createServer((req, res) => {
@@ -757,9 +603,8 @@ function handleRequest(req, res) {
       serverRoot: serverRoot || null, workspace: WORKSPACE,
       login: loginState(),
       sessions: {
-        total: all.length,
-        attached: all.filter((s) => !s.closed && s.ws).length,
-        detached: all.filter((s) => !s.closed && !s.ws).length,
+        total: all.filter((s) => !s.closed).length,
+        views: all.reduce((n, s) => n + (s.closed ? 0 : s.views.size), 0),
       },
       reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS },
       httpRelays: httpRelays.size,
@@ -892,7 +737,7 @@ function handleRequest(req, res) {
     if (scopeUser) {
       const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
       const callerKey = resolveUserKey(clientKey);
-      targets = targets.filter((s) => s.userKey === callerKey && !(keepTab && s.tabId === keepTab));
+      targets = targets.filter((s) => s.userKey === callerKey && !(keepTab && s.views.has(keepTab)));
     }
     for (const s of targets) terminateSession(s, scopeUser ? 'user terminate' : 'api terminate');
     if (!scopeUser) {
@@ -910,7 +755,15 @@ function handleRequest(req, res) {
     const q2 = new URL(req.url, 'http://x').searchParams;
     const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
     const userKey = resolveUserKey(clientKey);
-    return sendJson(res, 200, siblingSnapshot(userKey, { exceptTab: (q2.get('tab') || '').slice(0, 128) }));
+    const sess = sessions.get(userKey);
+    // background-execution signal: a session with NO attached views whose host
+    // streamed frames recently = a task running on a device that has left
+    let background = [];
+    if (sess && !sess.closed && sess.views.size === 0 && sess.framesIn > 0 &&
+        sess.lastFrameAt && Date.now() - sess.lastFrameAt < ACTIVE_FRAME_MS) {
+      background = [{ pid: sess.child.pid, lastFrameAgeSec: Math.round((Date.now() - sess.lastFrameAt) / 1000) }];
+    }
+    return sendJson(res, 200, { activeCount: background.length, hosts: background });
   }
 
   // import credentials (e.g. exported from an already-logged-in ZCode desktop)
@@ -1040,46 +893,34 @@ function handleUpgrade(req, socket, head) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
     return socket.destroy();
   }
-  // One host pipe serves exactly ONE renderer for its whole lifetime (the
-  // official protocol is single-client). Every page load / tab takeover gets a
-  // FRESH host; the previous host of the same (user, tab) — or any host of this
-  // user when ?takeover=1 — is parked (4001) and retired: idle hosts terminate
-  // immediately, busy hosts keep running detached in the background. Session
-  // data lives in the shared store, so the new page sees the same sessions.
+  // Multi-device live view: every page of an account attaches as a VIEW of the
+  // account's single running host (events broadcast, responses routed by
+  // ownership). resume=1 marks the SAME renderer page hot-reconnecting after an
+  // app switch — its mux era continues and frames buffered while it was away
+  // are replayed, so nothing is lost and nothing needs a reload.
   const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
   const userKey = resolveUserKey(clientKey);
   const tabId = (q.get('tab') || '').slice(0, 128);
-  const takeover = q.get('takeover') === '1';
+  const resume = q.get('resume') === '1';
+  if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') console.error('[wsdbg] upgrade tab=' + tabId.slice(0, 8) + ' resume=' + resume + ' userKey=' + shortUserKey(userKey) + ' cookie=' + String(req.headers.cookie || 'none').slice(0, 24));
 
   (async () => {
-    const prev = sessions.get(sessionKey(userKey, tabId));
-
-    // CONTINUITY POLICY: whichever device the user is on becomes the LIVE view.
-    // Pick the best existing host of this account (own tab first, else the most
-    // recently active one) and adopt it — even when another page currently holds
-    // it: that page is demoted with the standard 4001 "take back" affordance,
-    // which is a much smaller disruption than forking a blind second driver.
-    const pool = [...(userSessions.get(userKey) || [])]
-      .filter((s) => !s.closed && s.child && s.child.exitCode === null);
-    let victim = null;
-    if (prev && !prev.closed && prev.child && prev.child.exitCode === null) victim = prev;
-    else {
-      pool.sort((a, b) => (b.lastFrameAt || 0) - (a.lastFrameAt || 0));
-      victim = pool[0] || null;
-    }
-
-    let session = null;
+    // CONTINUITY POLICY: every page of an account attaches as a VIEW of that
+    // account's single running host — switching devices keeps the live stream on
+    // the same pid, previous pages simply keep working as additional viewers.
+    // Only when the account has NO live session does this page spawn a fresh one.
+    const prev = sessions.get(userKey);
+    let session = prev && !prev.closed && prev.child && prev.child.exitCode === null ? prev : null;
     let adopted = false;
-    if (victim) {
-      session = victim;
+    if (session) {
       adopted = true;
-      if (MUX_ENABLED && !session.mux) session.mux = makeMux();
-      rebindSession(session, userKey, tabId);       // page identity follows the adopting page
+      if (MUX_ENABLED && !session.mux) { session.mux = makeMux(); session.resumeBuf = []; }
+      if (!resume) session.resumeBuf = [];   // fresh page: no offline-gap replay
+      rebindView(session, tabId);
       session.detachedAt = 0;
-      console.error('[zcode-webui] ADOPTED host pid=' + session.child.pid +
-        ' by tab ' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + ', last frame ' +
-        (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')' +
-        (session.ws ? ' — demoting previous live page' : ''));
+      console.error('[zcode-webui] view attached pid=' + session.child.pid +
+        ' tab=' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + ', views=' + session.views.size +
+        ', last frame ' + (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')');
     } else {
       try {
         session = createSession(userKey, tabId);
@@ -1090,32 +931,105 @@ function handleUpgrade(req, socket, head) {
       }
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req, session, { adopted });
+      wss.emit('connection', ws, req, session, { adopted, tabId, resume });
     });
   })();
 }
 
 wss.on('connection', (ws, req, session, meta) => {
   const adopted = !!(meta && meta.adopted);
+  const tabId = ((meta && meta.tabId) || 'tab-unknown').slice(0, 128);
+  const resume = !!(meta && meta.resume);
   console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
-  // listeners FIRST, so a client replying instantly to the ready signal cannot
-  // have its first frame dropped; announcements go out right after
-  if (adopted) {
-    // gate downstream until this fresh renderer finished mounting; its port-ready
-    // ack (or an 8s failsafe) releases everything in order
-    session.holdFrames = true;
-    session.holdBuf = [];
-    if (session.firstDownstream) session.holdBuf.push(Buffer.from(session.firstDownstream));
-    else session.replayInitOnCapture = true;
-    setTimeout(() => releaseHold(session), 8000).unref();
+
+  // ---- build this page's view ----
+  const view = {
+    ws, tabId,
+    sent: new Set(),                       // globalIds this renderer is awaiting
+    holdFrames: false, holdBuf: [], holdSkipOnce: false, replayInitOnCapture: false,
+    lastFrameAt: 0,
+  };
+  if (adopted && !resume) {
+    // fresh renderer bootstrapping against a mid-stream host: gate downstream
+    // until its port-ready ack (or failsafe) so it sees Initialize first
+    view.holdFrames = true;
+    view.holdBuf = [];
+    if (session.firstDownstream) view.holdBuf.push(Buffer.from(session.firstDownstream));
+    else view.replayInitOnCapture = true;
+    setTimeout(() => releaseHold(view), 8000).unref();
   }
-  attachRelay(ws, session);
+  session.views.set(tabId, view);
+  session.detachedAt = 0;
+  if (session.mux) {
+    // a FRESH renderer invalidates outstanding requests of the SAME tab's old
+    // renderer era (other tabs' eras are untouched)
+    if (!resume) for (const [gid, e] of session.mux.pending) if (e.tabId === tabId) { session.mux.pending.delete(gid); view.sent.delete(gid); }
+    if (session.firstDownstream && !resume) { view.holdBuf.push(Buffer.from(session.firstDownstream)); }
+    else if (session.firstDownstream && resume) { /* same renderer: it already bootstrapped */ }
+  }
+
+  // listeners FIRST (a client answering the ready signal instantly must not
+  // lose its first frame), announcements after
+  ws.on('message', (data, isBinary) => {
+    if (session.closed) return;
+    if (!isBinary) {
+      if (String(data) === '{"kind":"zcode-webui-port-ready"}') releaseHold(view);
+      return;
+    }
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (view.lastFrameAt === 0) view.lastFrameAt = Date.now();
+    if (session.hello) writeToHost(session, view, payload);
+    else session.pendingInbound.push(payload);
+  });
+  ws.on('close', () => {
+    if (session.views.get(tabId) !== view) return;     // superseded by a newer view
+    session.views.delete(tabId);
+    if (session.views.size === 0) {
+      if (session.framesIn === 0 && session.framesOut === 0) {
+        console.error('[ws] closed before traffic, terminating host pid=' + session.child.pid);
+        terminateSession(session, 'closed before traffic');
+        return;
+      }
+      session.detachedAt = Date.now();
+      console.error('[ws] DETACHED (host keeps running) pid=' + session.child.pid + ' views=0 frames in=' + session.framesIn + ' out=' + session.framesOut);
+    } else {
+      console.error('[ws] view gone tab=' + tabId.slice(0, 8) + ' — ' + session.views.size + ' viewer(s) remain');
+    }
+  });
+  ws.on('error', () => { /* onclose follows */ });
+  ws.on('pong', () => { view.alive = true; });
+  view.alive = true;
+
   try { ws.send(WS_READY); } catch (_e) { /* ignore */ }
   const announce = (line) => {
     try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
   };
-  announce((adopted ? '[zcode-webui] host adopted pid=' : '[zcode-webui] host spawned pid=') + session.child.pid);
+  announce((adopted ? '[zcode-webui] host adopted pid=' : '[zcode-webui] host spawned pid=') + session.child.pid +
+    (session.views.size > 1 ? ' (viewers: ' + session.views.size + ')' : ''));
+  if (session.views.size > 1) {
+    console.error('[zcode-webui] multi-view: ' + session.views.size + ' devices watching user ' + shortUserKey(session.userKey));
+  }
 });
+
+// ws keepalive: ping attached clients every 30s and terminate the socket when
+// a pong is missed (phone app frozen in background, dead network). Terminating
+// DETACHES the host cleanly — it parks in the background and the client hot-
+// reconnects (and re-adopts the same host) when the user comes back.
+setInterval(() => {
+  for (const s of [...sessions.values()]) {
+    for (const v of s.views.values()) {
+      const ws = v.ws;
+      if (!ws || ws.readyState !== 1) continue;
+      if (v.alive === false) {
+        console.error('[ws] client unresponsive (no pong), terminating socket tab=' + v.tabId.slice(0, 8));
+        ws.terminate();                       // close event removes the view
+        continue;
+      }
+      v.alive = false;
+      try { ws.ping(); } catch (_e) { /* ignore */ }
+    }
+  }
+}, 30000).unref();
 
 // ---------- start ----------
 // Bind failures (EADDRINUSE…) are STARTUP errors: unlike request-path faults

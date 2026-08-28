@@ -1,12 +1,12 @@
 // Desktop-style zoom regression for the browser shim:
-// ctrl+wheel (Chrome pinch, debounced hybrid pipeline), two-finger pinch
-// recognizer with midpoint anchoring + scroll compensation, normal wheel
-// untouched, CSS zoom committed on <html>, transform cleaned up, and the
-// official zoom subscription channel.
+// ctrl+wheel (Chrome pinch, debounced hybrid pipeline), two-finger pinch with
+// midpoint anchoring + scroll compensation, rolling zoom-out with edge
+// protection, normal wheel untouched, CSS zoom committed on <html>,
+// transform cleaned up, and the official zoom subscription channel.
 // Usage: node scripts/dev/zoom-test.mjs [baseURL]
 // Safety: refuses :3102 (the usual production port) unless
 // ZOOM_TEST_ALLOW_PROD=1 — a stray test page load would ADOPT (and demote!)
-// your live session under the new continuity model.
+// your live session under the continuity model.
 import { chromium } from 'playwright-core';
 
 const BASE = (process.argv[2] || process.env.ZCODE_WEBUI_TEST_URL || 'http://127.0.0.1:3102/').replace(/\/?$/, '/');
@@ -23,6 +23,10 @@ page.on('pageerror', (e) => console.log('[pageerror] ' + e.message.slice(0, 200)
 const checks = [];
 const check = (n, ok, extra) => { checks.push(ok); console.log((ok ? 'PASS' : 'FAIL') + '  ' + n + (extra ? '  (' + extra + ')' : '')); };
 const raf = (p) => p.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+const pinch = (p, seq) => p.evaluate((seq) => {
+  const mk = (type, id, x, y) => window.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, isPrimary: id === 1, bubbles: true, cancelable: true }));
+  for (const [type, id, x, y] of seq) mk(type, id, x, y);
+}, seq);
 
 try {
   await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -50,21 +54,65 @@ try {
   const zAfter = await page.evaluate(() => window.__zwebui_zoom.get());
   check('normal wheel untouched (scroll preserved)', wheelOk && zAfter === 1);
 
-  // two-finger pinch via pointer events: 2x spread commits exactly 2x zoom
-  await page.evaluate(() => {
-    const mk = (type, id, x, y) => window.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, isPrimary: id === 1, bubbles: true, cancelable: true }));
-    mk('pointerdown', 1, 400, 400);
-    mk('pointerdown', 2, 500, 400);
-    mk('pointermove', 1, 350, 400);
-    mk('pointermove', 2, 550, 400);
-    mk('pointerup', 1, 350, 400);
-    mk('pointerup', 2, 550, 400);
-  });
+  // two-finger pinch-in via pointer events: 2x spread commits 2x zoom
+  await pinch(page, [
+    ['pointerdown', 1, 400, 400], ['pointerdown', 2, 500, 400],
+    ['pointermove', 1, 350, 400], ['pointermove', 2, 550, 400],
+    ['pointerup', 1, 350, 400], ['pointerup', 2, 550, 400],
+  ]);
   const z2 = await page.evaluate(() => window.__zwebui_zoom.get());
   check('two-finger pinch zooms', z2 > 1 && z2 <= 2, 'zoom=' + z2);
 
   const css = await page.evaluate(() => document.documentElement.style.zoom);
   check('CSS zoom applied on <html>', parseFloat(css) === z2, 'css=' + css);
+
+  // pinch-out (fingers closer): zoom-out commits directly (rolling, crisp) and
+  // the layout must still fill the viewport — no blank edges, ever
+  await page.evaluate(() => window.__zwebui_zoom.set(1));
+  await pinch(page, [
+    ['pointerdown', 1, 400, 400], ['pointerdown', 2, 600, 400],
+    ['pointermove', 1, 450, 400], ['pointermove', 2, 550, 400],
+    ['pointerup', 1, 450, 400], ['pointerup', 2, 550, 400],
+  ]);
+  const zOut = await page.evaluate(() => window.__zwebui_zoom.get());
+  check('pinch-out commits zoom (rolling)', Math.abs(zOut - 0.5) < 0.01, 'zoom=' + zOut);
+  const cover = await page.evaluate(() => ({
+    w: document.documentElement.getBoundingClientRect().width,
+    vw: window.innerWidth,
+  }));
+  check('no blank edges after zoom-out', cover.w >= cover.vw - 1, 'html=' + cover.w + ' vw=' + cover.vw);
+
+  // during a zoom-in preview: the transform stays clamped to the viewport
+  // (edge protection) and the content keeps covering the screen
+  await pinch(page, [
+    ['pointerdown', 1, 300, 400], ['pointerdown', 2, 500, 400],
+    ['pointermove', 1, 100, 400], ['pointermove', 2, 900, 400],
+  ]);
+  await raf(page);
+  const preview = await page.evaluate(() => {
+    const tr = document.documentElement.style.transform || '';
+    // Chrome normalizes translate+scale back to matrix(a, 0, 0, d, e, f)
+    let sp = null, tX = null, tY = null;
+    const mm = /matrix\(([-\d.]+),\s*0,\s*0,\s*([-\d.]+),\s*([-\d.]+),\s*([-\d.]+)\)/.exec(tr);
+    const mt = /translate\(([-\d.]+)px,\s*([-\d.]+)px\)\s*scale\(([\d.]+)\)/.exec(tr);
+    if (mm) { sp = parseFloat(mm[1]); tX = parseFloat(mm[5]); tY = parseFloat(mm[6]); }
+    else if (mt) { tX = parseFloat(mt[1]); tY = parseFloat(mt[2]); sp = parseFloat(mt[3]); }
+    const r = document.documentElement.getBoundingClientRect();
+    return { sp, tX, tY, trRaw: tr.slice(0, 100),
+      right: r.right, bottom: r.bottom, left: r.left, top: r.top,
+      vw: window.innerWidth, vh: window.innerHeight };
+  });
+  check('preview: scale parsed and at/above committed base', preview.sp !== null && preview.sp >= 0.999, 'sp=' + preview.sp + ' raw=' + preview.trRaw);
+  check('preview: translate clamped (edge protection)',
+    preview.tX !== null && preview.tX >= preview.vw * (1 - preview.sp) - 0.5 && preview.tX <= 0.5 &&
+    preview.tY !== null && preview.tY >= preview.vh * (1 - preview.sp) - 0.5 && preview.tY <= 0.5,
+    't=' + preview.tX + ',' + preview.tY + ' sp=' + preview.sp);
+  check('preview: content covers viewport (no blank)',
+    preview.right >= preview.vw - 1 && preview.bottom >= preview.vh - 1 &&
+    preview.left <= 0.5 && preview.top <= 0.5,
+    'rect=' + preview.left + ',' + preview.top + ' -> ' + preview.right + ',' + preview.bottom);
+  await pinch(page, [['pointerup', 1, 100, 400], ['pointerup', 2, 900, 400]]);
+  await page.waitForTimeout(50);
 
   // anchor + cleanup: on a scrollable page, zooming in around a focal point must
   // scroll-compensate so the content under the fingers stays put, and the
@@ -91,13 +139,11 @@ try {
       zoom: window.__zwebui_zoom.get(),
       transform: document.documentElement.style.transform,
       willChange: document.documentElement.style.willChange,
-      spacer: !!document.getElementById('zwebui-anchor-spacer'),
     };
     sp.remove();
     return { before, after };
   });
   const zExp = Math.min(2, Math.max(0.5, anchor.before.zoom * 2));
-  // committed zoom is rounded to 3 decimals
   const ratio = anchor.after.zoom / anchor.before.zoom;
   const expectedScroll = (400 + anchor.before.scrollY) * ratio - 400;
   check('anchor scroll compensation', Math.abs(anchor.after.scrollY - expectedScroll) <= 2,

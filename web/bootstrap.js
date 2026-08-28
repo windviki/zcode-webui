@@ -128,9 +128,9 @@
     el.textContent = '';
     var t = document.createElement('div');
     var ages = hosts.map(function (h) { return h.lastFrameAgeSec === null ? '?' : h.lastFrameAgeSec; });
-    t.textContent = '[zcode-webui] 另一处仍在执行任务：' + hosts.length + ' 个进程（pid ' +
-      hosts.map(function (h) { return h.pid; }).join(',') + '，最近活动 ' + ages.join('/') + ' 秒前）。' +
-      '本页看到的是已落库的历史状态——不要直接发「继续」，否则两个代理可能同时改同一批文件。';
+    t.textContent = '[zcode-webui] 后台仍有任务在执行（pid ' +
+      hosts.map(function (h) { return h.pid; }).join(',') + '，最近活动 ' + ages.join('/') + ' 秒前）——' +
+      '它由之前离开的设备启动，正在持续产出。可继续在本页查看进度；确认不再需要时才终止。';
     var row = document.createElement('div');
     row.style.cssText = 'margin-top:8px;display:flex;gap:8px;';
     var btnKill = document.createElement('button');
@@ -198,7 +198,12 @@
   }
 
   function deliverPort() {
-    if (delivered) return;
+    if (delivered) {
+      // hot reconnect: the renderer already has its port — tell the server to
+      // release any buffered frames immediately (resume mode, no replay)
+      try { if (ws && ws.readyState === 1) ws.send('{"kind":"zcode-webui-port-ready"}'); } catch (e) { /* ignore */ }
+      return;
+    }
     delivered = true;
     // The official renderer registers its one-shot 'zcode:service-port' listener when
     // its module executes. Delivering before that loses the message forever (blank
@@ -218,6 +223,7 @@
         }
         portQueue = [];
         window.postMessage('zcode:service-port', '*', [channel.port1]);
+        everDelivered = true;
         // tell the backend this renderer is now wired: an ADOPTED mid-stream host
         // releases its ordered frame buffer on this signal
         try {
@@ -316,14 +322,22 @@
     wsPath = p + 'ws';
   }
   var wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var wsUrl = wsProto + '//' + window.location.host + wsPath + '?token=' + (cfg.wsToken || '') + '&tab=' + encodeURIComponent(TAB_ID) + (TAKEOVER === '1' ? '&takeover=1' : '');
+  var everDelivered = false;
+  function wsUrl() {
+    return wsProto + '//' + window.location.host + wsPath + '?token=' + (cfg.wsToken || '') +
+      '&tab=' + encodeURIComponent(TAB_ID) +
+      (TAKEOVER === '1' ? '&takeover=1' : '') +
+      (everDelivered ? '&resume=1' : '');
+  }
   var wsVerified = false;
   var WS_READY = '{"kind":"zcode-webui-ready"}';
 
   function connect() {
-    ws = new WebSocket(wsUrl);
+    wsVerified = false;                          // re-arm per connection (hot reconnects)
+    wsOpened = false;
+    ws = new WebSocket(wsUrl());
     ws.binaryType = 'arraybuffer';
-    ws.onopen = function () { wsOpened = true; reloadAttempts = 0; };
+    ws.onopen = function () { wsOpened = true; reloadAttempts = 0; hotAttempts = 0; };
     ws.onmessage = function (ev) {
       // the very first message MUST be our ready signal; a foreign websocket
       // server (e.g. code-server's own /ws when the URL lacked a trailing slash)
@@ -366,21 +380,61 @@
       // (do NOT reload — that would ping-pong the takeover between tabs).
       if (ev.code === 4001) { parkWithNotice(); return; }
       if (!wsOpened) { startHttpMode(); return; }
-      // host gone (terminated/exit): a fresh page load will spawn a new host
       if (ev.code === 4000 || ev.code === 1011) {
+        // host exited (crash / server restart): the renderer must re-bootstrap
+        // against a fresh host, which needs a page reload — but NEVER while the
+        // page is hidden (defer it; churn-free backgrounding)
+        if (isHidden()) { pendingHostReboot = true; return; }
         reloadAttempts++;
-        if (reloadAttempts > 6) { showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); }); return; }
-        setTimeout(function () { window.location.reload(); }, 1500);
+        if (reloadAttempts > 2) {
+          showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); });
+          reloadAttempts = 0;
+        } else {
+          setTimeout(function () { window.location.reload(); }, 1200);
+        }
         return;
       }
-      // ordinary close / network drop: the backend keeps the host running in the
-      // background; reload and re-attach to the same session (same tab id).
-      reloadAttempts++;
-      if (reloadAttempts > 6) { showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); }); return; }
-      setTimeout(function () { window.location.reload(); }, 1500);
+      // ordinary drop (app switched away, network blip): HOT reconnect — the
+      // server re-adopts the same running host, no reload, nothing visible
+      scheduleHotReconnect();
     };
     ws.onerror = function () { /* onclose follows */ };
   }
+
+  // ---- lifecycle-aware recovery (module scope: registered exactly once) ----
+  // When the app is backgrounded Android freezes the tab and the OS/proxies drop
+  // the idle websocket — that part is not ours to control. What IS ours: never
+  // reload the page in the background, and recover with a HOT websocket
+  // reconnect — with session adoption the server re-attaches this page to the
+  // very same running host, so no reload is needed at all.
+  var hotAttempts = 0;
+  var pendingHostReboot = false;
+  function isHidden() { return document.visibilityState === 'hidden'; }
+  function scheduleHotReconnect() {
+    var delay = Math.min(1000 * Math.pow(2, Math.min(hotAttempts, 4)), 10000);
+    hotAttempts++;
+    setTimeout(function () {
+      if (mode !== 'ws' || (ws && (ws.readyState === 0 || ws.readyState === 1))) return;
+      connect();
+    }, delay);
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible') return;
+    // back in the foreground: fresh recovery budget + immediate action
+    hotAttempts = 0;
+    reloadAttempts = 0;
+    if (pendingHostReboot) { pendingHostReboot = false; window.location.reload(); return; }
+    if (mode === 'ws' && (!ws || ws.readyState > 1)) connect();
+  });
+  window.addEventListener('pageshow', function (ev) {
+    if (!ev.persisted) return;                     // bfcache restore: socket is dead
+    hotAttempts = 0; reloadAttempts = 0;
+    if (mode === 'ws' && (!ws || ws.readyState > 1)) connect();
+  });
+
+  // debug/test hook: current socket readiness (0 connecting, 1 open, 3 closed)
+  window.__zwebui_ws = function () { return ws ? ws.readyState : -1; };
+  window.__zwebui_wsDrop = function () { try { if (ws) ws.close(); } catch (e) { /* ignore */ } };
 
   // debug/transport override: ?transport=http forces the HTTP polling bridge
   // (useful behind proxies that never forward WebSocket upgrades)
@@ -433,17 +487,20 @@
     var g = null;            // live gesture
     var wheelTimer = 0;
 
-    function softClamp(v) {  // slight rubber-band beyond the limits while pinching
-      if (v < Z_MIN) return Z_MIN + (v - Z_MIN) * 0.35;
+    // rubber-band above the upper limit while zooming in (the zoom-out side is
+    // hard-clamped: it commits directly and can never leave blank edges)
+    function softClampAbs(v) {
       if (v > Z_MAX) return Z_MAX + (v - Z_MAX) * 0.35;
       return v;
     }
     function hardClamp(v) { return Math.min(Z_MAX, Math.max(Z_MIN, v)); }
+    function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
     function begin(zoomBase, fx, fy) {
       if (g) return;
       g = {
-        z0: zoomBase,
+        zb: zoomBase,          // zoom at gesture start (fixed reference)
+        z0: zoomBase,          // currently committed base (moves on rolling commits)
         touch: false,
         f: { x: fx, y: fy },
         A: { x: fx + window.scrollX, y: fy + window.scrollY }, // anchor (scroll space)
@@ -464,32 +521,56 @@
       schedule();
     }
     function schedule() { if (g && !g.raf) g.raf = requestAnimationFrame(tick); }
+
+    // Per-frame render. rs/s are the target/rendered zoom ratio relative to the
+    // gesture start; the ABSOLUTE target is zb * s. Two regimes:
+    //   zoom-in  (zAbs >= committed base): composited transform preview, clamped
+    //             so the transformed content always covers the viewport — no
+    //             blank edges, pan stays inside the content bounds;
+    //   zoom-out (zAbs <  base): transform cannot work (scaling below 1 shrinks
+    //             the painted box = blank edges), so the shrink commits directly
+    //             per frame — CSS zoom shrinks the layout, which always fills
+    //             the viewport width. The anchor stays under the focal via
+    //             scroll compensation (scroll = A*(z/zb) - focal).
     function tick() {
       if (!g) return;
       g.raf = 0;
       g.s += (g.rs - g.s) * EMA;
       if (Math.abs(g.rs - g.s) < 0.0004) g.s = g.rs;
-      apply();
-    }
-    function apply() {
-      // t = f - (A - scroll) * s  → the anchor content point stays under the focal
-      var tX = g.f.x - (g.A.x - window.scrollX) * g.s;
-      var tY = g.f.y - (g.A.y - window.scrollY) * g.s;
-      document.documentElement.style.transform = 'translate(' + tX + 'px,' + tY + 'px) scale(' + g.s + ')';
+      var de = document.documentElement;
+      var zAbs = softClampAbs(g.zb * g.s);
+      if (zAbs < g.z0 - 0.0005) {
+        // zoom-out: rolling direct commit
+        var z1 = Math.max(Z_MIN, zAbs);
+        if (Math.abs(z1 - g.z0) > 0.0005) {
+          var k = z1 / g.zb;
+          zoomSet(z1);
+          try { window.scrollTo(g.A.x * k - g.f.x, g.A.y * k - g.f.y); } catch (e) { /* ignore */ }
+          g.z0 = z1;
+        }
+        de.style.transform = '';
+      } else {
+        // zoom-in: transform preview
+        var sp = Math.max(zAbs / g.z0, 1);
+        var vw = window.innerWidth, vh = window.innerHeight;
+        var tX = clamp(g.f.x - (g.A.x - window.scrollX) * sp, vw * (1 - sp), 0);
+        var tY = clamp(g.f.y - (g.A.y - window.scrollY) * sp, vh * (1 - sp), 0);
+        de.style.transform = 'translate(' + tX + 'px,' + tY + 'px) scale(' + sp + ')';
+      }
+      if (Math.abs(g.rs - g.s) > 0.0004) schedule();
     }
 
     function endGesture() {
       if (!g) return;
       if (g.raf) cancelAnimationFrame(g.raf);
-      g.s = g.rs; apply();                      // settle to the exact target first
-      var z1 = hardClamp(g.z0 * g.s);
-      zoomSet(z1);                              // reflow once, text re-rasterizes crisp
-      // keep the anchored content point under the focal after the zoom switch
-      // (z1/z0 only differs from g.s at the rubber-band clamp boundaries)
-      var ratio = z1 / (g.z0 || 1);
-      try {
-        window.scrollTo(g.A.x * ratio - g.f.x, g.A.y * ratio - g.f.y);
-      } catch (e) { /* ignore */ }
+      g.s = g.rs;
+      tick();                                        // exact final frame
+      var z1 = hardClamp(g.zb * g.s);                // commit clamps the rubber band
+      if (Math.abs(z1 - g.z0) > 0.0005) {
+        var k = z1 / g.zb;
+        zoomSet(z1);
+        try { window.scrollTo(g.A.x * k - g.f.x, g.A.y * k - g.f.y); } catch (e) { /* ignore */ }
+      }
       var de = document.documentElement;
       de.style.transform = '';
       de.style.willChange = '';
@@ -502,7 +583,7 @@
       ev.preventDefault();
       if (g && g.touch) return;               // a touchscreen pinch owns the gesture
       if (!g) begin(zoomGet(), ev.clientX, ev.clientY);
-      g.rs = softClamp(g.rs * Math.exp(-ev.deltaY * 0.001));
+      g.rs = g.rs * Math.exp(-ev.deltaY * 0.001);
       update(g.rs, ev.clientX, ev.clientY);     // zoom toward the cursor
       clearTimeout(wheelTimer);
       wheelTimer = setTimeout(endGesture, WHEEL_COMMIT_MS);
@@ -543,7 +624,7 @@
       }
       pointers[ev.pointerId] = { x: ev.clientX, y: ev.clientY };
       var m = midpoint();
-      if (pinch && m.d > 0) update(softClamp(m.d / pinch.d0), m.x, m.y);
+      if (pinch && m.d > 0) update(m.d / pinch.d0, m.x, m.y);
     }
     function onPointerEnd(ev) {
       if (!pointers[ev.pointerId]) return;

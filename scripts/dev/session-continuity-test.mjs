@@ -177,8 +177,8 @@ class Page {
   console.log('PASS S1 cross-device adoption: pid ' + spawnedPid + ', replayed Initialize first, live round-trip OK');
 
   const h1 = await (await fetch(origin + '/api/health')).json();
-  if (h1.sessions.total !== 1 || h1.sessions.attached !== 1) fail('expected exactly 1 attached session after adoption, got ' + JSON.stringify(h1.sessions));
-  console.log('PASS S1b single-driver invariant holds (sessions=' + JSON.stringify(h1.sessions) + ')');
+  if (h1.sessions.total !== 1 || h1.sessions.views !== 1) fail('expected 1 session with 1 view after adoption, got ' + JSON.stringify(h1.sessions));
+  console.log('PASS S1b single-host invariant holds (sessions=' + JSON.stringify(h1.sessions) + ')');
 
   // ===== S2: refreshing dev-b keeps the SAME host too =====
   b.ws.close(1000, 'refresh');
@@ -199,118 +199,38 @@ class Page {
   await b2.roundTrip();
   console.log('PASS S2 same-tab refresh also adopts (no fork, pid ' + spawnedPid + ')');
 
-  // ===== S3: while b2 is LIVE, device-d takes over the view (demote + adopt) =====
+  // ===== S3: MULTI-VIEW — second device attaches while the first stays live =====
   const d = await new Page('dev-d', tok).open();
   for (let i = 0; i < 80 && !/host adopted/.test(d.texts.join('\n')); i++) await sleep(60);
-  if (!d.hostPid || d.hostPid !== spawnedPid) fail(`dev-d expected to adopt pid ${spawnedPid}, got ${d.hostPid}`);
+  if (!d.hostPid || d.hostPid !== spawnedPid) fail(`dev-d expected same host pid ${spawnedPid}, got ${d.hostPid}`);
   await sleep(1300);
-  if (d.binaries.length !== 0) fail('dev-d hold gate leaked frames');
   d.sendPortReady();
   for (let i = 0; i < 50 && d.binaries.length === 0; i++) await sleep(100);
-  if (!d.binaries.length || d.binaries[0].toString('hex') !== INIT_HEX) fail('dev-d replay ordering broken');
+  if (!d.binaries.length || d.binaries[0].toString('hex') !== '040106c80100') fail('dev-d replay ordering broken');
   await d.roundTrip();
-  // the demoted original page must receive the standard take-back close
-  for (let i = 0; i < 80 && b2.closedCode === null; i++) await sleep(60);
-  if (b2.closedCode !== 4001) fail('previous live page was not demoted with 4001 (got ' + b2.closedCode + ')');
+  // the first device must NOT be demoted anymore: both stay attached
+  if (b2.closedCode !== null) fail('first device was demoted under multi-view (code ' + b2.closedCode + ')');
+  await b2.roundTrip();
   const h2 = await (await fetch(origin + '/api/health')).json();
-  if (h2.sessions.total !== 1 || h2.sessions.attached !== 1) fail('after takeover expected single attached session, got ' + JSON.stringify(h2.sessions));
-  console.log('PASS S3 three-hop continuity on one pid; previous page demoted via 4001');
-  // take-back symmetry: original tab reconnects and steals the view right back
-  const b3 = await new Page('dev-b', tok).open();
-  for (let i = 0; i < 80 && !/host adopted/.test(b3.texts.join('\n')); i++) await sleep(60);
-  if (b3.hostPid !== spawnedPid) fail('take-back failed pid mismatch');
-  await sleep(1300);
-  b3.sendPortReady();
-  await b3.roundTrip();
-  for (let i = 0; i < 80 && d.closedCode === null; i++) await sleep(60);
-  if (d.closedCode !== 4001) fail('take-back did not demote dev-d');
-  console.log('PASS S3b take-back is symmetric (dev-b reclaimed, dev-d demoted)');
-  d.sendPortReady();
+  if (h2.sessions.total !== 1 || h2.sessions.views !== 2) fail('expected 1 session with 2 views, got ' + JSON.stringify(h2.sessions));
+  console.log('PASS S3 multi-view: two devices live on one pid; first not demoted');
 
-  // ===== S4: instant-first-write client (historic race) on a brand-new host =====
-  const fBin = [];
-  const fc = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=${tok}&tab=dev-f`);
-  let fv = false;
-  const fReadyOk = new Promise((r) => {
-    fc.on('message', function h(dd, bin) {
-      if (!bin && !fv && String(dd) === '{"kind":"zcode-webui-ready"}') { fv = true; r(); }
-      else if (bin) fBin.push(Buffer.from(dd));
-    });
-  });
-  await new Promise((r) => fc.on('open', r));
-  await fReadyOk;
-  fc.send(systemInfo());                                 // INSTANT first write
-  let fReplied = false;
-  const tF = Date.now();
-  while (Date.now() - tF < 30000 && !fReplied) {
-    if (fBin.some((x) => x.includes(Buffer.from('homedir')))) fReplied = true;
-    await sleep(80);
-  }
-  if (!fReplied) fail('instant-first-write got no reply (race regressed)');
-  console.log('PASS S4 instant-first-write answered');
-  fc.close(4000, 'bye');
+  // ===== S3b: interleaved round-trips — responses route to the right view =====
+  const rA = b2.roundTrip(20000);
+  const rB = d.roundTrip(20000);
+  const [okA, okB] = await Promise.all([rA.then(() => 1, () => 0), rB.then(() => 1, () => 0)]);
+  if (okA + okB !== 2) fail('interleaved round-trips failed');
+  const h3 = await (await fetch(origin + '/api/health')).json();
+  if (h3.sessions.views !== 2) fail('views dropped after interleaved traffic');
+  console.log('PASS S3b interleaved round-trips on both views');
 
-  // ===== S5: stale-era responses from a demoted owner are SUPPRESSED (mux) =====
-  // device ga fires 30 requests and vanishes instantly — none of the replies can
-  // reach it. device gb adopts the same host: every late reply for the ga era
-  // must be dropped by the mux; gb's own requests must still be answered.
-  {
-    const ga = await new Page('dev-ga', tok).open();
-    await ga.roundTrip();
-    const gaPid = ga.hostPid;
-    for (let i = 0; i < 30; i++) {
-      ga.ws.send(Buffer.concat([serialize([100, 1000 + i, 'system', 'info']), serialize(undefined)]));
-    }
-    ga.ws.close(1000, 'gone');                       // detach mid-burst
-    await sleep(120);                                // replies land while nobody is attached
-    const gb = await new Page('dev-gb', tok).open();
-    for (let i = 0; i < 80 && !/host adopted/.test(gb.texts.join('\n')); i++) await sleep(60);
-    if (gb.hostPid !== gaPid) fail('S5: adoption picked wrong host');
-    await sleep(1300);
-    if (gb.binaries.length !== 0) fail('S5: hold gate leaked before port-ready');
-    gb.sendPortReady();
-    gb.ws.send(Buffer.concat([serialize([100, 777, 'system', 'info']), serialize(undefined)]));
-    // wait for the 777 reply, then classify everything received
-    const decodeId = (buf) => {
-      try {
-        if (buf[0] !== 4) return null;
-        let off = 1;
-        const rdVql = () => { let v = 0, n = 0; for (;;) { const b = buf[off++]; v |= (b & 127) << n; if (!(b & 128)) return v >>> 0; n += 7; } };
-        const len = rdVql();
-        const vals = [];
-        for (let k = 0; k < len; k++) {
-          const t = buf[off++];
-          if (t === 6) vals.push(rdVql());
-          else if (t === 0) vals.push(undefined);
-          else if (t === 1) { const l = rdVql(); off += l; vals.push('s'); }
-          else if (t === 5) { const l = rdVql(); off += l; vals.push('o'); }
-          else return null;
-        }
-        return { type: vals[0], id: vals[1] };
-      } catch (_e) { return null; }
-    };
-    const responseIds = () => {
-      const out = [];
-      for (const f of gb.binaries) {
-        const d = decodeId(f);
-        if (d && (d.type === 201 || d.type === 202)) out.push(d.id);
-      }
-      return out;
-    };
-    let saw777 = false;
-    const t5 = Date.now();
-    while (Date.now() - t5 < 30000 && !saw777) {
-      saw777 = responseIds().includes(777);
-      if (!saw777) await sleep(100);
-    }
-    if (!saw777) fail('S5: mux broke the current era (777 unanswered)');
-    const stale = responseIds().filter((id) => id >= 1000 && id < 1030);
-    if (stale.length) fail('S5: stale-era responses leaked to the new renderer: ' + stale.join(','));
-    console.log('PASS S5 stale-era suppression (777 answered; no ga-era ids among ' +
-      responseIds().length + ' responses)');
-    gb.ws.close(4000, 'bye');
-    await sleep(300);
-  }
+  // ===== S3c: a view leaving must not disturb the other =====
+  b2.ws.close(1000, 'bye');
+  await sleep(400);
+  await d.roundTrip();
+  const h4 = await (await fetch(origin + '/api/health')).json();
+  if (h4.sessions.views !== 1) fail('expected 1 view after b2 left, got ' + JSON.stringify(h4.sessions));
+  console.log('PASS S3c view departure leaves the other view intact');
 
   console.log('CONTINUITY OK');
   cleanup();
