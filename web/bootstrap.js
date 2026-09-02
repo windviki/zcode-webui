@@ -9,6 +9,15 @@
   var cfg = window.__ZCODE_WEBUI_CONFIG__ || {};
   var base = cfg.base || '';
 
+  // The official renderer stores its ZCode protocol clientId in localStorage,
+  // one random id per browser. The zcode-server host accepts only ONE clientId
+  // per host, so a second device presenting its own id gets
+  // "fault.connection.clientChanged". Force every browser/device to use the
+  // server-injected shared deviceId as the protocol client identity.
+  try {
+    localStorage.setItem('zcode-v4-client-id:v1', cfg.deviceId || 'zcode-webui-client');
+  } catch (e) { /* ignore */ }
+
   // ---- tab identity (survives reloads, unique per tab) + takeover flag ----
   var TAB_ID = '';
   try { TAB_ID = sessionStorage.getItem('zwebui_tab') || ''; } catch (e) { /* ignore */ }
@@ -290,7 +299,7 @@
   }
 
   function startHttpMode() {
-    if (mode === 'http') return;
+    if (mode === 'http' && httpSessionId) return;
     mode = 'http';
     console.warn('[zcode-webui] websocket unavailable, switching to http polling bridge');
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
@@ -307,6 +316,22 @@
         report('bridge-open-failed', String(e.message || e));
       });
   }
+
+  // Closing the browser tab must close the HTTP bridge too — otherwise every
+  // refresh/close leaves a full zcode-server host parked on the backend forever.
+  function closeHttpMode() {
+    if (mode !== 'http' || !httpSessionId) return;
+    var id = httpSessionId;
+    httpSessionId = null;
+    try {
+      fetch('bridge/close?id=' + encodeURIComponent(id), { method: 'POST', keepalive: true });
+    } catch (e) { /* ignore */ }
+  }
+  window.addEventListener('pagehide', function (ev) {
+    // Do NOT close when entering bfcache (ev.persisted): the page can restore
+    // and re-open its relay in the pageshow handler below.
+    if (!ev.persisted) closeHttpMode();
+  });
 
   // WebSocket path by deployment mode:
   //  - Mode A (code-server /proxy/<port>/ proxy): the proxy STRIPS the prefix, so the
@@ -429,7 +454,11 @@
   window.addEventListener('pageshow', function (ev) {
     if (!ev.persisted) return;                     // bfcache restore: socket is dead
     hotAttempts = 0; reloadAttempts = 0;
-    if (mode === 'ws' && (!ws || ws.readyState > 1)) connect();
+    if (mode === 'ws') {
+      if (!ws || ws.readyState > 1) connect();
+    } else if (mode === 'http' && !httpSessionId) {
+      startHttpMode();
+    }
   });
 
   // debug/test hook: current socket readiness (0 connecting, 1 open, 3 closed)

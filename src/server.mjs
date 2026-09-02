@@ -151,6 +151,10 @@ const RUNNING_TASK_STALE_MS = Number(process.env.ZCODE_WEBUI_RUNNING_TASK_STALE_
 // "a sibling host is actively driving turns" heuristic: protocol frames flowing
 // this recently mean the agent is mid-execution (streaming, tool calls, thinking)
 const ACTIVE_FRAME_MS = Math.max(Number(process.env.ZCODE_WEBUI_ACTIVE_FRAME_MS) || 120000, 15000);
+// HTTP fallback bridge relays: bounded + idle-reaped. lastSeen is refreshed by
+// /bridge/send and /bridge/poll, so an actively polling page never ages out.
+const HTTP_RELAY_TTL_MS = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_TTL_MS || 30 * 60 * 1000);
+const HTTP_RELAY_MAX = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_MAX || 8) || 0;   // 0 = unlimited
 
 function tasksIndexPath() {
   const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
@@ -176,6 +180,63 @@ async function hasRunningTask(dbPath) {
       console.error('[zcode-webui] auto-reap: cannot read tasks index (' + ((_e && _e.message) || _e) + '); reaping disabled (safe mode)');
     }
     return true;
+  }
+}
+
+// Worktrees/workspace directories get deleted all the time (git worktree prune,
+// rm -rf). The official zcode-server treats a missing workspace cwd as a fatal
+// agent-spawn error and exits code=1, which drops the host and makes the page
+// show "reconnecting". Prevent that by materializing any workspace directory
+// referenced by zcode's own settings / task index / session db before spawning
+// a host. We only create directories under the home directory.
+async function ensureWorkspaceDirs() {
+  const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
+  const home = os.homedir();
+  const seen = new Set();
+  const add = (p) => {
+    if (!p || typeof p !== 'string') return;
+    let abs;
+    try { abs = path.resolve(p); } catch (_e) { return; }
+    if (abs !== home && !abs.startsWith(home + path.sep)) return;
+    seen.add(abs);
+  };
+
+  try {
+    const sf = path.join(zhome, 'v2', 'setting.json');
+    if (existsSync(sf)) {
+      const s = JSON.parse(readFileSync(sf, 'utf8'));
+      for (const p of (s && s.recentProjects) || []) add(p);
+      for (const e of (s && s.lastWorkspaceSession) || []) add(e && e.workspacePath);
+    }
+  } catch (_e) { /* ignore */ }
+
+  const readDb = async (dbPath, sql) => {
+    if (!existsSync(dbPath)) return;
+    try {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const rows = db.prepare(sql).all();
+        for (const r of rows) add(r.workspace_path || r.directory || r.p);
+      } finally { db.close(); }
+    } catch (_e) { /* ignore */ }
+  };
+  await readDb(path.join(zhome, 'v2', 'tasks-index.sqlite'),
+    "SELECT DISTINCT workspace_path FROM tasks WHERE workspace_path IS NOT NULL" +
+    " UNION SELECT DISTINCT workspace_path FROM off_peak_tasks WHERE workspace_path IS NOT NULL" +
+    " UNION SELECT DISTINCT workspace_path FROM task_group_members WHERE workspace_path IS NOT NULL");
+  await readDb(path.join(zhome, 'cli', 'db', 'db.sqlite'),
+    "SELECT directory AS p FROM session WHERE directory IS NOT NULL" +
+    " UNION SELECT path AS p FROM session WHERE path IS NOT NULL");
+
+  for (const dir of seen) {
+    if (existsSync(dir)) continue;
+    try {
+      mkdirSync(dir, { recursive: true });
+      console.error('[zcode-webui] created missing workspace dir ' + dir);
+    } catch (e) {
+      console.error('[zcode-webui] cannot create missing workspace dir ' + dir + ': ' + e.message);
+    }
   }
 }
 
@@ -274,12 +335,131 @@ function readRendererIndex() {
   return html;
 }
 
+// ---------- process monitor (official renderer page, fed from /proc) ----------
+// The desktop app opens process-monitor.html in its own window; its preload
+// exposes window.processMonitor.getProcessMetrics() backed by Electron's
+// app.getAppMetrics(). The page itself is pure renderer, so we serve it
+// unchanged and inject a shim (web/process-monitor-bridge.js) that pulls the
+// same tree from /api/process-metrics. The tree is rooted at THIS server
+// process and includes every descendant — the zcode host, agent sessions and
+// the tools they spawn. Node shape must match what the page renders:
+// {name, pid, cpu (percent), memory (KB), children[]}.
+const PROC_CLK_TCK = 100;        // Linux USER_HZ: jiffies in /proc/<pid>/stat
+const PROC_SAMPLE_CACHE_MS = 400; // several open tabs polling at 1s share one sample
+let procLastSnapshot = null;     // {ts, tree}
+const procCpuSamples = new Map(); // pid -> {jiffies, ts, start} ('start' guards pid reuse)
+
+function readPidStat(pid) {
+  let raw;
+  try { raw = readFileSync('/proc/' + pid + '/stat', 'utf8'); } catch (_e) { return null; }
+  // comm is wrapped in parens and may contain spaces or ')' itself — split on the LAST ')'
+  const open = raw.indexOf('(');
+  const close = raw.lastIndexOf(')');
+  if (open < 1 || close <= open) return null;
+  const f = raw.slice(close + 2).split(' ');
+  // f[0]=state(3) f[1]=ppid(4) ... f[11]=utime(14) f[12]=stime(15) f[19]=starttime(22)
+  if (f.length < 20) return null;
+  return { comm: raw.slice(open + 1, close), ppid: Number(f[1]), jiffies: Number(f[11]) + Number(f[12]), start: f[19] };
+}
+
+function readPidName(pid, fallback) {
+  let raw;
+  try { raw = readFileSync('/proc/' + pid + '/cmdline', 'utf8'); } catch (_e) { return fallback; }
+  const argv = raw.split('\0').filter(Boolean);
+  if (!argv.length) return fallback;
+  let name = path.basename(argv[0]);
+  // "node /…/zcode-server.cjs" reads better as "node zcode-server.cjs"
+  if (/^node(\.exe)?$/.test(name) && argv[1]) name += ' ' + path.basename(argv[1]);
+  return name.slice(0, 80) || fallback;
+}
+
+function readPidRssKb(pid) {
+  let raw;
+  try { raw = readFileSync('/proc/' + pid + '/status', 'utf8'); } catch (_e) { return 0; }
+  const m = raw.match(/^VmRSS:\s+(\d+)\s+kB/m);
+  return m ? Number(m[1]) : 0;
+}
+
+function processMetricsTree() {
+  const now = Date.now();
+  if (procLastSnapshot && now - procLastSnapshot.ts < PROC_SAMPLE_CACHE_MS) return procLastSnapshot.tree;
+  let tree;
+  if (process.platform === 'linux') {
+    // one /proc sweep for stat (cheap), then cmdline/status only for our subtree
+    const stats = new Map();
+    let pids;
+    try { pids = readdirSync('/proc').filter((s) => /^\d+$/.test(s)); } catch (_e) { pids = []; }
+    for (const pidStr of pids) {
+      const st = readPidStat(pidStr);
+      if (st) stats.set(Number(pidStr), st);
+    }
+    const byPpid = new Map();
+    for (const [pid, st] of stats) {
+      if (!byPpid.has(st.ppid)) byPpid.set(st.ppid, []);
+      byPpid.get(st.ppid).push(pid);
+    }
+    const build = (pid) => {
+      const st = stats.get(pid);
+      if (!st) return null;
+      const prev = procCpuSamples.get(pid);
+      let cpu = 0;
+      if (prev && prev.start === st.start && now > prev.ts) {
+        const dJ = st.jiffies - prev.jiffies;
+        if (dJ >= 0) cpu = Math.max(0, (dJ / PROC_CLK_TCK) / ((now - prev.ts) / 1000) * 100);
+      }
+      procCpuSamples.set(pid, { jiffies: st.jiffies, ts: now, start: st.start });
+      return {
+        name: pid === process.pid ? 'zcode-webui' : readPidName(String(pid), st.comm),
+        pid,
+        cpu: Math.round(cpu * 10) / 10,
+        memory: readPidRssKb(String(pid)),
+        children: (byPpid.get(pid) || []).map(build).filter(Boolean),
+      };
+    };
+    tree = build(process.pid);
+    for (const pid of procCpuSamples.keys()) if (!stats.has(pid)) procCpuSamples.delete(pid);
+  } else {
+    // no /proc to walk (darwin/win32): report this process only
+    const usage = process.cpuUsage();
+    const totalUs = usage.user + usage.system;
+    const prev = procCpuSamples.get(process.pid);
+    let cpu = 0;
+    if (prev && now > prev.ts) cpu = Math.max(0, (totalUs - prev.jiffies) / 1000 / ((now - prev.ts) / 1000) * 100);
+    procCpuSamples.set(process.pid, { jiffies: totalUs, ts: now, start: '' });
+    tree = {
+      name: 'zcode-webui', pid: process.pid,
+      cpu: Math.round(cpu * 10) / 10,
+      memory: Math.round(process.memoryUsage().rss / 1024),
+      children: [],
+    };
+  }
+  procLastSnapshot = { ts: now, tree };
+  return tree;
+}
+
+// same injection strategy as readRendererIndex, minus the zcode bridge: the
+// process-monitor page never touches window.zcode, it only needs the metrics shim.
+function readProcessMonitorPage() {
+  const p = path.join(RENDERER_DIR, 'process-monitor.html');
+  if (!existsSync(p)) return null;
+  let html = readFileSync(p, 'utf8');
+  const shim = '<script src="./__zcode_webui/process-monitor-bridge.js?v=' + Date.now().toString(36) + '"></script>';
+  const metaViewport = '<meta name="viewport" content="width=device-width, initial-scale=1.0" />';
+  if (html.includes(metaViewport)) {
+    html = html.replace(metaViewport, metaViewport + shim);
+  } else {
+    html = html.replace(/<head([^>]*)>/i, (m, attrs) => '<head' + attrs + '>' + shim);
+  }
+  return html;
+}
+
 // ---------- login ----------
 let loginRun = null; // {child, url(), output()}
 let loginLog = '';
 
 // ---------- host pipe (shared by WS transport and HTTP fallback transport) ----------
-function openHostPipe() {
+async function openHostPipe() {
+  await ensureWorkspaceDirs();
   const extraEnv = HOST_PROXY
     ? { ZCODE_HTTP_PROXY: HOST_PROXY, ZCODE_NO_PROXY: 'localhost,127.0.0.1' }
     : {};
@@ -464,7 +644,8 @@ function releaseHold(view) {
   }
 }
 
-function createSession(userKey, tabId) {
+async function createSession(userKey, tabId) {
+  await ensureWorkspaceDirs();
   let child;
   try {
     const host = spawnHost({ serverRoot, log: (l) => console.error(l) });
@@ -510,8 +691,15 @@ function createSession(userKey, tabId) {
       try { v.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ }
     }
     session.views.clear();
-    console.error('[zcode-webui] host exited pid=' + child.pid + ' code=' + code + ' signal=' + signal + (session.views.size ? '' : ''));
-    sessions.delete(session.userKey);
+    console.error('[zcode-webui] host exited pid=' + child.pid + ' code=' + code + ' signal=' + signal);
+    // Only remove the CURRENT session for this userKey. A slow-to-die host from
+    // an older session can exit after a new session has already replaced it;
+    // deleting by key unconditionally would untrack (and leak) the new host.
+    if (sessions.get(session.userKey) === session) {
+      sessions.delete(session.userKey);
+    } else {
+      console.error('[zcode-webui] stale host exit ignored pid=' + child.pid + ' (session already replaced)');
+    }
   });
 
   handshake(child)
@@ -556,6 +744,24 @@ if (DETACHED_TTL_MS > 0) {
         ' (detached ' + Math.round((now - s.detachedAt) / 1000) + 's, quiet ' +
         Math.round((now - s.lastFrameAt) / 1000) + 's)');
       terminateSession(s, 'idle reap');
+    }
+  }, 60000).unref();
+}
+
+// HTTP fallback relays are NOT protected by the sessions reaper above; without
+// this every abandoned long-poll page would keep a full zcode-server host alive
+// forever. Close relays whose client has not polled/sent recently.
+if (HTTP_RELAY_TTL_MS > 0) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of httpRelays) {
+      if (entry.pipe.closed) { httpRelays.delete(id); continue; }
+      if (now - entry.lastSeen > HTTP_RELAY_TTL_MS) {
+        console.error('[bridge] reaping idle http relay id=' + id +
+          ' (idle ' + Math.round((now - entry.lastSeen) / 1000) + 's)');
+        try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+        httpRelays.delete(id);
+      }
     }
   }, 60000).unref();
 }
@@ -658,7 +864,19 @@ function handleRequest(req, res) {
           clearTimeout(entry.waiterTimer);
           w(null);
         }
+        httpRelays.delete(id);
       };
+      if (HTTP_RELAY_MAX > 0) {
+        let oldest = null;
+        for (const [rid, e] of httpRelays) {
+          if (!oldest || e.lastSeen < oldest.entry.lastSeen) oldest = { id: rid, entry: e };
+        }
+        if (oldest && httpRelays.size >= HTTP_RELAY_MAX) {
+          console.error('[bridge] closing oldest http relay id=' + oldest.id + ' (max ' + HTTP_RELAY_MAX + ' reached)');
+          try { oldest.entry.pipe.close(); } catch (_e) { /* ignore */ }
+          httpRelays.delete(oldest.id);
+        }
+      }
       httpRelays.set(id, entry);
       console.error('[bridge] http session opened id=' + id + ' host=' + pipe.hello.version);
       sendJson(res, 200, { ok: true, id, hostVersion: pipe.hello.version });
@@ -805,6 +1023,12 @@ function handleRequest(req, res) {
     return;
   }
 
+  // process tree for the official renderer's process-monitor page (see shim in
+  // web/process-monitor-bridge.js); response body IS the tree root, unwrapped
+  if (urlPath === '/api/process-metrics' && req.method === 'GET') {
+    return sendJson(res, 200, processMetricsTree());
+  }
+
   // browser-side diagnostics: POST {href, message, stack}
   if (urlPath === '/api/log' && req.method === 'POST') {
     let body = '';
@@ -851,6 +1075,13 @@ function handleRequest(req, res) {
   if (urlPath === '/export-credentials.html') {
     const f = path.join(WEB_DIR, 'export-credentials.html');
     const html = existsSync(f) ? readFileSync(f, 'utf8') : '<h1>missing export-credentials.html</h1>';
+    return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  }
+
+  // official renderer's process monitor page, with the metrics shim injected
+  if (urlPath === '/process-monitor.html') {
+    const html = readProcessMonitorPage();
+    if (!html) return send(res, 404, 'process-monitor.html missing (run npm run fetch-renderer)');
     return send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
   }
 
@@ -923,7 +1154,7 @@ function handleUpgrade(req, socket, head) {
         ', last frame ' + (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')');
     } else {
       try {
-        session = createSession(userKey, tabId);
+        session = await createSession(userKey, tabId);
       } catch (err) {
         console.error('[ws] host spawn failed: ' + err.message);
         socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');

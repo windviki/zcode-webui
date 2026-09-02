@@ -14,10 +14,15 @@ tmp/
 
 # logs, screenshots, OS files
 *.log
+*.log.*
 npm-debug.log*
 .zcode-webui.json
 scripts/dev/*.png
 .DS_Store
+
+# service runtime files
+.service.pid
+*.pid
 
 # npm packaging artifacts
 *.tgz

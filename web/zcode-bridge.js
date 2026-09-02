@@ -147,7 +147,16 @@
     getZCodeStdioTapDevState: val(false),
     getInstalledEditors: val([]),
     openInEditor: val(false),
-    executeDesktopCommand: val(true),
+    // desktop commands arrive as camelCase strings; only openProcessMonitor has
+    // a web equivalent today — the official renderer ships process-monitor.html
+    // and our server injects the window.processMonitor shim into it.
+    executeDesktopCommand: function (cmd) {
+      if (cmd === 'openProcessMonitor') {
+        var dir = window.location.pathname.replace(/[^/]*$/, '');
+        try { window.open(dir + 'process-monitor.html', 'zcode-process-monitor'); } catch (e) { /* popup blocked */ }
+      }
+      return Promise.resolve(true);
+    },
     loadMcpFromUserDirectory: val({ items: [] }),
     saveMcpToUserDirectory: ok,
     migrateLegacyCommonMcp: ok
