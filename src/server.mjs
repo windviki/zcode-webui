@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
-import { rpcLogLine, decodeRpcHeader, rewriteRpcId } from './rpclog.mjs';
+import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
 import { spawnHost, handshake, resolveServerRoot } from './host.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
@@ -510,10 +510,11 @@ async function openHostPipe() {
 // ---------- host sessions (multi-device live view) ----------
 // ONE host process per ACCOUNT (userKey). Every browser tab/device attaches as
 // a VIEW of that session:
-//   - event frames (type 200) are broadcast to every view — all devices see the
-//     live stream simultaneously;
-//   - responses (201/202) are routed back to the view whose request produced
-//     them (the mux keeps per-view id spaces), so views never cross-contaminate;
+//   - the mux translates every view's renderer-local RPC ids (calls AND event
+//     subscriptions) into a session-global space, because the host sees one
+//     client while each fresh renderer restarts counting at 0;
+//   - responses (201/202/203) and event fires (204) are routed to the view
+//     that owns the id, so views never cross-contaminate;
 //   - a session with zero views parks detached and keeps running its turns
 //     (the reaper cleans idle ones); the first view to (re)attach adopts it.
 const sessions = new Map();       // userKey -> session
@@ -528,6 +529,16 @@ function rpcLogIn(payload) {
   if (l) console.error('[rpc] ' + l);
 }
 
+// One mux per session. The host sees exactly ONE client, but every fresh
+// renderer restarts its request-id counter at 0 — without translation, the
+// identical small ids from different views/eras alias inside the host (a
+// renderer can even receive an event fired for a DIFFERENT subscription,
+// crashing its handler). `pending` tracks calls awaiting a response, `events`
+// tracks live host-side event subscriptions; both keyed by global id.
+function makeMux() {
+  return { next: 0x10000, pending: new Map(), events: new Map(), dropped: 0 };
+}
+
 function writeToHost(session, view, payload) {
   if (session.closed) return false;
   session.framesIn++;
@@ -538,23 +549,48 @@ function writeToHost(session, view, payload) {
     return true;
   }
   if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
-  // mux: translate this view's request id into the stable global space
+  // mux: translate this view's renderer-local ids into the global space
   if (session.mux) {
     const hdr = decodeRpcHeader(payload);
+    // A frame whose id cannot be rewritten is DROPPED, never forwarded raw:
+    // an unrewritten local id would bypass the mux and alias inside the host.
     if (hdr && hdr.type === 100) {
+      // call: remember ownership so the response can be routed back
       const gid = ++session.mux.next;
-      if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') console.error('[muxdbg] req view=' + view.tabId.slice(0, 6) + ' orig=' + hdr.id + ' gid=' + gid);
+      const rewritten = rewriteRpcId(payload, gid);
+      if (!rewritten) { session.mux.dropped++; return true; }
       view.sent.add(gid);
       session.mux.pending.set(gid, { view, origId: hdr.id });
-      const rewritten = rewriteRpcId(payload, gid);
-      if (rewritten) payload = rewritten;
+      payload = rewritten;
     } else if (hdr && hdr.type === 101) {
       // cancel: renderer refers to its original id — find the global twin
       let gid = null;
       for (const [g, e] of session.mux.pending) if (e.view === view && e.origId === hdr.id) { gid = g; break; }
       if (gid === null) return true;                        // cancel for a dead era
       const rewritten = rewriteRpcId(payload, gid);
-      if (rewritten) payload = rewritten;
+      if (!rewritten) { session.mux.dropped++; return true; }
+      payload = rewritten;
+    } else if (hdr && hdr.type === 102) {
+      // event subscribe: same aliasing hazard as calls — map (view, localId) to
+      // a global id, reusing the mapping if this exact subscription re-attaches
+      let gid = null;
+      for (const [g, e] of session.mux.events) if (e.view === view && e.origId === hdr.id) { gid = g; break; }
+      if (gid === null) gid = ++session.mux.next;
+      const rewritten = rewriteRpcId(payload, gid);
+      if (!rewritten) { session.mux.dropped++; return true; }
+      session.mux.events.set(gid, { view, origId: hdr.id });
+      payload = rewritten;
+    } else if (hdr && hdr.type === 103) {
+      // event dispose: forward only when WE hold the mapping. A stale dispose
+      // from a dead renderer era must be swallowed — forwarded raw it would
+      // unsubscribe whatever other view now owns that same local id.
+      let gid = null;
+      for (const [g, e] of session.mux.events) if (e.view === view && e.origId === hdr.id) { gid = g; break; }
+      if (gid === null) return true;
+      const rewritten = rewriteRpcId(payload, gid);
+      if (!rewritten) { session.mux.dropped++; return true; }
+      session.mux.events.delete(gid);
+      payload = rewritten;
     }
   }
   try { session.child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
@@ -593,10 +629,12 @@ function terminateSession(session, reason) {
   sessions.delete(session.userKey);
 }
 
-// Deliver one downstream frame: responses to their owning view, events to all.
+// Deliver one downstream frame: responses (201/202/203) and event fires (204)
+// go to the view that owns the id, host Initialize (200) and undecodable frames
+// broadcast to every view.
 function routeDownstream(session, payload) {
   const hdr = session.mux ? decodeRpcHeader(payload) : null;
-  if (hdr && (hdr.type === 201 || hdr.type === 202)) {
+  if (hdr && (hdr.type === 201 || hdr.type === 202 || hdr.type === 203)) {
     const entry = session.mux.pending.get(hdr.id);
     if (!entry) {
       session.mux.dropped++;
@@ -607,18 +645,28 @@ function routeDownstream(session, payload) {
       return;
     }
     session.mux.pending.delete(hdr.id);
-    const view = entry.view;
     entry.view.sent.delete(hdr.id);
-    const ws = view.ws;
-    if (!ws || ws.readyState !== 1) return;
-    let out = payload;
-    if (entry.origId !== hdr.id) {
-      out = rewriteRpcId(payload, entry.origId) || payload;
-    }
-    try { ws.send(out, { binary: true }); } catch (_e) { /* ignore */ }
+    sendToView(session, entry, hdr, payload);
     return;
   }
-  // events (type 200, no id) and undecodable frames: broadcast to every view
+  if (hdr && hdr.type === 204) {
+    // event fire: unicast to the subscribing view with its local id restored.
+    // Broadcasting raw would deliver host-global ids other views never
+    // registered — and those collide with local handler ids (crash class:
+    // "Cannot read properties of undefined (reading 'revision')").
+    const entry = session.mux.events.get(hdr.id);
+    if (!entry) {
+      session.mux.dropped++;
+      if (session.mux.dropped <= 5 || session.mux.dropped % 50 === 0) {
+        console.error('[mux] dropped event globalId=' + hdr.id +
+          ' (' + hdr.channel + '.' + hdr.method + ') no live subscriber, total=' + session.mux.dropped);
+      }
+      return;
+    }
+    sendToView(session, entry, hdr, payload);
+    return;
+  }
+  // events without a mux, host Initialize and undecodable frames: broadcast
   for (const [, v] of session.views) {
     if (v.holdFrames) {                         // still mounting: buffer in order
       if (v.holdBuf.length < 512) v.holdBuf.push(Buffer.from(payload));
@@ -628,6 +676,38 @@ function routeDownstream(session, payload) {
     if (ws && ws.readyState === 1) {
       try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
     }
+  }
+}
+
+// Rewrite a downstream frame back into the owning view's local id space and
+// deliver it (buffered in-order while that view is still mounting).
+function sendToView(session, entry, hdr, payload) {
+  const view = entry.view;
+  if (session.views.get(view.tabId) !== view) return;   // renderer era replaced
+  let out = payload;
+  if (entry.origId !== hdr.id) out = rewriteRpcId(payload, entry.origId) || payload;
+  if (view.holdFrames) {
+    if (view.holdBuf.length < 512) view.holdBuf.push(Buffer.from(out));
+    return;
+  }
+  const ws = view.ws;
+  if (!ws || ws.readyState !== 1) return;
+  try { ws.send(out, { binary: true }); } catch (_e) { /* ignore */ }
+}
+
+// Tear down a view's host-side event subscriptions by sending EventDispose
+// frames with the global ids the host knows. Used when a renderer era is
+// replaced: the host never learns that the browser page died, so without this
+// its emitter listeners pile up and keep firing for ghosts.
+function disposeViewEvents(session, view) {
+  if (!session.mux || session.closed || !session.child || session.child.exitCode !== null) return;
+  for (const [gid, e] of session.mux.events) {
+    if (e.view !== view) continue;
+    session.mux.events.delete(gid);
+    // EventDispose frame = header [103, gid] + undefined body (preset 0 byte),
+    // exactly what the renderer's sendCancelOrDispose emits
+    const frame = Buffer.concat([encodeRpcHeader([103, gid]), Buffer.from([0])]);
+    try { session.child.stdin.write(encodeFrame(frame)); } catch (_e) { /* host gone */ }
   }
 }
 
@@ -655,12 +735,15 @@ async function createSession(userKey, tabId) {
   }
   const session = {
     userKey, primaryTab: tabId, child, hello: null,
-    views: new Map(),                       // tabId -> view
+    views: new Map(),                       // tabId -> view (currently connected)
+    eraByTab: new Map(),                    // tabId -> last view object, even after its ws closed (resume/rebind needs it)
     detachedAt: 0, lastFrameAt: 0,
-    framesIn: 0, framesOut: 0, pendingInbound: [], closed: false,
+    framesIn: 0, framesOut: 0,
+    pendingInbound: [],                     // {view, payload} frames seen before the host handshake finished
+    closed: false,
     firstDownstream: null, initForwarded: false,
     resumeBuf: [], resumeMode: false,
-    mux: MUX_ENABLED ? { next: 0x10000, pending: new Map(), dropped: 0 } : null,
+    mux: MUX_ENABLED ? makeMux() : null,
   };
   console.error('[zcode-webui] host spawned pid=' + child.pid + ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
   sessions.set(userKey, session);
@@ -677,10 +760,12 @@ async function createSession(userKey, tabId) {
     }
     if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogOut(payload);
     // official startup sequencing: flush frames queued during the handshake only
-    // after the Initialize has gone out (earlier flushes wedge the runtime)
+    // after the Initialize has gone out (earlier flushes wedge the runtime) —
+    // each queued frame goes back to the view that sent it (two devices can
+    // connect within the handshake window)
     if (!session.initForwarded) {
       session.initForwarded = true;
-      for (const p of session.pendingInbound.splice(0)) writeToHost(session, firstViewOf(session), p);
+      for (const e of session.pendingInbound.splice(0)) writeToHost(session, e.view, e.payload);
     }
     routeDownstream(session, payload);
   });
@@ -718,11 +803,6 @@ async function createSession(userKey, tabId) {
     });
 
   return session;
-}
-
-function firstViewOf(session) {
-  for (const [, v] of session.views) return v;
-  return null;
 }
 
 function rebindView(session, tabId) {
@@ -1145,7 +1225,7 @@ function handleUpgrade(req, socket, head) {
     let adopted = false;
     if (session) {
       adopted = true;
-      if (MUX_ENABLED && !session.mux) { session.mux = makeMux(); session.resumeBuf = []; }
+      if (MUX_ENABLED && !session.mux) { session.mux = makeMux(); session.eraByTab ??= new Map(); session.resumeBuf = []; }
       if (!resume) session.resumeBuf = [];   // fresh page: no offline-gap replay
       rebindView(session, tabId);
       session.detachedAt = 0;
@@ -1173,6 +1253,18 @@ wss.on('connection', (ws, req, session, meta) => {
   const resume = !!(meta && meta.resume);
   console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
 
+  // resume=1 means the page instance already bootstrapped once, so its event
+  // subscriptions are "live" from its point of view and it will NEVER re-send
+  // EventListen. If this session holds no era of this tab (server restart, host
+  // reaped and re-spawned by another page), those subscriptions can never be
+  // restored — events would silently stop. Force the clean path instead:
+  // bootstrap.js reloads the page on close code 4000 and re-bootstraps fresh.
+  if (resume && !session.eraByTab.get(tabId)) {
+    console.error('[ws] stale-era resume rejected tab=' + tabId.slice(0, 8) + ' — forcing page reload');
+    try { ws.close(4000, 'era gone'); } catch (_e) { /* ignore */ }
+    return;
+  }
+
   // ---- build this page's view ----
   const view = {
     ws, tabId,
@@ -1180,6 +1272,10 @@ wss.on('connection', (ws, req, session, meta) => {
     holdFrames: false, holdBuf: [], holdSkipOnce: false, replayInitOnCapture: false,
     lastFrameAt: 0,
   };
+  // prevView is the previous renderer era of this tab — looked up in eraByTab
+  // because the ws close handler may already have removed it from views (the
+  // close of a hot-reconnecting socket always races the reconnect)
+  const prevView = session.eraByTab.get(tabId) || null;
   if (adopted && !resume) {
     // fresh renderer bootstrapping against a mid-stream host: gate downstream
     // until its port-ready ack (or failsafe) so it sees Initialize first
@@ -1189,15 +1285,29 @@ wss.on('connection', (ws, req, session, meta) => {
     else view.replayInitOnCapture = true;
     setTimeout(() => releaseHold(view), 8000).unref();
   }
-  session.views.set(tabId, view);
-  session.detachedAt = 0;
-  if (session.mux) {
-    // a FRESH renderer invalidates outstanding requests of the SAME tab's old
-    // renderer era (other tabs' eras are untouched)
-    if (!resume) for (const [gid, e] of session.mux.pending) if (e.tabId === tabId) { session.mux.pending.delete(gid); view.sent.delete(gid); }
-    if (session.firstDownstream && !resume) { view.holdBuf.push(Buffer.from(session.firstDownstream)); }
-    else if (session.firstDownstream && resume) { /* same renderer: it already bootstrapped */ }
+  if (session.mux && prevView && prevView !== view) {
+    if (resume) {
+      // hot reconnect of the SAME live renderer: its era continues — re-point
+      // the ownership records at the new socket or responses/fires for its
+      // in-flight calls and subscriptions would be dropped forever
+      for (const [, e] of session.mux.pending) if (e.view === prevView) e.view = view;
+      for (const [, e] of session.mux.events) if (e.view === prevView) e.view = view;
+    } else {
+      // fresh renderer era of this tab: the old renderer is gone without the
+      // host ever noticing, so explicitly unsubscribe its events (calls just
+      // expire — their stale responses are dropped by the mux)
+      disposeViewEvents(session, prevView);
+      for (const [gid, e] of session.mux.pending) if (e.view === prevView) {
+        session.mux.pending.delete(gid);
+        prevView.sent.delete(gid);
+      }
+      prevView.sent.clear();
+      prevView.holdBuf.length = 0;           // eraByTab keeps the object alive — drop its buffers
+    }
   }
+  session.views.set(tabId, view);
+  session.eraByTab.set(tabId, view);
+  session.detachedAt = 0;
 
   // listeners FIRST (a client answering the ready signal instantly must not
   // lose its first frame), announcements after
@@ -1210,11 +1320,13 @@ wss.on('connection', (ws, req, session, meta) => {
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
     if (view.lastFrameAt === 0) view.lastFrameAt = Date.now();
     if (session.hello) writeToHost(session, view, payload);
-    else session.pendingInbound.push(payload);
+    else session.pendingInbound.push({ view, payload });   // flushed with its owner (see FrameParser callback)
   });
   ws.on('close', () => {
     if (session.views.get(tabId) !== view) return;     // superseded by a newer view
     session.views.delete(tabId);
+    view.sent.clear();
+    view.holdBuf.length = 0;               // eraByTab keeps the object alive — drop its buffers
     if (session.views.size === 0) {
       if (session.framesIn === 0 && session.framesOut === 0) {
         console.error('[ws] closed before traffic, terminating host pid=' + session.child.pid);
