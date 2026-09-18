@@ -162,7 +162,7 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_WEBUI_LOCALE` | `locale` | `zh-CN` | 界面语言 |
 | `ZCODE_WEBUI_OAUTH_PROXY` / `--oauth-proxy` | `oauthProxy` | 空 | OAuth 登录用的 HTTP 代理（服务器直连 `zcode.z.ai/api/v1` 不通时） |
 | `ZCODE_WEBUI_HOST_PROXY` / `--host-proxy` | `hostProxy` | 空 | 运行时/Agent 访问云与模型 API 的 HTTP 代理（`api.z.ai`、`open.bigmodel.cn` 不通时） |
-| `ZCODE_WEBUI_QUOTA_RESET` | — | `on` | 重置机会自动使用：`on`（默认，择机使用）/ `dry-run`（只记录决策）/ `off`。只在「有任务且池余量 ≤5%」或「机会将过期且池用量 ≥30%」时使用，每日上限 6 次；详见 AGENTS.md |
+| `ZCODE_WEBUI_QUOTA_RESET` | — | `on` | 重置机会自动使用：`on`（默认，择机使用）/ `dry-run`（只记录决策）/ `off`。触发条件：有任务且池余量 ≤5%；或收到厂商「配额耗尽」429/402 硬信号；或池已用尽且自然重置尚远；或机会将过期且池用量 ≥30%。池的自然重置就在眼前时一律不用；每日上限 6 次；详见 AGENTS.md |
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |

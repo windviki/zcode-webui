@@ -615,8 +615,15 @@ function guardStatsSnapshot() {
   } catch (_e) { return null; }
 }
 
-// quota-reset-guard state (chances seen, last decision, uses today) — written by
-// the HOST process, read here for observability
+// quota-reset-guard state (chances seen, pool usage, signals, last decision,
+// uses today) — written by the HOST process, read here for observability.
+// `pools` is what the guard actually believed; a stale/absent pool entry there
+// is the first thing to look at when a reset "should" have fired but did not.
+const poolSnapshot = (b) => (!b ? null : {
+  usedPct: typeof b.usedRatio === 'number' ? Math.round(b.usedRatio * 1000) / 10 : null,
+  remaining: b.remaining ?? null, total: b.total ?? null,
+  naturalResetAt: b.expiresAt ?? null, src: b.src || null, at: b.at ?? null,
+});
 function quotaResetSnapshot() {
   try {
     const j = JSON.parse(readFileSync(path.join(PATHS.dataHome, 'data', 'guard-stats', 'quota-reset-guard.json'), 'utf8'));
@@ -628,6 +635,13 @@ function quotaResetSnapshot() {
         statusAt: j.status ? j.status.at : null,
       },
       busy: typeof j.busy === 'boolean' ? j.busy : null,
+      pools: {
+        fiveHour: poolSnapshot(j.buckets && j.buckets.FIVE_HOUR),
+        week: poolSnapshot(j.buckets && j.buckets.WEEK),
+        at: (j.buckets && j.buckets.at) || null,
+      },
+      signals: j.exhaustion ? { at: j.exhaustion.at || 0, byType: j.exhaustion.byType || null, last: j.exhaustion.last || null } : null,
+      stats: j.stats || null,
       usesToday: j.usesToday ?? null, lastUsedAt: j.lastUsedAt || null, lastUsedType: j.lastUsedType || null,
       confirmed: typeof j.confirmed === 'boolean' ? j.confirmed : null,
       lastDecision: j.lastDecision || null,

@@ -266,30 +266,52 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 3. **正确用法**：会话空闲（无挂起确认）时点输入框旁模式下拉 → 完全访问。该会话即不再问，
    同工作区**新会话**在该设备默认继承 yolo。老会话/其它设备需各自切一次。
 
-## 重置机会自动使用（quota-reset-guard，2026-09-18）
+## 重置机会自动使用（quota-reset-guard，2026-09-18；口径修复 2026-09-19）
 
 官方编程套餐偶尔发放「重置额度」机会（5 小时池 / 周额度各一种，`/api/v1/coding-plan/reset/status`
 里的 `available_five_hour_resets`/`available_week_resets`，各带 `expire_at`）。本项目让宿主进程
 自动**择机**使用（`src/quota-reset-guard.cjs`，host.mjs 注入 preload，与另两个 guard 并列）：
 
+- **池数据口径（0.7.1 踩过坑，务必按这个来）**：池余量只能从
+  `GET {bigmodel.cn|api.z.ai}/api/monitor/usage/quota/limit` 的 `data.limits[]` 读：
+  `{type, unit, number, usage, currentValue, remaining, percentage, nextResetTime}`，其中
+  **`usage` 才是窗口额度（12000 / 60000），`currentValue` 是已用，`remaining = usage - currentValue`，
+  `percentage` 是已用百分比**（官方 UI 的「剩余 %」= `100 - percentage`，见渲染层 `kL()`）。
+  池身份按 `type` + `unit` 匹配（`TOKENS_LIMIT|CREDIT_LIMIT` × `unit:3` = 5h，× `unit:6` = 周；
+  `TIME_LIMIT` × `unit:5` 是月度 MCP 额度，任何重置机会都不补它）。**`number`（5 / 1）不是额度**：
+  0.7.1 把 `remaining ÷ number` 当余量比例，于是「60000 额度只剩 2」被算成 200% 余量，
+  ≤5% 触发点实际只在恰好归零时成立——也就是任务已经撞墙死掉之后（见下）。
 - **策略**（原则：留到最需要、不浪费）：
-  1. 有任务活跃（tasks-index 最近 10 分钟有 running 更新）**且**对应池余量 ≤5% → 用；
-  2. 模型调用出现 402（配额耗尽硬信号）且机会将过期 → 用；
-  3. 机会自身即将过期（5h≤30min / 周≤2h）**且**池用量 ≥30%（重置有实际价值）→ 挽救性使用；
-  4. 空闲、池健康、机会不过期 → 一律不用；每日上限 6 次；用后必须等 `/status` 确认才允许下一次。
-- **机制**：观察运行时自己的 fetch（`/reset/status`、billing/balance——从中解析机会与池余量，
-  具名桶优先、同类取更近到期）；捕获运行时请求里的双 JWT 头（`Authorization` +
-  `X-Bigmodel-Authorization` + scope 头）**重放**给自己发起的只读 `/status` 轮询（10min 一次）与
-  `/use`（uuid 幂等键，用后轮询确认）。凭据不落盘。子进程（agent）只上报 402 信号。
+  1. 有任务活跃（tasks-index 有 `running` 行，窗口 2h，与 webui reaper 的
+     `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` 一致）**且**对应池余量 ≤5% → 用；
+  2. **耗尽硬信号**（模型调用返回 HTTP 429 + 业务码 `1310`=周/月、`1308`=5h；兼容 402）→
+     对应池立即挽救，**空闲也发**（前提：该池用量 ≥30% 或池数据未知）；
+  3. **池已用尽**（≈100%）且该池自然重置还在 30min（周 2h）之外、机会仍有效 → 空闲也发
+     （等着什么也保不住，只会让下一轮直接失败）；
+  4. 机会自身即将过期（5h≤30min / 周≤2h）**且**池用量 ≥30%（重置有实际价值）→ 挽救性使用；
+  5. 池的**自然重置就在眼前**（5h≤30min / 周≤2h）→ 一律不用（马上免费回满，花了就是浪费）；
+  6. 空闲、池健康、机会不过期 → 一律不用；每日上限 6 次；用后必须等 `/status` 确认才允许下一次。
+- **机制**：观察运行时自己的 fetch（`/reset/status`、billing/balance、quota/limit——从中解析机会与
+  池余量）；捕获运行时请求里的双 JWT 头（`Authorization` + `X-Bigmodel-Authorization` + scope 头）
+  **重放**给自己发起的只读 `/status` 轮询（10min 一次）与 `/use`（uuid 幂等键，用后轮询确认）。
+  凭据不落盘。子进程（agent）把「配额耗尽」写成带 scope 的信号行，宿主每 tick 收取。
 - **开关**：`ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off`（默认 on；dry-run 只记录决策不发请求）。
-  其余阈值 env 见文件头（比例/过期窗口/冷却/日上限/头最大年龄/活跃窗口/余额新鲜度）。
-- **观测**：stderr `[zcode-webui] quota-reset-guard:`；状态 JSON 在
-  `<dataHome>/data/guard-stats/quota-reset-guard.json`，`/api/health` → `guards.quotaReset`
-  （机会数、最近决策、当日使用次数、busy）。
+  其余阈值 env 见文件头（比例/过期窗口/冷却/日上限/头最大年龄/活跃窗口/余额新鲜度/
+  信号有效期 `_EXHAUSTION_SIGNAL_MS`/自然重置地板 `_NATURAL_RESET_FLOOR_*`/`_DRY_IDLE`）。
+- **观测**：stderr `[zcode-webui] quota-reset-guard:`（决策行带 chances / pools 已用% / busy）；
+  状态 JSON 在 `<dataHome>/data/guard-stats/quota-reset-guard.json`，`/api/health` → `guards.quotaReset`
+  （机会数、两池 `usedPct/remaining/naturalResetAt`、信号时间、最近决策、当日使用次数、busy）。
 - **注意**：授权头只能从运行时真实请求捕获——**界面长期不打开时头会过期**（默认 12h 窗口），
   引擎会安全停摆并在日志说明；打开一次页面即恢复。`dry-run` 先跑一段时间观察决策是否符合预期
-  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（39 项，全离线 mock，
-  绝不触真实 API）。
+  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（61 项，全离线 mock，
+  绝不触真实 API；含 2026-09-19 线上真实 payload 与 429 撞墙回放）。
+- **2026-09-19 事故复盘**：周额度撞墙（`[1310]您已达到每周/每月使用上限…2026-09-22 21:55 重置`），
+  手上 1 个周机会（10-18 到期）+ 1 个 5h 机会全没用，服务停摆 3.6 天。三个叠加原因：
+  ①`remaining ÷ number` 口径错 → 撞墙前池看着「200% 健康」，≤5% 规则形同虚设；
+  ②耗尽信号只认 402，而厂商实际返回 429+`1310/1308` → `stats.signals` 恒为 0，挽救通道是死代码；
+  ③主规则强制要求 `busy`，而额度撞墙后任务立刻变 `error`，`busy=false` 且机会还有 30 天才过期
+  → 永久不动。修复即上面 2/3 两条 + 口径按 `percentage`/`usage`；`busy` 窗口同时从 10min 放到 2h
+  （长回合期间索引行不会每分钟重写，10min 会把正在跑的任务判成空闲）。
 
 ## 其他约定
 

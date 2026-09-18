@@ -58,6 +58,13 @@ globalThis.fetch = async (input, init) => {
     });
   }
   if (url.includes('/api/v1/coding-plan/reset/use')) {
+    // a real use consumes the chance, so the confirmation poll succeeds on its
+    // first pass (keeps the suite fast without weakening the assertions)
+    try {
+      const used = JSON.parse((init && init.body) || '{}').reset_type;
+      if (used === 'FIVE_HOUR') upstream.status.fiveHour = [];
+      if (used === 'WEEK') upstream.status.week = [];
+    } catch (_e) { /* ignore */ }
     return jsonResponse(upstream.useResult);
   }
   if (url.includes('/api/v1/zcode-plan/billing/balance')) {
@@ -73,6 +80,15 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.includes('/chat/completions')) {
     return new Response('{"error":"payment required"}', { status: 402 });
+  }
+  // the provider's real "quota used up" shape: 429 + Anthropic-style body with
+  // a business code (1310 = 每周/每月上限, 1308 = 5 小时上限)
+  if (url.includes('/api/anthropic')) {
+    return new Response(JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', code: '1310', message: '[1310][您已达到每周/每月使用上限，您的限额将在 2026-09-22 21:55:11 重置。][202609190718185d4957e6cd3c4582]' },
+      request_id: '202609190718185d4957e6cd3c4582',
+    }), { status: 429, headers: { 'content-type': 'application/json' } });
   }
   return jsonResponse({ code: 0, data: null });
 };
@@ -106,7 +122,10 @@ check('idle + healthy pool + chance not expiring → NO reset (the core "don\'t 
 check('busy + 5h pool ≤ threshold → fires FIVE_HOUR', d({ busy: true, fiveHourBucket: { total: 100, remaining: 3 } }).type === 'FIVE_HOUR');
 check('idle + 5h pool ≤ threshold + chance not expiring → holds', d({ fiveHourBucket: { total: 100, remaining: 3 } }).fired === false);
 check('idle + hard exhaustion + chance lapsing soon → salvages', d({ exhaustedSignalAt: now, fiveHourResets: [now + 10 * 60_000] }).type === 'FIVE_HOUR');
-check('idle + hard exhaustion + chance NOT lapsing → holds', d({ exhaustedSignalAt: now, fiveHourResets: [now + 3 * H] }).fired === false);
+check('idle + hard exhaustion (fresh) → rescues even with a long-lived chance (2026-09-19 policy fix)',
+  d({ exhaustedSignalAt: now, fiveHourResets: [now + 24 * H] }).type === 'FIVE_HOUR');
+check('idle + stale exhaustion signal + near-fresh pool → holds (no reset for a rate-limit blip)',
+  d({ exhaustedSignalAt: now - 30 * 60_000, fiveHourResets: [now + 24 * H] }).fired === false);
 check('chance lapsing + pool sufficiently used → rescue fires', d({ fiveHourResets: [now + 20 * 60_000], fiveHourBucket: { total: 100, remaining: 40 } }).type === 'FIVE_HOUR');
 check('chance lapsing + nearly fresh pool → holds (reset would be wasted)', d({ fiveHourResets: [now + 20 * 60_000], fiveHourBucket: { total: 100, remaining: 95 } }).fired === false);
 check('busy + WEEK pool ≤ threshold (5h healthy) → fires WEEK', d({ busy: true, weekBucket: { total: 1000, remaining: 20 } }).type === 'WEEK');
@@ -114,6 +133,32 @@ check('week chance lapsing (≤2h) + used enough → rescue fires', d({ weekRese
 check('week chance lapsing + fresh pool → holds', d({ weekResets: [now + H], weekBucket: { total: 1000, remaining: 950 } }).fired === false);
 check('both pools critical → FIVE_HOUR wins (checked first)', d({ busy: true, fiveHourBucket: { total: 100, remaining: 1 }, weekBucket: { total: 1000, remaining: 1 } }).type === 'FIVE_HOUR');
 check('unknown pool + busy → only exhaustion/expiry paths apply', d({ busy: true, fiveHourBucket: null, weekBucket: null }).fired === false);
+// bone-dry pools: nothing left to preserve, but never just before a free refill
+check('bone-dry week pool + idle + natural reset days away → uses the chance',
+  d({ weekBucket: { total: 60000, remaining: 0, usedRatio: 1, expiresAt: now + 3 * 86400_000 }, weekResets: [now + 30 * 86400_000] }).type === 'WEEK');
+check('bone-dry week pool but natural reset in 10min → holds (the refill is free)',
+  d({ weekBucket: { total: 60000, remaining: 0, usedRatio: 1, expiresAt: now + 10 * 60_000 }, weekResets: [now + 30 * 86400_000] }).fired === false);
+check('dry-idle rule can be switched off',
+  d({ dryIdle: false, weekBucket: { total: 60000, remaining: 0, usedRatio: 1, expiresAt: now + 3 * 86400_000 }, weekResets: [now + 30 * 86400_000] }).fired === false);
+
+// ---------- 1b. live 2026-09-19 scenario (weekly wall, both chances valid) ----------
+// Real payload at the moment the writing task was killed:
+//   week  60000 allowance / 60073 used / remaining 0 / percentage 100 / reset +3.6d
+//   five  12000 allowance /    76 used / remaining 11923 / percentage 1 / reset +5h
+//   chances: 1 x 5h and 1 x week, both expiring ~30 days out
+const liveWeek = { total: 60000, remaining: 0, usedRatio: 1, expiresAt: now + 3.6 * 86400_000 };
+const liveFive = { total: 12000, remaining: 11923, usedRatio: 0.01, expiresAt: now + 5 * H };
+const liveChances = [now + 30 * 86400_000];
+const live = (over) => d({
+  fiveHourResets: liveChances, weekResets: liveChances,
+  fiveHourBucket: liveFive, weekBucket: liveWeek, ...over,
+});
+check('live: idle + drained week pool + 30-day chance → WEEK (the reported miss)', live({}).type === 'WEEK');
+check('live: while the task was still running the fixed math fires at ≤5% left',
+  d({ busy: true, fiveHourResets: liveChances, weekResets: liveChances, fiveHourBucket: liveFive, weekBucket: { total: 60000, remaining: 3000, usedRatio: 0.95 } }).type === 'WEEK');
+check('live: the 0.7.1 math (remaining ÷ number) read that same wall as healthy',
+  // the guard stored {total: number = 1, remaining: 2} → ratio 2 → no trigger
+  d({ busy: true, fiveHourResets: liveChances, weekResets: liveChances, fiveHourBucket: liveFive, weekBucket: { total: 1, remaining: 2 } }).fired === false);
 
 // ---------- 2. observation through the patched fetch ----------
 // authorized status request → headers captured + chances parsed
@@ -163,18 +208,36 @@ check('402 model response appends an exhaustion signal', existsSync(signalFile) 
 const passthrough = await globalThis.fetch('https://example.com/none');
 check('unrelated traffic passes through untouched', passthrough.ok && (await passthrough.json()).code === 0);
 
-// coding-plan pools come from /api/monitor/usage/quota/limit → data.limits[]
+// coding-plan pools come from /api/monitor/usage/quota/limit → data.limits[].
+// Shape + numbers are the real 2026-09-19 field capture (the weekly pool already
+// drained: 60073 used of a 60000 allowance).
 upstream.limits = [
-  { type: 'TIME_LIMIT', number: 100, usage: 96, remaining: 4, nextResetTime: Math.floor((now + 2 * H) / 1000) },
-  { type: 'WEEK_LIMIT', number: 500, usage: 480, remaining: 20, nextResetTime: Math.floor((now + 3 * 86400_000) / 1000) },
+  { type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 12000, currentValue: 76, remaining: 11923, percentage: 1, nextResetTime: now + 5 * H },
+  { type: 'TIME_LIMIT', unit: 5, number: 1, usage: 100, currentValue: 0, remaining: 100, percentage: 0, nextResetTime: now + 12 * 86400_000 },
+  { type: 'CREDIT_LIMIT', unit: 6, number: 1, usage: 60000, currentValue: 60073, remaining: 0, percentage: 100, nextResetTime: now + 3.6 * 86400_000 },
 ];
-await globalThis.fetch('https://api.z.ai/api/monitor/usage/quota/limit', { headers: { Authorization: 'Bearer zj5', 'X-Bigmodel-Authorization': 'Bearer pj5' } });
-check('quota/limit 5h pool parsed (window-classified)', S.buckets.FIVE_HOUR && S.buckets.FIVE_HOUR.remaining === 4 && S.buckets.FIVE_HOUR.src === 'limit');
-check('quota/limit week pool parsed (type-matched)', S.buckets.WEEK && S.buckets.WEEK.remaining === 20);
+await globalThis.fetch('https://bigmodel.cn/api/monitor/usage/quota/limit', { headers: { Authorization: 'Bearer zj5', 'X-Bigmodel-Authorization': 'Bearer pj5' } });
+check('limits[] 5h pool keyed by unit 3, sized by usage (not number)', S.buckets.FIVE_HOUR && S.buckets.FIVE_HOUR.total === 12000 && S.buckets.FIVE_HOUR.usedRatio === 0.01 && S.buckets.FIVE_HOUR.src === 'limit');
+check('limits[] week pool keyed by unit 6, drained state preserved', S.buckets.WEEK && S.buckets.WEEK.total === 60000 && S.buckets.WEEK.usedRatio === 1 && S.buckets.WEEK.remaining === 0);
+check('limits[] monthly TIME_LIMIT is not mistaken for a reset target', guard.classifyLimit({ type: 'TIME_LIMIT', unit: 5, number: 1 }) === null);
+check('fieldsFromLimit never uses number as the pool size', guard.fieldsFromLimit({ type: 'CREDIT_LIMIT', unit: 6, number: 1, usage: 60000, currentValue: 2, remaining: 2, percentage: 0.003 }, now).total === 60000);
+check('the real drained week pool + a running task fires WEEK', 
+  d({ busy: true, weekBucket: S.buckets.WEEK, fiveHourBucket: S.buckets.FIVE_HOUR, weekResets: [now + 30 * 86400_000] }).type === 'WEEK');
 // limits[] outrank subsequent balance heuristics for the same kind
 upstream.balances = [{ show_name: '', total_units: 10, used_units: 1, remaining_units: 9, expires_at: Math.floor((now + 30 * 60_000) / 1000) }];
 await globalThis.fetch('https://zcode.z.ai/api/v1/zcode-plan/billing/balance', { headers: { Authorization: 'Bearer zj6', 'X-Bigmodel-Authorization': 'Bearer pj6' } });
-check('fresh limits[] entry not displaced by balance heuristics', S.buckets.FIVE_HOUR.remaining === 4 && S.buckets.FIVE_HOUR.src === 'limit');
+check('fresh limits[] entry not displaced by balance heuristics', S.buckets.FIVE_HOUR.remaining === 11923 && S.buckets.FIVE_HOUR.src === 'limit');
+
+// provider quota refusal (the real wall): 429 + business code → scoped signal
+const quota429 = (code, message) => new Response(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', code, message } }), { status: 429 });
+check('429 + code 1310 → WEEK-scoped signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429('1310', '[1310][您已达到每周/每月使用上限，您的限额将在 2026-09-22 21:55:11 重置。]')) === 'WEEK');
+check('429 + code 1308 → FIVE_HOUR-scoped signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429('1308', '[1308][已达到 5 小时的使用上限。]')) === 'FIVE_HOUR');
+check('plain 429 rate limit (RPM) → no signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429(undefined, 'too many requests')) === null);
+check('non-quota failure (502) → no signal', await guard.exhaustionScopeOf('https://zcode.z.ai/api/v1/mcp/usage', new Response('{}', { status: 502 })) === null);
+check('429 text-only quota message → unscoped signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', new Response('{"msg":"您的额度已用完"}', { status: 429 })) === 'ANY');
+// …and the child-observer path writes it to the signal file the host drains
+await globalThis.fetch('https://open.bigmodel.cn/api/anthropic/v1/messages', { method: 'POST', headers: { authorization: 'Bearer x' }, body: '{}' });
+check('429 wall appends a WEEK-scoped signal for the host', existsSync(signalFile) && /"scope":"WEEK"/.test(readFileSync(signalFile, 'utf8')));
 
 // ---------- 3. executor: header replay + idempotency + confirmation ----------
 calls.length = 0;
@@ -193,16 +256,26 @@ check('auth headers replayed for /use (latest captured pair)', uh.Authorization 
 check('content-type json on /use', (uh['content-type'] || uh['Content-Type'] || '').includes('application/json'));
 check('use accepted', result.ok === true);
 
-// ---------- 4. state file written for /api/health ----------
-guard.__tick().catch?.(() => {});   // fire-and-forget is fine; state also written on decisions
-await new Promise((r) => setTimeout(r, 300));
-// force a state write via a decision change
+// ---------- 4. end-to-end: child 429 signal → host drain → /use → state file ----------
+// This is the live 2026-09-19 shape: the 429 wall left a WEEK signal on disk, the
+// week pool is drained to 100%, and nothing is running (idle rescue path).
+calls.length = 0;
+S.lastDecision = null;
+await guard.__tick();
+const weekUses = calls.filter((c) => c.url.includes('/reset/use'));
+check('end-to-end: child 429 signal + drained week pool → WEEK reset sent once',
+  weekUses.length === 1 && JSON.parse(weekUses[0].body).reset_type === 'WEEK',
+  'use calls=' + weekUses.length);
+check('the fired use was confirmed by a fresh /status', S.confirmed === true && S.lastUsedType === 'WEEK' && S.usesToday === 1);
+// let the engine settle on a non-firing decision so the state file is rewritten
 S.lastDecision = null;
 await guard.__tick();
 const stateFile = path.join(statsDir, 'quota-reset-guard.json');
 check('state file written for /api/health', existsSync(stateFile));
 const stateJson = JSON.parse(readFileSync(stateFile, 'utf8'));
 check('state file carries chances + decision', stateJson.status && Array.isArray(stateJson.status.fiveHourResets) && stateJson.lastDecision && typeof stateJson.lastDecision.fired === 'boolean');
+check('state file carries pool usage ratios + exhaustion signals for triage',
+  stateJson.buckets && stateJson.buckets.WEEK && stateJson.buckets.WEEK.usedRatio === 1 && stateJson.exhaustion && typeof stateJson.exhaustion.byType.WEEK === 'number');
 
 // ---------- 5. mode behaviours via fresh subprocesses ----------
 const probe = (env, script) => new Promise((resolve) => {
