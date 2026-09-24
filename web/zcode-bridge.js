@@ -360,6 +360,64 @@
   function val(v) { return function () { return Promise.resolve(v); }; }
   function unsupported() { return Promise.reject(new Error('not supported in zcode-webui')); }
 
+  // ---- browser task notifications ----
+  // The official renderer asks the host to notify on task completion/failure,
+  // but the desktop-only preload is a no-op in a browser. Forward that channel
+  // to the browser Notification API, while keeping notification failures from
+  // affecting the task flow.
+  var notificationClickListeners = [];
+  var notificationPermissionRequested = false;
+  function requestNotificationPermission() {
+    if (notificationPermissionRequested || typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'default') return;
+    notificationPermissionRequested = true;
+    try {
+      var result = Notification.requestPermission();
+      if (result && typeof result.catch === 'function') result.catch(function () { /* optional permission */ });
+    } catch (e) { /* notification permission is best effort */ }
+  }
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('click', requestNotificationPermission, true);
+    document.addEventListener('keydown', requestNotificationPermission, true);
+  }
+  function emitTaskNotificationClick(taskId) {
+    for (var i = 0; i < notificationClickListeners.length; i++) {
+      try { notificationClickListeners[i](taskId); } catch (e) { /* one listener must not block others */ }
+    }
+  }
+  function onTaskNotificationClick(cb) {
+    if (typeof cb !== 'function') return unsub();
+    notificationClickListeners.push(cb);
+    return function () {
+      var i = notificationClickListeners.indexOf(cb);
+      if (i >= 0) notificationClickListeners.splice(i, 1);
+    };
+  }
+  function showTaskNotification(payload) {
+    if (!payload || typeof payload !== 'object' || typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'granted') return;
+    try {
+      // Match desktop behavior: do not interrupt a user who is looking at the page.
+      if (document.visibilityState === 'visible' && document.hasFocus()) return;
+      var failed = payload.status === 'failed';
+      var title = payload.title || (failed
+        ? (isEn() ? 'ZCode task failed' : 'ZCode 任务失败')
+        : (isEn() ? 'ZCode task completed' : 'ZCode 任务完成'));
+      var notification = new Notification(title, {
+        body: payload.body || '',
+        tag: payload.taskId ? 'zcode-task-' + payload.taskId : undefined,
+        requireInteraction: failed
+      });
+      if (payload.taskId) {
+        notification.onclick = function () {
+          try { window.focus(); } catch (e) { /* focus is best effort */ }
+          emitTaskNotificationClick(payload.taskId);
+          try { notification.close(); } catch (e) { /* already closed */ }
+        };
+      }
+    } catch (e) { /* notifications must never break the task flow */ }
+  }
+
   var api = {
     // identity / lifecycle
     getDeviceId: val(DEVICE_ID),
@@ -487,7 +545,8 @@
     clearEmbeddedBrowserData: ok,
     browserViewScreenshotSurfaceReady: noop,
     // misc
-    showTaskNotification: noop,
+    showTaskNotification: showTaskNotification,
+    onTaskNotificationClick: onTaskNotificationClick,
     exportLogs: function () {
       // Downloads the server-side log bundle (service snapshot + process tree +
       // service log tail) as a file; the renderer just needs {success}.
