@@ -230,7 +230,8 @@ Note: `upgrade` updates the official components only; upgrade zcode-webui itself
 > "database startup" channel (`zcode:database-startup-state`, phase=ready, startupId matching the port),
 > otherwise the UI stops at "未能收到启动状态 / startup-channel-unavailable". `web/bootstrap.js` now picks
 > the right handshake per deployed renderer version (bare string for <=3.11, object + startup state for
-> >=3.12) and `SHIM_MAX_SUPPORTED` is 3.12.3.
+> >=3.12); there is no fixed shim version ceiling, and the post-upgrade UI check and rollback protect
+> unsupported renderer changes.
 >
 > 3.12's `zcode.cjs` also needs `<runtime>/agents/glm/provider/zcode-builtin.json` (the desktop app
 > ships it, the server runtime does not) — without it both login and agent spawns fail; the server

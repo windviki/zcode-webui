@@ -59,7 +59,7 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 ```bash
 ./zcode-update.sh              # 探测最新版本并更新，装完自动重启 + 校验
 ./zcode-update.sh --check      # 只看版本（当前 / 官网 / CDN）
-./zcode-update.sh -v 3.12.3    # 指定版本（显式指定会绕过「shim 支持上限」的判断）
+./zcode-update.sh -v 3.12.3    # 指定版本
 ./zcode-update.sh --stable     # 只跟官网公布版本，不采用 CDN 上更新的构建
 ./zcode-update.sh --rollback   # 回滚到最近一次更新前的备份
 ```
@@ -75,8 +75,7 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 4. **强制校验**：版本对齐 → `/api/health` → `scripts/smoke-test.mjs`（WS/HTTP 协议桥）→
    `scripts/ui-boot-check.mjs`（headless Chromium 真跑官方渲染层）。任一失败，**默认自动回滚**并再校验一次
    （`--no-auto-rollback` 可关）。
-5. **shim 支持上限**：`SHIM_MAX_SUPPORTED`（脚本与 `src/upgrade.mjs` 各一份）为 **3.12.3**，
-   超过它的版本不自动升，只提示（显式 `-v` 可试装，装完照样校验界面）。
+5. **版本上限**：不设置固定的 shim 版本上限；升级完成后由 UI 启动校验和失败回滚兜底。
 
 ### 3.12.x 适配（2026-09-17 完成）
 
@@ -129,8 +128,8 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 
 - 本机部署：**3.12.3**（`zcode-update.sh` 的 `PINNED_VERSION`、`scripts/fetch-renderer.sh` 的
   `ZCODE_VERSION` 默认值、`src/upgrade.mjs` 的 `DEFAULT_VERSION`、README 里的默认值，四处一起改）。
-- shim 支持上限：**3.12.3**（`SHIM_MAX_SUPPORTED`，两处：`zcode-update.sh` 与 `src/upgrade.mjs`）。
-  超过上限的版本默认不升，只提示；显式 `-v` 仍可试装，装完照常校验、起不来自动回滚。
+- shim 版本上限：**不设固定上限**。安装后必须通过 `scripts/ui-boot-check.mjs` 真浏览器校验；
+  校验失败按更新脚本的回滚流程恢复旧版本。
 
 ### 会话置顶（pin）禁用（2026-09-18）
 

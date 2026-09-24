@@ -205,7 +205,7 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 > **3.12.x 已适配**：官方 3.12 起服务端口消息改成 `{type:'zcode:service-port', databaseStartupId}`
 > 对象，并要求桌面端再下发「数据库启动通道」状态（`zcode:database-startup-state`，phase=ready 且
 > startupId 对齐），否则界面停在「未能收到启动状态 / startup-channel-unavailable」。`web/bootstrap.js`
-> 现按渲染层版本自动二选一（<=3.11 裸字符串，>=3.12 对象+启动状态），`SHIM_MAX_SUPPORTED` 已提到 3.12.3。
+> 现按渲染层版本自动二选一（<=3.11 裸字符串，>=3.12 对象+启动状态）；不再设置固定的 shim 版本上限，升级后由 UI 启动校验和失败回滚兜底。
 >
 > 3.12 的 `zcode.cjs` 还需要 `<runtime>/agents/glm/provider/zcode-builtin.json`（官方只随桌面端分发），
 > 缺了它登录和 agent 都起不来；server 启动与 host 握手后会自动从 `~/.zcode/v2/runtime/provider/bundled/`

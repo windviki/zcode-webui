@@ -68,11 +68,8 @@ SITE_PAGES=(
 # DEFAULT_VERSION 保持一致。
 PINNED_VERSION="3.12.3"
 
-# shim 能驱动的最高官方版本（与 src/upgrade.mjs 的 SHIM_MAX_SUPPORTED 保持一致）。
-# 超过它的版本默认不升，只提示（显式 -v 可绕过，装完照样校验界面、起不来自动回滚）。
-# 3.12.x 已适配（启动通道 + 对象形式的服务端口消息，见 web/bootstrap.js），
-# 再往上的版本尚未验证，所以上限钉在 3.12.3。
-SHIM_MAX_SUPPORTED="3.12.3"
+# 3.12.x 已适配（启动通道 + 对象形式的服务端口消息，见 web/bootstrap.js）。
+# 后续版本不在这里设置固定上限；安装后由 UI 启动校验和失败回滚兜底。
 
 DATA_HOME="${ZCODE_WEBUI_HOME:-$SCRIPT_DIR}"
 RENDERER_DIR="$DATA_HOME/vendor/renderer"
@@ -128,7 +125,6 @@ EOF
 
 # ---------- 参数 ----------
 TARGET_VERSION=""
-EXPLICIT_TARGET=0
 ARCH=""
 MODE="full"           # full | renderer | server
 CHECK_ONLY=0
@@ -148,7 +144,7 @@ SERVICE_STOPPED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -v|--version)    TARGET_VERSION="${2:-}"; EXPLICIT_TARGET=1; shift 2 ;;
+    -v|--version)    TARGET_VERSION="${2:-}"; shift 2 ;;
     --arch)          ARCH="${2:-}"; shift 2 ;;
     --check)         CHECK_ONLY=1; shift ;;
     --stable)        STABLE_ONLY=1; shift ;;
@@ -621,13 +617,7 @@ if [[ "$STABLE_ONLY" == "1" ]]; then
 elif [[ -n "$site_v" && "$TARGET_VERSION" != "$site_v" ]] && version_gt "$TARGET_VERSION" "$site_v"; then
   log "（CDN 上已有比官网公告更新的构建，按 CDN 版本更新；--stable 可只跟官网版本）"
 fi
-# 超过 shim 支持范围的版本默认不升（显式 -v 或 --force 才装，且装完会校验界面）
-if [[ "$EXPLICIT_TARGET" == "0" && "$FORCE" == "0" ]] && version_gt "$TARGET_VERSION" "$SHIM_MAX_SUPPORTED"; then
-  warn "官方已发布 v$TARGET_VERSION，但本项目 shim 目前最高支持 v$SHIM_MAX_SUPPORTED（新版渲染层需要桌面端数据库启动通道），保持在 v$SHIM_MAX_SUPPORTED"
-  warn "要试新版本: $0 -v $TARGET_VERSION （装完会自动校验界面，起不来就回滚）"
-  TARGET_VERSION="$SHIM_MAX_SUPPORTED"
-  log "目标版本改为: $TARGET_VERSION"
-fi
+# 不设置固定 shim 版本上限；安装后由 UI 启动校验和失败回滚兜底。
 
 need_renderer=0; need_runtime=0
 if [[ "$MODE" != "server" ]]; then

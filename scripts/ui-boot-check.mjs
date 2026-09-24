@@ -5,10 +5,10 @@
 // Why this exists: protocol-level smoke tests (scripts/smoke-test.mjs) can pass while
 // the renderer itself refuses to start. Official renderers >= 3.12, for example, wait
 // for a desktop "database startup" channel (window message zcode:database-startup-state
-// + a MessagePort) that this project's shim does not provide, so the page renders a
-// "未能收到启动状态 / startup-channel-unavailable" failure screen — the bridge is fine,
-// the UI is dead. zcode-update.sh runs this gate after every update and reverts the
-// update when it fails.
+// + a MessagePort) that web/bootstrap.js provides for the browser shim. If that wiring
+// regresses, the page renders a "未能收到启动状态 / startup-channel-unavailable" failure
+// screen — the bridge can be fine while the UI is dead. zcode-update.sh runs this gate
+// after every update and reverts the update when it fails.
 //
 // Usage: node scripts/ui-boot-check.mjs [baseUrl] [screenshotPath]
 // Exit: 0 = app booted, 1 = failed gate, 3 = skipped (playwright-core or browser missing)
@@ -90,8 +90,8 @@ while (!gotoErr && Date.now() - started < TIMEOUT_MS) {
 const elapsed = ((Date.now() - started) / 1000).toFixed(1) + 's';
 if (SHOT) { try { writeFileSync(SHOT, await page.screenshot()); } catch (_e) { /* ignore */ } }
 
-// the official renderer's own startup-failure screen (e.g. 3.12 waiting for the
-// desktop database-startup channel this project cannot provide yet)
+// the official renderer's own startup-failure screen (e.g. if the browser shim
+// regresses and no longer supplies the desktop database-startup channel)
 const failureScreen = /未能收到启动状态|无法完成启动准备|startup-channel-unavailable/.exec(state.text || '');
 
 check('页面可加载', !gotoErr && state.rootHtmlLen >= 0, gotoErr || state.navError || '');

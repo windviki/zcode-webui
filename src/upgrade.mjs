@@ -40,16 +40,14 @@ export const CDN_BASE = 'https://cdn-zcode.z.ai/zcode/electron/releases';
 // the same value for standalone shell usage — keep the two in sync.
 export const DEFAULT_VERSION = '3.12.3';
 
-// Highest official release this shim is verified against. Official renderers >= 3.12
-// switched the service-port message to an object and additionally require the desktop
-// "database startup" channel (`zcode:database-startup-state`, phase=ready, startupId
-// matching the port's databaseStartupId) — implemented for both eras in
-// web/bootstrap.js. cmdUpgrade refuses to cross this line unless --force is given;
-// ./zcode-update.sh instead verifies the UI after installing and rolls back on failure.
+// Renderer compatibility is checked by the post-upgrade UI boot gate rather than
+// enforced by a fixed version ceiling. Official renderers >= 3.12 use the object
+// service-port message and the database startup channel; both eras are handled in
+// web/bootstrap.js. Keep the UI check in the update path so new releases can be
+// tried without baking an obsolete upper bound into the CLI.
 // NOTE for >= 3.12: model availability is resolved server-side against the account
 // entitlement, so an account without an active plan shows "当前没有可用模型" even though
 // everything else works (configure a provider/API key via 管理模型 in that case).
-export const SHIM_MAX_SUPPORTED = '3.12.3';
 
 // numeric dotted-version comparison: true when a is newer than b
 export function semverGt(a, b) {
