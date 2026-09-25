@@ -266,6 +266,38 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 3. **正确用法**：会话空闲（无挂起确认）时点输入框旁模式下拉 → 完全访问。该会话即不再问，
    同工作区**新会话**在该设备默认继承 yolo。老会话/其它设备需各自切一次。
 
+## 模式快车道（mode-boost，2026-09-25）
+
+接上节：build 模式的多步任务里用户被锁死在「逐条允许」循环——2026-09-25 真浏览器实测
+（3 条写命令 = 3 张卡，允许后 **2~5 秒**内下一张卡就把输入区再次替换），**模式下拉在整个回合中
+几乎无窗口可点**；而 agent 侧其实即时生效（v4 `switchCollaborationMode` 处理器就是
+`await app.setMode(mode)`，且**每个 tool call 权限评估实时读 `app.getMode()`**，
+`mode==="yolo"` 直接放行 "Yolo mode bypasses permission prompts"）。瓶颈只在「切换意图传不到 agent」。
+
+处置（默认开启，无需 env）：
+
+- **`src/mode-boost.mjs`**：构造 `zcode-task` 通道的 `setMode` 调用（args 单元素数组
+  `[{taskId, mode}]`，与 setTaskPinned 同通道同形状；宿主内部 `switchCollaborationModeViaProtocol`
+  → v4 命令 + CAS stale 重试 → agent `app.setMode`）。附带 `scanCommandSessionId`/
+  `scanTopicSessionId`（从渲染层命令 envelope / 宿主 conversation topic 帧里提取当前活跃会话，
+  512KB 预筛 + 字节 indexOf，不做全量 JSON.parse）。
+- **server**（`src/server.mjs`）：`writeToHost`/`routeDownstream` 记录 `activeConvSession`/
+  `lastTopicSession`；新端点 `POST /api/mode-boost {mode, taskId?}`——mode 收渲染层全值域
+  + 中文标签（`normalizeBoostMode`），缺省 taskId 用最近活跃会话；注入调用用独立 id 段
+  （`0x60000000+`，mux pending 登记 `injected` 标记，响应回来记日志即丢，不路由给 view）。
+- **桥**（`web/zcode-bridge.js`）：右下角常驻「⚡ 切完全访问」开关（localStorage 记忆）。
+  **ON** → POST `/api/mode-boost {mode:'yolo'}`（不经过官方 composer，权限卡挂起时也能点）→
+  成功后立即替用户点掉挂起卡的「允许(仅允许这一次)」按钮（找按钮：innerText 规整后
+  含 `允许仅允许这一次` 且不含 `始终`/`本会话`——**卡上按钮带 "1." 序号前缀**，按开头匹配会漏），
+  并用 MutationObserver（350ms 节流）自动放行 ON 期间漏网的新卡（覆盖 setMode 生效前的亚秒竞态）。
+  **OFF** → 把官方下拉当前显示的模式推给 agent，停止自动放行。官方下拉照常工作，
+  仍是**下一个 prompt** 会话配置的权威来源；开关只是「让当前回合立即生效」的加速器。
+- **注意**：自动放行仅在用户显式点开⚡后生效、点 OFF 即停，语义等同官方 yolo（无差别放行），
+  日志 `[mode-boost] pushed/auto-allowed` 可审计。server 侧改动要重启服务才生效（桥部分刷新即可）。
+- 自检：`node scripts/dev/mode-boost-test.mjs`（45 项离线）；重启后
+  `node scripts/dev/mode-boost-verify.mjs`（真浏览器 e2e：build 任务 → 第 1 张卡挂起时点⚡ →
+  断言卡自动放行、后续零卡、三文件写齐、tasks 表 mode=yolo）。
+
 ## 重置机会自动使用（quota-reset-guard，2026-09-18；口径修复 2026-09-19）
 
 官方编程套餐偶尔发放「重置额度」机会（5 小时池 / 周额度各一种，`/api/v1/coding-plan/reset/status`

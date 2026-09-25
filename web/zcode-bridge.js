@@ -360,6 +360,140 @@
   function val(v) { return function () { return Promise.resolve(v); }; }
   function unsupported() { return Promise.reject(new Error('not supported in zcode-webui')); }
 
+  // ---- mode boost (⚡ 完全访问 fast-lane) ----
+  // While a permission card is pending the official renderer REPLACES the
+  // composer, so the mode dropdown is not in the DOM and a build-mode
+  // multi-step turn locks the user into clicking 允许 for every step. The
+  // agent, however, applies mode changes instantly (every tool call re-reads
+  // the live mode), so a push through the backend takes effect on the very
+  // NEXT step. This floating switch:
+  //   ON  → POST /api/mode-boost {mode:'yolo'} (host → v4 switchCollaboration
+  //         Mode → agent setMode), auto-allow the pending card, and keep
+  //         auto-allowing cards that slip through the sub-second race;
+  //   OFF → push whatever the official dropdown currently shows and stop
+  //         auto-allowing.
+  // The official dropdown keeps working and stays authoritative for the NEXT
+  // prompt's session config; this switch is an accelerator, not a replacement.
+  var BOOST_KEY = 'zwebui-mode-boost';
+  var boostOn = false;
+  try { boostOn = localStorage.getItem(BOOST_KEY) === 'yolo'; } catch (e) { /* ignore */ }
+  var boostBtn = null;
+
+  function findAllowOnceButton() {
+    var btns = document.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) {
+      var t = (btns[i].innerText || '').replace(/\s+/g, '');
+      // matches "1.\n允许\n仅允许这一次"; excludes 始终允许… / 允许本会话
+      if (t.indexOf('允许仅允许这一次') >= 0 && t.indexOf('始终') < 0 && t.indexOf('本会话') < 0) return btns[i];
+    }
+    return null;
+  }
+  function autoAllowPendingCard(reason) {
+    var b = findAllowOnceButton();
+    if (!b) return false;
+    try { b.click(); } catch (e) { return false; }
+    try { console.info('[zcode-webui] mode-boost: auto-allowed pending card (' + reason + ')'); } catch (e) {}
+    return true;
+  }
+  function officialPickerMode() {
+    try {
+      var b = document.querySelector('button[aria-label="切换模式"]');
+      var t = b ? (b.innerText || '').trim() : '';
+      if (t === '完全访问') return 'yolo';
+      if (t === '自动编辑') return 'edit';
+      if (t === '计划模式') return 'plan';
+    } catch (e) { /* ignore */ }
+    return 'build';
+  }
+  function postModeBoost(mode) {
+    return fetch(pageUrl('api/mode-boost'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: mode }),
+    }).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); });
+  }
+
+  function ensureBoostButton() {
+    if (boostBtn) return;
+    try {
+      var css = ''
+        + '.zwebui-boost{position:fixed;right:18px;bottom:18px;z-index:99999;display:inline-flex;align-items:center;gap:6px;'
+        + 'padding:7px 14px;border:1px solid var(--color-border,#2c3138);border-radius:999px;'
+        + 'background:var(--color-surface,#1a1e23);color:var(--color-foreground,#e8eaed);'
+        + 'font:600 12px/1 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;cursor:pointer;'
+        + 'box-shadow:0 6px 24px rgba(0,0,0,.35);user-select:none;}'
+        + '.zwebui-boost:hover{background:var(--color-surface-hover,#262b31);}'
+        + '.zwebui-boost.on{border-color:rgba(84,214,138,.6);background:rgba(84,214,138,.14);color:#63d68f;}'
+        + '.zwebui-boost.err{border-color:rgba(255,99,99,.7);color:#ff8a8a;}'
+        + '.zwebui-boost .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;}';
+      var st = document.createElement('style');
+      st.textContent = css;
+      (document.head || document.documentElement).appendChild(st);
+      boostBtn = document.createElement('button');
+      boostBtn.type = 'button';
+      boostBtn.className = 'zwebui-boost';
+      var dot = document.createElement('span');
+      dot.className = 'dot';
+      var lbl = document.createElement('span');
+      boostBtn.appendChild(dot);
+      boostBtn.appendChild(lbl);
+      boostBtn.__lbl = lbl;
+      (document.body || document.documentElement).appendChild(boostBtn);
+      boostBtn.addEventListener('click', function () { setBoost(!boostOn, true); });
+      renderBoostButton();
+    } catch (e) { boostBtn = null; }
+  }
+  function renderBoostButton(errText) {
+    if (!boostBtn) return;
+    boostBtn.className = 'zwebui-boost' + (boostOn ? ' on' : errText ? ' err' : '');
+    boostBtn.__lbl.textContent = boostOn ? '⚡ 完全访问 已生效' : '⚡ 切完全访问';
+    boostBtn.title = boostOn
+      ? '当前会话已是完全访问：等待中的确认自动放行，后续步骤不再逐条询问。点击切回。'
+      : (errText || '立即把「完全访问」推送给当前会话——不用等任务空闲；等待中的确认会自动放行，后续步骤不再逐条询问。');
+  }
+  function setBoost(next, userAction) {
+    boostOn = !!next;
+    try { localStorage.setItem(BOOST_KEY, boostOn ? 'yolo' : ''); } catch (e) { /* ignore */ }
+    renderBoostButton();
+    var mode = boostOn ? 'yolo' : officialPickerMode();
+    postModeBoost(mode).then(function (r) {
+      if (r.j && r.j.ok) {
+        renderBoostButton();
+        if (boostOn) autoAllowPendingCard('switch-on');
+      } else {
+        renderBoostButton((r.j && r.j.error) || ('HTTP ' + r.status));
+        setTimeout(renderBoostButton, 4000);
+      }
+    }).catch(function (e) {
+      renderBoostButton(String(e && e.message || e));
+      setTimeout(renderBoostButton, 4000);
+    });
+    if (!boostOn && userAction) { /* nothing else to do when turning off */ }
+  }
+
+  // Auto-allow while ON: covers cards raised inside the sub-second window
+  // before the agent applies the pushed mode. Throttled body observer.
+  var boostScanTimer = 0;
+  function scheduleBoostScan() {
+    if (!boostOn || boostScanTimer) return;
+    boostScanTimer = setTimeout(function () {
+      boostScanTimer = 0;
+      if (boostOn) autoAllowPendingCard('observer');
+    }, 350);
+  }
+  function installModeBoost() {
+    var boot = function () {
+      ensureBoostButton();
+      try {
+        new MutationObserver(scheduleBoostScan).observe(document.body, { childList: true, subtree: true });
+      } catch (e) { /* ignore */ }
+      if (boostOn) autoAllowPendingCard('page-load');
+    };
+    if (document.body) boot();
+    else document.addEventListener('DOMContentLoaded', boot);
+  }
+  installModeBoost();
+
   var api = {
     // identity / lifecycle
     getDeviceId: val(DEVICE_ID),

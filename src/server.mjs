@@ -16,6 +16,7 @@ import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
 import { interceptPinRpc, pinAckFor } from './pin.mjs';
+import { buildSetModeCall, normalizeBoostMode, scanCommandSessionId, scanTopicSessionId, INJECTED_ID_BASE } from './mode-boost.mjs';
 import { spawnHost, handshake, resolveServerRoot, ensureCliProviderConfig } from './host.mjs';
 import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
@@ -824,6 +825,13 @@ function writeToHost(session, view, payload) {
     return true;
   }
   if (process.env.ZCODE_WEBUI_DEBUG_RPC === '1') rpcLogIn(payload);
+  // mode-boost bookkeeping: remember which conversation the renderer is
+  // actively driving (every v4 conversation command carries a sessionId) so a
+  // mode push has the right target even mid-turn
+  {
+    const cmdSid = scanCommandSessionId(payload);
+    if (cmdSid) session.activeConvSession = cmdSid;
+  }
   {
     const pinnedCall = interceptPinRpc(payload);
     if (pinnedCall) {
@@ -889,6 +897,24 @@ function removeSession(session) {
   sessions.delete(session.userKey);
 }
 
+// Push a collaboration-mode change for one conversation straight to the host,
+// shaped exactly like a renderer call (see src/mode-boost.mjs for why the
+// official dropdown cannot do this mid-turn). Returns the global id used, or
+// null when the host pipe is gone.
+function injectModeBoost(session, taskId, mode) {
+  if (!session || session.closed || !session.mux || !session.child || session.child.exitCode !== null) return null;
+  const gid = INJECTED_ID_BASE + (++session.injectedNext);
+  session.mux.pending.set(gid, { view: null, origId: gid, at: Date.now(), injected: true });
+  try {
+    session.child.stdin.write(encodeFrame(buildSetModeCall(gid, taskId, mode)));
+  } catch (_e) {
+    session.mux.pending.delete(gid);
+    return null;
+  }
+  console.error('[mode-boost] pushed mode=' + mode + ' task=' + taskId + ' (gid=' + gid + ')');
+  return gid;
+}
+
 // Per-view snapshot for observability endpoints
 function viewsSnapshot(session, exceptTab) {
   const now = Date.now();
@@ -922,6 +948,12 @@ function terminateSession(session, reason) {
 // broadcast to every view.
 function routeDownstream(session, payload) {
   const hdr = session.mux ? decodeRpcHeader(payload) : null;
+  // mode-boost bookkeeping: the host streams conversation topic frames for
+  // the active dialogue — a fallback target for a mode push
+  {
+    const topicSid = scanTopicSessionId(payload);
+    if (topicSid) session.lastTopicSession = topicSid;
+  }
   if (hdr && (hdr.type === 201 || hdr.type === 202 || hdr.type === 203)) {
     const entry = session.mux.pending.get(hdr.id);
     if (!entry) {
@@ -933,6 +965,14 @@ function routeDownstream(session, payload) {
       return;
     }
     session.mux.pending.delete(hdr.id);
+    // responses to calls this server injected itself (mode-boost): log the
+    // ack and stop — there is no view to route them to
+    if (entry.injected) {
+      const ok = hdr.type === 201;
+      console.error('[mode-boost] host ' + (ok ? 'acked' : 'rejected') + ' ' + hdr.channel + '.' + hdr.method +
+        ' globalId=' + hdr.id + ' bodyBytes=' + payload.length);
+      return;
+    }
     entry.view.sent.delete(hdr.id);
     sendToView(session, entry, hdr, payload);
     return;
@@ -1032,6 +1072,9 @@ async function createSession(userKey, tabId) {
     firstDownstream: null, initForwarded: false,
     resumeBuf: [], resumeMode: false,
     mux: MUX_ENABLED ? makeMux() : null,
+    activeConvSession: '',                  // mode-boost: sessionId from the latest renderer conversation command
+    lastTopicSession: '',                   // mode-boost: sessionId from the latest conversation topic frame
+    injectedNext: 0,                        // mode-boost: counter for server-injected host calls
   };
   console.error('[zcode-webui] host spawned pid=' + child.pid + ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
   sessions.set(userKey, session);
@@ -1444,6 +1487,31 @@ function handleRequest(req, res) {
       background = [{ pid: sess.child.pid, lastFrameAgeSec: Math.round((Date.now() - sess.lastFrameAt) / 1000) }];
     }
     return sendJson(res, 200, { activeCount: background.length, hosts: background });
+  }
+
+  // instant collaboration-mode push for the conversation the user is looking
+  // at (see src/mode-boost.mjs): POST {mode:'yolo'|'完全访问'|…, taskId?}.
+  // The host maps the mode and runs the v4 switchCollaborationMode command
+  // with its own CAS retry, so the agent applies it on the very next step.
+  if (urlPath === '/api/mode-boost' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 16384) req.destroy(); });
+    req.on('end', () => {
+      let j = {};
+      try { j = JSON.parse(body || '{}'); } catch (_e) {}
+      const mode = normalizeBoostMode(j.mode);
+      if (!mode) return sendJson(res, 400, { ok: false, error: 'unsupported mode ' + JSON.stringify(j.mode) });
+      const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+      const sess = sessions.get(resolveUserKey(clientKey));
+      if (!sess || sess.closed) return sendJson(res, 503, { ok: false, error: 'no host session (open the app first)' });
+      const taskId = typeof j.taskId === 'string' && j.taskId.startsWith('sess_') && j.taskId.length < 128
+        ? j.taskId : (sess.activeConvSession || sess.lastTopicSession || '');
+      if (!taskId) return sendJson(res, 409, { ok: false, error: 'no active conversation yet (send a prompt first)' });
+      const gid = injectModeBoost(sess, taskId, mode);
+      if (!gid) return sendJson(res, 502, { ok: false, error: 'host pipe unavailable' });
+      return sendJson(res, 200, { ok: true, taskId, mode, gid });
+    });
+    return;
   }
 
   // import credentials (e.g. exported from an already-logged-in ZCode desktop)
