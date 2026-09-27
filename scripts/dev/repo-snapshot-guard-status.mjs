@@ -56,6 +56,15 @@ let bundle = null;
 try { bundle = fs.readFileSync(bundlePath, 'utf8'); } catch (_e) { /* handled below */ }
 if (!bundle) {
   console.log('  WARN  cannot read the runtime bundle');
+} else if (!['repoSnapshot', 'captureBeforePrompt', '/api/v1/snapshot/upload-credential', 'repo-snapshot.tar.gz.enc']
+    .some((m) => bundle.includes(m))) {
+  // Verified on 3.14.3 (2026-09-27): the vendor REMOVED the whole silent
+  // workspace-snapshot pipeline — repoSnapshot/captureBeforePrompt/openAsBlob/
+  // repo-snapshot.tar.gz.enc all absent from zcode-server.cjs and zcode.cjs
+  // (the two remaining upload-credential hits belong to feedback attachments).
+  // No capture code => nothing to hook: report OK instead of a wall of
+  // "pattern not found" WARNs that would force a pointless rollback.
+  console.log('  OK    snapshot capture code absent from the runtime — vendor removed the feature; the guard has nothing to hook (harmless if still preloaded)');
 } else {
   const hooks = [
     ['credential endpoint /api/v1/snapshot/upload-credential', bundle.includes('/api/v1/snapshot/upload-credential')],
