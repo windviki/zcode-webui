@@ -413,18 +413,68 @@
     }).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); });
   }
 
+  // ---- position / drag ----
+  // Default berth: just OUTSIDE the top-right corner of the composer surface
+  // (.chat-composer-input-surface — the input window). While not dragged the
+  // button keeps following the composer (sidebar collapse / window resize);
+  // once dragged to a custom spot the position is remembered. Dragging it
+  // back near the berth re-docks it (custom position forgotten).
+  var BOOST_POS_KEY = 'zwebui-mode-boost-pos';
+  var boostDragged = false;
+
+  function boostAnchorRect() {
+    var el = document.querySelector('.chat-composer-input-surface')
+      || document.querySelector('[data-testid="v4-composer-input"]');
+    if (!el) return null;
+    var r = el.getBoundingClientRect();
+    return r.width >= 60 ? r : null;
+  }
+  // The berth coordinates (view-space) for the composer's top-right outside edge.
+  function boostBerth() {
+    var r = boostAnchorRect();
+    var vw = window.innerWidth || 1200, vh = window.innerHeight || 800;
+    var w = boostBtn.offsetWidth || 120, h = boostBtn.offsetHeight || 30;
+    if (!r) return { x: vw - w - 16, y: vh - h - 72 };
+    var x = r.right + 10, y = r.top + 2;
+    if (x + w > vw - 8) {                 // narrow viewport: no room outside the edge —
+      x = Math.max(8, r.right - w);       // sit above the composer's right corner instead
+      y = r.top - h - 8;
+      if (y < 8) { x = r.right + 10; y = r.top + 2; }
+    }
+    return { x: x, y: y };
+  }
+  function placeBoost(x, y) {
+    var vw = window.innerWidth || 1200, vh = window.innerHeight || 800;
+    var w = boostBtn.offsetWidth || 120, h = boostBtn.offsetHeight || 30;
+    x = Math.min(Math.max(4, x), Math.max(4, vw - w - 4));
+    y = Math.min(Math.max(4, y), Math.max(4, vh - h - 4));
+    var ls = Math.round(x) + 'px', ts = Math.round(y) + 'px';
+    if (boostBtn.style.left !== ls) boostBtn.style.left = ls;   // no-op writes keep the node
+    if (boostBtn.style.top !== ts) boostBtn.style.top = ts;     // stable for playwright checks
+  }
+  function savedBoostPos() {
+    try {
+      var s = (localStorage.getItem(BOOST_POS_KEY) || '').split(',');
+      var x = parseFloat(s[0]), y = parseFloat(s[1]);
+      if (isFinite(x) && isFinite(y)) return { x: x, y: y };
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function dockBoost() { var b = boostBerth(); placeBoost(b.x, b.y); }
+
   function ensureBoostButton() {
     if (boostBtn) return;
     try {
       var css = ''
-        + '.zwebui-boost{position:fixed;right:18px;bottom:18px;z-index:99999;display:inline-flex;align-items:center;gap:6px;'
+        + '.zwebui-boost{position:fixed;z-index:99999;display:inline-flex;align-items:center;gap:6px;'
         + 'padding:7px 14px;border:1px solid var(--color-border,#2c3138);border-radius:999px;'
         + 'background:var(--color-surface,#1a1e23);color:var(--color-foreground,#e8eaed);'
-        + 'font:600 12px/1 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;cursor:pointer;'
-        + 'box-shadow:0 6px 24px rgba(0,0,0,.35);user-select:none;}'
+        + 'font:600 12px/1 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;cursor:grab;'
+        + 'box-shadow:0 6px 24px rgba(0,0,0,.35);user-select:none;-webkit-user-select:none;touch-action:none;}'
         + '.zwebui-boost:hover{background:var(--color-surface-hover,#262b31);}'
         + '.zwebui-boost.on{border-color:rgba(84,214,138,.6);background:rgba(84,214,138,.14);color:#63d68f;}'
         + '.zwebui-boost.err{border-color:rgba(255,99,99,.7);color:#ff8a8a;}'
+        + '.zwebui-boost.dragging{cursor:grabbing;opacity:.88;box-shadow:0 12px 32px rgba(0,0,0,.5);}'
         + '.zwebui-boost .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;}';
       var st = document.createElement('style');
       st.textContent = css;
@@ -439,17 +489,74 @@
       boostBtn.appendChild(lbl);
       boostBtn.__lbl = lbl;
       (document.body || document.documentElement).appendChild(boostBtn);
-      boostBtn.addEventListener('click', function () { setBoost(!boostOn, true); });
+      installBoostDrag();
       renderBoostButton();
+      var saved = savedBoostPos();
+      if (saved) { boostDragged = true; placeBoost(saved.x, saved.y); }
+      else dockBoost();
+      // keep the berth (or the clamped custom spot) correct as the layout moves
+      setInterval(function () {
+        if (!boostBtn) return;
+        if (!boostDragged) dockBoost();
+        else placeBoost(parseFloat(boostBtn.style.left) || 0, parseFloat(boostBtn.style.top) || 0);
+      }, 500);
     } catch (e) { boostBtn = null; }
+  }
+  // Pointer-based drag; a press-release without a 5px move counts as a click
+  // (toggles the boost). Dropping within 24px of the berth re-docks the button.
+  function installBoostDrag() {
+    var drag = null;
+    boostBtn.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      drag = {
+        id: e.pointerId, sx: e.clientX, sy: e.clientY,
+        bx: parseFloat(boostBtn.style.left) || 0, by: parseFloat(boostBtn.style.top) || 0,
+        moved: false,
+      };
+      try { boostBtn.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      e.preventDefault();
+    });
+    boostBtn.addEventListener('pointermove', function (e) {
+      if (!drag || e.pointerId !== drag.id) return;
+      var dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+      if (!drag.moved) {
+        if (dx * dx + dy * dy < 25) return;      // 5px threshold: still a click
+        drag.moved = true;
+        boostDragged = true;
+        boostBtn.classList.add('dragging');
+      }
+      placeBoost(drag.bx + dx, drag.by + dy);
+    });
+    var finish = function (e) {
+      if (!drag || (e.pointerId !== undefined && e.pointerId !== drag.id)) return;
+      var moved = drag.moved;
+      drag = null;
+      boostBtn.classList.remove('dragging');
+      try { boostBtn.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      if (moved) {
+        var berth = boostBerth();
+        var cx = parseFloat(boostBtn.style.left) || 0, cy = parseFloat(boostBtn.style.top) || 0;
+        if (Math.abs(cx - berth.x) <= 24 && Math.abs(cy - berth.y) <= 24) {
+          boostDragged = false;                  // dropped back on the berth: re-dock
+          try { localStorage.removeItem(BOOST_POS_KEY); } catch (err) { /* ignore */ }
+          dockBoost();
+          return;
+        }
+        try { localStorage.setItem(BOOST_POS_KEY, Math.round(cx) + ',' + Math.round(cy)); } catch (err) { /* ignore */ }
+      } else {
+        setBoost(!boostOn, true);
+      }
+    };
+    boostBtn.addEventListener('pointerup', finish);
+    boostBtn.addEventListener('pointercancel', finish);
   }
   function renderBoostButton(errText) {
     if (!boostBtn) return;
     boostBtn.className = 'zwebui-boost' + (boostOn ? ' on' : errText ? ' err' : '');
     boostBtn.__lbl.textContent = boostOn ? '⚡ 完全访问 已生效' : '⚡ 切完全访问';
     boostBtn.title = boostOn
-      ? '当前会话已是完全访问：等待中的确认自动放行，后续步骤不再逐条询问。点击切回。'
-      : (errText || '立即把「完全访问」推送给当前会话——不用等任务空闲；等待中的确认会自动放行，后续步骤不再逐条询问。');
+      ? '当前会话已是完全访问：等待中的确认自动放行，后续步骤不再逐条询问。点击切回；可拖动。'
+      : (errText || '立即把「完全访问」推送给当前会话——不用等任务空闲；等待中的确认会自动放行，后续步骤不再逐条询问。可拖动，拖回输入框右上角即恢复停靠。');
   }
   function setBoost(next, userAction) {
     boostOn = !!next;
