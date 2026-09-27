@@ -38,7 +38,7 @@ export const CDN_BASE = 'https://cdn-zcode.z.ai/zcode/electron/releases';
 // Pinned fallback when the website cannot be reached. JS callers import this so
 // the default never drifts between modules; scripts/fetch-renderer.sh carries
 // the same value for standalone shell usage — keep the two in sync.
-export const DEFAULT_VERSION = '3.12.3';
+export const DEFAULT_VERSION = '3.14.3';
 
 // Highest official release this shim is verified against. Official renderers >= 3.12
 // switched the service-port message to an object and additionally require the desktop

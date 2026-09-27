@@ -14,7 +14,7 @@
 #      ZCODE_URL (override the .deb URL), ZCODE_WEBUI_HOME (data home override).
 set -euo pipefail
 
-VERSION="${ZCODE_VERSION:-3.12.3}"
+VERSION="${ZCODE_VERSION:-3.14.3}"
 ARCH="${ZCODE_ARCH:-x64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ZCODE_WEBUI_HOME redirects all mutable state away from the package directory

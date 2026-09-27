@@ -86,7 +86,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # 运行时依赖只有 ws
 
 npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取界面
-                                       # （默认 3.12.3，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
+                                       # （默认 3.14.3，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
 
 cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
@@ -166,7 +166,7 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.12.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.14.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | 回收条件之一：最近该时长内无 host→浏览器帧 |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | 回收的全局保险：索引里有窗口内的 running 任务时不回收任何会话 |
