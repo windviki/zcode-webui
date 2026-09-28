@@ -285,7 +285,9 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   `lastTopicSession`；新端点 `POST /api/mode-boost {mode, taskId?}`——mode 收渲染层全值域
   + 中文标签（`normalizeBoostMode`），缺省 taskId 用最近活跃会话；注入调用用独立 id 段
   （`0x60000000+`，mux pending 登记 `injected` 标记，响应回来记日志即丢，不路由给 view）。
-- **桥**（`web/zcode-bridge.js`）：右下角常驻「⚡ 切完全访问」开关（localStorage 记忆）。
+- **桥**（`web/zcode-bridge.js`）：输入框右上角外缘的浮动面板（可整体拖动/回停靠，localStorage 记忆位置），
+  内含两枚 chip：**⚡ 切完全访问**（localStorage 记忆，即本节主角）与 **♻ 自动重置**
+  （quota-reset 守卫的 UI 开关，状态在服务端，见「重置机会自动使用」一节）。
   **ON** → POST `/api/mode-boost {mode:'yolo'}`（不经过官方 composer，权限卡挂起时也能点）→
   成功后立即替用户点掉挂起卡的「允许(仅允许这一次)」按钮（找按钮：innerText 规整后
   含 `允许仅允许这一次` 且不含 `始终`/`本会话`——**卡上按钮带 "1." 序号前缀**，按开头匹配会漏），
@@ -327,16 +329,21 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   池余量）；捕获运行时请求里的双 JWT 头（`Authorization` + `X-Bigmodel-Authorization` + scope 头）
   **重放**给自己发起的只读 `/status` 轮询（10min 一次）与 `/use`（uuid 幂等键，用后轮询确认）。
   凭据不落盘。子进程（agent）把「配额耗尽」写成带 scope 的信号行，宿主每 tick 收取。
-- **开关**：`ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off`（默认 on；dry-run 只记录决策不发请求）。
-  其余阈值 env 见文件头（比例/过期窗口/冷却/日上限/头最大年龄/活跃窗口/余额新鲜度/
+- **开关（2026-09-28 改为 UI 开关，默认关）**：⚡ 浮窗里的「♻ 自动重置」chip——
+  `GET/POST /api/quota-reset {mode:'on'|'off'|'dry-run'}`，server 原子写
+  `<dataHome>/data/guard-stats/quota-reset-switch.json`，宿主里的守卫每 ≤10s 轮询该文件，
+  **运行中即时生效，无需重启/重拉宿主**（守卫现在即使 off 也照常装载，就是为了让开关能随时唤醒它）。
+  优先级：开关文件 > env `ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off`（仅作无开关文件时的基线，默认 off）。
+  `/api/health` → `guards.quotaReset.switch` 显示意图状态、`mode` 显示守卫实际生效模式。其余阈值 env 见文件头
+  （比例/过期窗口/冷却/日上限/头最大年龄/活跃窗口/余额新鲜度/
   信号有效期 `_EXHAUSTION_SIGNAL_MS`/自然重置地板 `_NATURAL_RESET_FLOOR_*`/`_DRY_IDLE`）。
 - **观测**：stderr `[zcode-webui] quota-reset-guard:`（决策行带 chances / pools 已用% / busy）；
   状态 JSON 在 `<dataHome>/data/guard-stats/quota-reset-guard.json`，`/api/health` → `guards.quotaReset`
   （机会数、两池 `usedPct/remaining/naturalResetAt`、信号时间、最近决策、当日使用次数、busy）。
 - **注意**：授权头只能从运行时真实请求捕获——**界面长期不打开时头会过期**（默认 12h 窗口），
   引擎会安全停摆并在日志说明；打开一次页面即恢复。`dry-run` 先跑一段时间观察决策是否符合预期
-  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（61 项，全离线 mock，
-  绝不触真实 API；含 2026-09-19 线上真实 payload 与 429 撞墙回放）。
+  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（70 项，全离线 mock，
+  绝不触真实 API；含 2026-09-19 线上真实 payload 与 429 撞墙回放、开关文件优先级与运行中唤醒）。
 - **2026-09-19 事故复盘**：周额度撞墙（`[1310]您已达到每周/每月使用上限…2026-09-22 21:55 重置`），
   手上 1 个周机会（10-18 到期）+ 1 个 5h 机会全没用，服务停摆 3.6 天。三个叠加原因：
   ①`remaining ÷ number` 口径错 → 撞墙前池看着「200% 健康」，≤5% 规则形同虚设；

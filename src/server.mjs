@@ -7,7 +7,7 @@
 // ZCODE_WEBUI_OAUTH_PROXY, ZCODE_SERVER_RUNTIME_ROOT.
 
 import http from 'node:http';
-import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, truncateSync, writeFileSync } from 'node:fs';
+import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -625,11 +625,30 @@ const poolSnapshot = (b) => (!b ? null : {
   remaining: b.remaining ?? null, total: b.total ?? null,
   naturalResetAt: b.expiresAt ?? null, src: b.src || null, at: b.at ?? null,
 });
+// quota-reset runtime switch (the ♻ chip in the boost panel): a tiny JSON file
+// in the shared guard-stats dir. The guard preloaded into every host process
+// re-reads it within ~10s, so a flip reaches running hosts without a respawn.
+// The file outranks the env baseline (ZCODE_WEBUI_QUOTA_RESET, default off).
+const QUOTA_RESET_SWITCH_FILE = path.join(PATHS.dataHome, 'data', 'guard-stats', 'quota-reset-switch.json');
+const QUOTA_RESET_MODES = new Set(['on', 'dry-run', 'off']);
+function quotaResetSwitchState() {
+  try {
+    const j = JSON.parse(readFileSync(QUOTA_RESET_SWITCH_FILE, 'utf8'));
+    const m = typeof j.mode === 'string' ? j.mode.trim().toLowerCase() : '';
+    if (QUOTA_RESET_MODES.has(m)) return { mode: m, at: j.at || null, source: 'switch' };
+  } catch (_e) { /* not written yet / unreadable → fall back to the env baseline */ }
+  const env = (process.env.ZCODE_WEBUI_QUOTA_RESET || '').trim().toLowerCase();
+  return QUOTA_RESET_MODES.has(env)
+    ? { mode: env, at: null, source: 'env' }
+    : { mode: 'off', at: null, source: 'default' };
+}
+
 function quotaResetSnapshot() {
   try {
     const j = JSON.parse(readFileSync(path.join(PATHS.dataHome, 'data', 'guard-stats', 'quota-reset-guard.json'), 'utf8'));
     return {
       mode: j.mode || null, at: j.at || null,
+      switch: quotaResetSwitchState(),
       chances: {
         fiveHour: j.status ? (j.status.fiveHourResets || []).length : null,
         week: j.status ? (j.status.weekResets || []).length : null,
@@ -1510,6 +1529,38 @@ function handleRequest(req, res) {
       const gid = injectModeBoost(sess, taskId, mode);
       if (!gid) return sendJson(res, 502, { ok: false, error: 'host pipe unavailable' });
       return sendJson(res, 200, { ok: true, taskId, mode, gid });
+    });
+    return;
+  }
+
+  // quota-reset auto-use switch (the ♻ chip next to the ⚡ one): the guard
+  // preloaded in every host process polls the switch file, so flipping it takes
+  // effect within seconds and needs no restart. GET reports the state the hosts
+  // will resolve; POST {mode:'on'|'off'|'dry-run'} (or {enabled:boolean}) writes it.
+  if (urlPath === '/api/quota-reset' && req.method === 'GET') {
+    return sendJson(res, 200, { ok: true, ...quotaResetSwitchState() });
+  }
+  if (urlPath === '/api/quota-reset' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      let j = {};
+      try { j = JSON.parse(body || '{}'); } catch (_e) {}
+      let mode = typeof j.mode === 'string' ? j.mode.trim().toLowerCase() : '';
+      if (!mode && typeof j.enabled === 'boolean') mode = j.enabled ? 'on' : 'off';
+      if (!QUOTA_RESET_MODES.has(mode)) {
+        return sendJson(res, 400, { ok: false, error: 'unsupported mode ' + JSON.stringify(j.mode) + ' (on|off|dry-run)' });
+      }
+      try {
+        mkdirSync(path.dirname(QUOTA_RESET_SWITCH_FILE), { recursive: true });
+        const tmp = QUOTA_RESET_SWITCH_FILE + '.tmp';
+        writeFileSync(tmp, JSON.stringify({ at: Date.now(), mode, by: 'ui' }) + '\n');
+        renameSync(tmp, QUOTA_RESET_SWITCH_FILE);
+        console.error('[quota-reset] switch → ' + mode + ' (ui)');
+      } catch (e) {
+        return sendJson(res, 500, { ok: false, error: String(e && e.message || e) });
+      }
+      return sendJson(res, 200, { ok: true, ...quotaResetSwitchState() });
     });
     return;
   }

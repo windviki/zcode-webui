@@ -379,6 +379,16 @@
   try { boostOn = localStorage.getItem(BOOST_KEY) === 'yolo'; } catch (e) { /* ignore */ }
   var boostBtn = null;
 
+  // ---- quota-reset switch (♻ 自动重置) ----
+  // Same floating panel, second chip. Unlike the ⚡ switch this one is
+  // SERVER-state (not localStorage): POST /api/quota-reset writes a switch file
+  // the host-side guard re-reads within seconds, so the state follows the
+  // service, not the browser. Default OFF — auto-spending reset chances is
+  // strictly opt-in.
+  var qresetBtn = null;
+  var qresetOn = false;
+  var qresetBusy = false;
+
   function findAllowOnceButton() {
     var btns = document.querySelectorAll('button');
     for (var i = 0; i < btns.length; i++) {
@@ -412,15 +422,63 @@
       body: JSON.stringify({ mode: mode }),
     }).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); });
   }
+  function postQuotaReset(mode) {
+    return fetch(pageUrl('api/quota-reset'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: mode }),
+    }).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); });
+  }
+  function loadQuotaReset() {
+    fetchJson(pageUrl('api/quota-reset')).then(function (j) {
+      if (!j || !j.ok || qresetBusy || !qresetBtn) return;
+      qresetOn = j.mode === 'on';
+      renderQresetButton();
+    }).catch(function () { /* chip stays neutral until first click */ });
+  }
+  function renderQresetButton(errText) {
+    if (!qresetBtn) return;
+    qresetBtn.className = 'zwebui-qreset' + (qresetOn ? ' on' : errText ? ' err' : '');
+    qresetBtn.__lbl.textContent = qresetOn ? '♻ 自动重置 已开启' : '♻ 自动重置';
+    qresetBtn.title = qresetOn
+      ? '宿主进程会在「池子快用完且有任务在跑 / 刚撞额度墙 / 机会快过期」时自动使用编程套餐的重置机会。点击关闭；可拖动。'
+      : (errText || '开启后，宿主进程在池子快用完、任务被额度卡住或机会即将过期时自动使用「重置额度」机会。默认关闭；点击开启；可拖动。');
+  }
+  function setQreset(next) {
+    if (qresetBusy) return;
+    qresetBusy = true;
+    var prev = qresetOn;
+    qresetOn = !!next;                        // optimistic; reverted on failure
+    renderQresetButton();
+    postQuotaReset(qresetOn ? 'on' : 'off').then(function (r) {
+      qresetBusy = false;
+      if (r.j && r.j.ok) {
+        qresetOn = r.j.mode === 'on';
+        renderQresetButton(r.j.mode === 'dry-run' ? '当前为 dry-run（只记录决策，不实际使用），由 ZCODE_WEBUI_QUOTA_RESET 环境变量设定' : '');
+        if (r.j.mode === 'dry-run') setTimeout(renderQresetButton, 4000);
+        try { console.info('[zcode-webui] quota-reset switch → ' + r.j.mode); } catch (e) {}
+      } else {
+        qresetOn = prev;
+        renderQresetButton((r.j && r.j.error) || ('HTTP ' + r.status));
+        setTimeout(renderQresetButton, 4000);
+      }
+    }).catch(function (e) {
+      qresetBusy = false;
+      qresetOn = prev;
+      renderQresetButton(String(e && e.message || e));
+      setTimeout(renderQresetButton, 4000);
+    });
+  }
 
   // ---- position / drag ----
   // Default berth: just OUTSIDE the top-right corner of the composer surface
   // (.chat-composer-input-surface — the input window). While not dragged the
-  // button keeps following the composer (sidebar collapse / window resize);
+  // panel keeps following the composer (sidebar collapse / window resize);
   // once dragged to a custom spot the position is remembered. Dragging it
   // back near the berth re-docks it (custom position forgotten).
   var BOOST_POS_KEY = 'zwebui-mode-boost-pos';
   var boostDragged = false;
+  var boostPanel = null;
 
   function boostAnchorRect() {
     var el = document.querySelector('.chat-composer-input-surface')
@@ -433,7 +491,7 @@
   function boostBerth() {
     var r = boostAnchorRect();
     var vw = window.innerWidth || 1200, vh = window.innerHeight || 800;
-    var w = boostBtn.offsetWidth || 120, h = boostBtn.offsetHeight || 30;
+    var w = boostPanel.offsetWidth || 120, h = boostPanel.offsetHeight || 30;
     if (!r) return { x: vw - w - 16, y: vh - h - 72 };
     var x = r.right + 10, y = r.top + 2;
     if (x + w > vw - 8) {                 // narrow viewport: no room outside the edge —
@@ -445,12 +503,12 @@
   }
   function placeBoost(x, y) {
     var vw = window.innerWidth || 1200, vh = window.innerHeight || 800;
-    var w = boostBtn.offsetWidth || 120, h = boostBtn.offsetHeight || 30;
+    var w = boostPanel.offsetWidth || 120, h = boostPanel.offsetHeight || 30;
     x = Math.min(Math.max(4, x), Math.max(4, vw - w - 4));
     y = Math.min(Math.max(4, y), Math.max(4, vh - h - 4));
     var ls = Math.round(x) + 'px', ts = Math.round(y) + 'px';
-    if (boostBtn.style.left !== ls) boostBtn.style.left = ls;   // no-op writes keep the node
-    if (boostBtn.style.top !== ts) boostBtn.style.top = ts;     // stable for playwright checks
+    if (boostPanel.style.left !== ls) boostPanel.style.left = ls;   // no-op writes keep the node
+    if (boostPanel.style.top !== ts) boostPanel.style.top = ts;     // stable for playwright checks
   }
   function savedBoostPos() {
     try {
@@ -462,80 +520,96 @@
   }
   function dockBoost() { var b = boostBerth(); placeBoost(b.x, b.y); }
 
-  function ensureBoostButton() {
-    if (boostBtn) return;
+  function makeBoostChip(cls) {
+    var chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = cls;
+    var dot = document.createElement('span');
+    dot.className = 'dot';
+    var lbl = document.createElement('span');
+    chip.appendChild(dot);
+    chip.appendChild(lbl);
+    chip.__lbl = lbl;
+    return chip;
+  }
+  function ensureBoostPanel() {
+    if (boostPanel) return;
     try {
       var css = ''
-        + '.zwebui-boost{position:fixed;z-index:99999;display:inline-flex;align-items:center;gap:6px;'
+        + '.zwebui-boost-panel{position:fixed;z-index:99999;display:flex;flex-direction:column;align-items:flex-end;gap:6px;'
+        + 'user-select:none;-webkit-user-select:none;touch-action:none;}'
+        + '.zwebui-boost-panel.dragging{opacity:.88;}'
+        + '.zwebui-boost-panel.dragging .zwebui-boost,.zwebui-boost-panel.dragging .zwebui-qreset{cursor:grabbing;}'
+        + '.zwebui-boost,.zwebui-qreset{display:inline-flex;align-items:center;gap:6px;'
         + 'padding:7px 14px;border:1px solid var(--color-border,#2c3138);border-radius:999px;'
         + 'background:var(--color-surface,#1a1e23);color:var(--color-foreground,#e8eaed);'
         + 'font:600 12px/1 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;cursor:grab;'
         + 'box-shadow:0 6px 24px rgba(0,0,0,.35);user-select:none;-webkit-user-select:none;touch-action:none;}'
-        + '.zwebui-boost:hover{background:var(--color-surface-hover,#262b31);}'
-        + '.zwebui-boost.on{border-color:rgba(84,214,138,.6);background:rgba(84,214,138,.14);color:#63d68f;}'
-        + '.zwebui-boost.err{border-color:rgba(255,99,99,.7);color:#ff8a8a;}'
-        + '.zwebui-boost.dragging{cursor:grabbing;opacity:.88;box-shadow:0 12px 32px rgba(0,0,0,.5);}'
-        + '.zwebui-boost .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;}';
+        + '.zwebui-boost:hover,.zwebui-qreset:hover{background:var(--color-surface-hover,#262b31);}'
+        + '.zwebui-boost.on,.zwebui-qreset.on{border-color:rgba(84,214,138,.6);background:rgba(84,214,138,.14);color:#63d68f;}'
+        + '.zwebui-boost.err,.zwebui-qreset.err{border-color:rgba(255,99,99,.7);color:#ff8a8a;}'
+        + '.zwebui-boost .dot,.zwebui-qreset .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;}';
       var st = document.createElement('style');
       st.textContent = css;
       (document.head || document.documentElement).appendChild(st);
-      boostBtn = document.createElement('button');
-      boostBtn.type = 'button';
-      boostBtn.className = 'zwebui-boost';
-      var dot = document.createElement('span');
-      dot.className = 'dot';
-      var lbl = document.createElement('span');
-      boostBtn.appendChild(dot);
-      boostBtn.appendChild(lbl);
-      boostBtn.__lbl = lbl;
-      (document.body || document.documentElement).appendChild(boostBtn);
+      boostPanel = document.createElement('div');
+      boostPanel.className = 'zwebui-boost-panel';
+      boostBtn = makeBoostChip('zwebui-boost');
+      qresetBtn = makeBoostChip('zwebui-qreset');
+      boostPanel.appendChild(boostBtn);
+      boostPanel.appendChild(qresetBtn);
+      (document.body || document.documentElement).appendChild(boostPanel);
       installBoostDrag();
       renderBoostButton();
+      renderQresetButton();
+      loadQuotaReset();
       var saved = savedBoostPos();
       if (saved) { boostDragged = true; placeBoost(saved.x, saved.y); }
       else dockBoost();
       // keep the berth (or the clamped custom spot) correct as the layout moves
       setInterval(function () {
-        if (!boostBtn) return;
+        if (!boostPanel) return;
         if (!boostDragged) dockBoost();
-        else placeBoost(parseFloat(boostBtn.style.left) || 0, parseFloat(boostBtn.style.top) || 0);
+        else placeBoost(parseFloat(boostPanel.style.left) || 0, parseFloat(boostPanel.style.top) || 0);
       }, 500);
-    } catch (e) { boostBtn = null; }
+    } catch (e) { boostPanel = null; }
   }
-  // Pointer-based drag; a press-release without a 5px move counts as a click
-  // (toggles the boost). Dropping within 24px of the berth re-docks the button.
+  // Pointer-based drag on the whole panel; a press-release without a 5px move
+  // counts as a click on whichever chip was pressed (each chip toggles its own
+  // switch). Dropping within 24px of the berth re-docks the panel.
   function installBoostDrag() {
     var drag = null;
-    boostBtn.addEventListener('pointerdown', function (e) {
+    boostPanel.addEventListener('pointerdown', function (e) {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
+      var chip = e.target && e.target.closest ? e.target.closest('.zwebui-boost,.zwebui-qreset') : null;
       drag = {
-        id: e.pointerId, sx: e.clientX, sy: e.clientY,
-        bx: parseFloat(boostBtn.style.left) || 0, by: parseFloat(boostBtn.style.top) || 0,
+        id: e.pointerId, sx: e.clientX, sy: e.clientY, chip: chip,
+        bx: parseFloat(boostPanel.style.left) || 0, by: parseFloat(boostPanel.style.top) || 0,
         moved: false,
       };
-      try { boostBtn.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      try { boostPanel.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       e.preventDefault();
     });
-    boostBtn.addEventListener('pointermove', function (e) {
+    boostPanel.addEventListener('pointermove', function (e) {
       if (!drag || e.pointerId !== drag.id) return;
       var dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
       if (!drag.moved) {
         if (dx * dx + dy * dy < 25) return;      // 5px threshold: still a click
         drag.moved = true;
         boostDragged = true;
-        boostBtn.classList.add('dragging');
+        boostPanel.classList.add('dragging');
       }
       placeBoost(drag.bx + dx, drag.by + dy);
     });
     var finish = function (e) {
       if (!drag || (e.pointerId !== undefined && e.pointerId !== drag.id)) return;
-      var moved = drag.moved;
+      var moved = drag.moved, chip = drag.chip;
       drag = null;
-      boostBtn.classList.remove('dragging');
-      try { boostBtn.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+      boostPanel.classList.remove('dragging');
+      try { boostPanel.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       if (moved) {
         var berth = boostBerth();
-        var cx = parseFloat(boostBtn.style.left) || 0, cy = parseFloat(boostBtn.style.top) || 0;
+        var cx = parseFloat(boostPanel.style.left) || 0, cy = parseFloat(boostPanel.style.top) || 0;
         if (Math.abs(cx - berth.x) <= 24 && Math.abs(cy - berth.y) <= 24) {
           boostDragged = false;                  // dropped back on the berth: re-dock
           try { localStorage.removeItem(BOOST_POS_KEY); } catch (err) { /* ignore */ }
@@ -543,12 +617,13 @@
           return;
         }
         try { localStorage.setItem(BOOST_POS_KEY, Math.round(cx) + ',' + Math.round(cy)); } catch (err) { /* ignore */ }
-      } else {
-        setBoost(!boostOn, true);
+      } else if (chip) {
+        if (chip === boostBtn) setBoost(!boostOn, true);
+        else if (chip === qresetBtn) setQreset(!qresetOn);
       }
     };
-    boostBtn.addEventListener('pointerup', finish);
-    boostBtn.addEventListener('pointercancel', finish);
+    boostPanel.addEventListener('pointerup', finish);
+    boostPanel.addEventListener('pointercancel', finish);
   }
   function renderBoostButton(errText) {
     if (!boostBtn) return;
@@ -590,7 +665,7 @@
   }
   function installModeBoost() {
     var boot = function () {
-      ensureBoostButton();
+      ensureBoostPanel();
       try {
         new MutationObserver(scheduleBoostScan).observe(document.body, { childList: true, subtree: true });
       } catch (e) { /* ignore */ }

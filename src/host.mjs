@@ -107,8 +107,11 @@ export function buildHostEnv(serverRoot, extra = {}) {
   //                         "套餐查询失败" (opt out with ZCODE_WEBUI_BILLING_CACHE_TTL_MS=0);
   //   quota-reset-guard   — auto-uses coding-plan reset chances only when they are
   //                         actually needed (pool nearly gone with tasks running, or
-  //                         the chance itself about to lapse) — opt out with
-  //                         ZCODE_WEBUI_QUOTA_RESET=off, audit with =dry-run.
+  //                         the chance itself about to lapse). OFF by default;
+  //                         flipped at runtime from the web panel's ♻ chip
+  //                         (POST /api/quota-reset → switch file polled by the
+  //                         guard), ZCODE_WEBUI_QUOTA_RESET=on|dry-run is only
+  //                         the pre-switch baseline.
   const preload = (file) => {
     const guard = path.join(PROJECT_ROOT, 'src', file);
     if (existsSync(guard) && !String(env.NODE_OPTIONS || '').includes(guard)) {

@@ -277,6 +277,31 @@ check('state file carries chances + decision', stateJson.status && Array.isArray
 check('state file carries pool usage ratios + exhaustion signals for triage',
   stateJson.buckets && stateJson.buckets.WEEK && stateJson.buckets.WEEK.usedRatio === 1 && stateJson.exhaustion && typeof stateJson.exhaustion.byType.WEEK === 'number');
 
+// ---------- 4b. runtime switch file (the ♻ web chip) ----------
+// Precedence: switch file > env baseline; default (neither) = off. The engine
+// must consult the file on every tick, not the env snapshot taken at load.
+const switchFile = path.join(statsDir, 'quota-reset-switch.json');
+const writeSwitch = (mode, extra = '') => writeFileSync(switchFile, '{"at":' + Date.now() + ',"mode":"' + mode + '"' + extra + '}\n');
+const useCallCount = () => calls.filter((c) => c.url.includes('/reset/use')).length;
+
+writeSwitch('off');
+check('switch file off outranks env on', guard.effectiveMode() === 'off');
+S.lastDecision = null;
+calls.length = 0;
+await guard.__tick();
+check('tick with switch off decides "mode off" and sends nothing',
+  S.lastDecision && S.lastDecision.fired === false && S.lastDecision.reason === 'mode off' && useCallCount() === 0,
+  'reason=' + (S.lastDecision && S.lastDecision.reason) + ' uses=' + useCallCount());
+const offState = JSON.parse(readFileSync(stateFile, 'utf8'));
+check('state file reports the effective (switch) mode', offState.mode === 'off');
+
+writeSwitch('dry-run');
+check('switch file dry-run recognized', guard.effectiveMode() === 'dry-run');
+writeFileSync(switchFile, '{"at":' + Date.now() + ',"mode":"bogus"}\n');
+check('invalid switch file falls back to the env baseline', guard.effectiveMode() === 'on');
+rmSync(switchFile, { force: true });
+check('removed switch file falls back to the env baseline', guard.effectiveMode() === 'on');
+
 // ---------- 5. mode behaviours via fresh subprocesses ----------
 const probe = (env, script) => new Promise((resolve) => {
   const { spawnSync } = require('node:child_process');
@@ -326,11 +351,57 @@ const dry = await probe({
 check('dry-run decides to fire but sends NOTHING to /use', /DECISION=\{"at":\d+,"fired":true/.test(dry.out) && /SENT=\[\]/.test(dry.out), dry.out.split('\n').filter((l) => /DECISION|SENT|BUSY/.test(l)).join(' | ').slice(0, 200));
 check('task activity read from the (synthetic) tasks index', /BUSY=true/.test(dry.out));
 
-const off = await probe({ ZCODE_WEBUI_QUOTA_RESET: 'off' }, `
+const dflt = await probe({ ZCODE_WEBUI_QUOTA_RESET: '' }, `
   const g = require(${JSON.stringify(path.join(ROOT, 'src', 'quota-reset-guard.cjs'))});
-  console.log('DISABLED=' + (globalThis[Symbol.for('zcode-webui.quota-reset-guard')].disabled === true));
+  console.log('MODE=' + g.effectiveMode());
 `);
-check('off mode: guard marked disabled, no crash', off.status === 0 && /DISABLED=true/.test(off.out));
+check('no env + no switch file → the default is now OFF (opt-in)', dflt.status === 0 && /MODE=off/.test(dflt.out), dflt.out.trim().slice(-80));
+
+// off is no longer "don't even load": the guard installs itself (so the web ♻
+// chip can wake it) and holds fire; flipping the switch file mid-run must take
+// effect on the very next tick, without a respawn.
+const offOn = await probe({
+  ZCODE_WEBUI_QUOTA_RESET: 'off', ZCODE_WEBUI_QUOTA_RESET_ROLE: 'host',
+}, `
+  const fs = require('node:fs');
+  const g = require(${JSON.stringify(path.join(ROOT, 'src', 'quota-reset-guard.cjs'))});
+  const S = g.__state;
+  const now = Date.now();
+  S.headers = { at: now, Authorization: 'Bearer a', XBigmodelAuthorization: 'Bearer b', targetType: 'PERSONAL' };
+  S.status = { at: now, fiveHourResets: [now + 3600000], weekResets: [], lastFiveHourUsedAt: 0, lastWeekUsedAt: 0 };
+  // bone-dry 5h pool with the natural reset days away: would fire if enabled
+  S.buckets = { at: now, FIVE_HOUR: { total: 100, remaining: 0, usedRatio: 1, expiresAt: now + 3 * 86400000 } };
+  S.busy = false; S.confirmed = true; S.usesToday = 0; S.lastUsedAt = 0;
+  globalThis.__sent = [];
+  globalThis.fetch = async (u) => {
+    const s = String(u);
+    globalThis.__sent.push(s);
+    const hdrs = { 'content-type': 'application/json' };
+    if (s.includes('/reset/use')) return new Response('{"code":0,"data":{"used":true}}', { status: 200, headers: hdrs });
+    if (s.includes('/reset/status')) return new Response(JSON.stringify({ code: 0, data: { available_five_hour_resets: [], available_week_resets: [], latest_five_hour_reset_history: null, latest_week_reset_history: null, has_unread_history: false } }), { status: 200, headers: hdrs });
+    return new Response('{}', { status: 200, headers: hdrs });
+  };
+  (async () => {
+    await g.__tick();
+    console.log('OFF_DECISION=' + JSON.stringify(S.lastDecision && S.lastDecision.reason));
+    console.log('OFF_SENT=' + JSON.stringify(globalThis.__sent.filter((u) => u.includes('/reset/use'))));
+    // the web panel's ♻ chip writes the switch file — the running engine must pick it up
+    fs.writeFileSync(process.env.ZCODE_WEBUI_GUARD_STATS_DIR + '/quota-reset-switch.json', JSON.stringify({ at: Date.now(), mode: 'on', by: 'ui' }));
+    S.lastDecision = null;
+    globalThis.__sent = [];
+    await g.__tick();
+    console.log('ON_DECISION=' + JSON.stringify(S.lastDecision));
+    console.log('ON_SENT=' + JSON.stringify(globalThis.__sent.filter((u) => u.includes('/reset/use'))));
+  })();
+`);
+check('baseline off: engine installed, would-fire state still holds fire',
+  /OFF_DECISION="mode off"/.test(offOn.out) && /OFF_SENT=\[\]/.test(offOn.out),
+  offOn.out.split('\n').filter((l) => /OFF_/.test(l)).join(' | ').slice(0, 160));
+check('switch file flipped ON mid-run fires on the next tick (no respawn)',
+  /ON_DECISION=\{"at":\d+,"fired":true,"type":"FIVE_HOUR"/.test(offOn.out),
+  offOn.out.split('\n').filter((l) => /ON_/.test(l)).join(' | ').slice(0, 200));
+check('the woken engine sent exactly one /use', /ON_SENT=\["https:\/\/[^"]*\/reset\/use"\]/.test(offOn.out),
+  offOn.out.split('\n').filter((l) => /ON_SENT/.test(l)).join(' | ').slice(0, 160));
 
 // ---------- cleanup ----------
 rmSync(statsDir, { recursive: true, force: true });

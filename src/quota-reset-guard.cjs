@@ -56,7 +56,14 @@
 // ${ZCODE_WEBUI_GUARD_STATS_DIR}/quota-reset-guard.json (surfaced in
 // /api/health → guards.quotaReset).
 //
-// Knobs (env): ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off (default on),
+// On/off is operator-controlled from the web UI (the ♻ chip next to the ⚡
+// mode-boost switch): POST /api/quota-reset writes {at, mode} into
+// ${ZCODE_WEBUI_GUARD_STATS_DIR}/quota-reset-switch.json and every running
+// guard re-reads that file within ~10s — no respawn needed. The switch file
+// outranks the env baseline (latest intent wins); the DEFAULT is off.
+//
+// Knobs (env): ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off (baseline while no
+// switch file exists; default off),
 // _TICK_MS, _STATUS_REFRESH_MS, _FIVE_HOUR_MIN_RATIO, _WEEK_MIN_RATIO,
 // _EXPIRY_SOON_FIVE_HOUR_MS, _EXPIRY_SOON_WEEK_MS, _RESCUE_MIN_USED,
 // _COOLDOWN_MS, _MAX_USES_PER_DAY, _HEADER_MAX_AGE_MS, _ACTIVITY_WINDOW_MS,
@@ -82,7 +89,9 @@ const envNum = (name, dflt) => {
 const envOff = (name) => (process.env[name] || '').trim().toLowerCase() === 'off';
 
 const CFG = {
-  mode: (process.env.ZCODE_WEBUI_QUOTA_RESET || 'on').trim().toLowerCase(),
+  // baseline mode only — superseded at any moment by the UI switch file (see
+  // effectiveMode below). Default OFF: auto-spending reset chances is opt-in.
+  mode: (process.env.ZCODE_WEBUI_QUOTA_RESET || 'off').trim().toLowerCase(),
   tickMs: envNum('ZCODE_WEBUI_QUOTA_RESET_TICK_MS', 60_000),
   statusRefreshMs: envNum('ZCODE_WEBUI_QUOTA_RESET_STATUS_REFRESH_MS', 10 * 60_000),
   fiveHourMinRatio: envNum('ZCODE_WEBUI_QUOTA_RESET_FIVE_HOUR_MIN_RATIO', 0.05),
@@ -112,6 +121,24 @@ const CFG = {
 const STATS_DIR = process.env.ZCODE_WEBUI_GUARD_STATS_DIR || '';
 const STATE_FILE = STATS_DIR ? path.join(STATS_DIR, 'quota-reset-guard.json') : '';
 const SIGNALS_FILE = STATS_DIR ? path.join(STATS_DIR, 'quota-reset-signals.log') : '';
+// written by POST /api/quota-reset (the web panel's ♻ chip); polled below
+const SWITCH_FILE = STATS_DIR ? path.join(STATS_DIR, 'quota-reset-switch.json') : '';
+
+// ---------- runtime switch (UI-controlled) ----------
+// The guard always installs itself (even while off) so flipping the web switch
+// can wake a running host without a respawn; every decision point resolves the
+// mode through here instead of reading the env snapshot.
+function readSwitchMode() {
+  if (!SWITCH_FILE) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(SWITCH_FILE, 'utf8'));
+    const m = typeof j.mode === 'string' ? j.mode.trim().toLowerCase() : '';
+    return (m === 'on' || m === 'dry-run' || m === 'off') ? m : null;
+  } catch (_e) { return null; }
+}
+function effectiveMode() {
+  return readSwitchMode() || CFG.mode;
+}
 // balance snapshots older than this are ignored for the predictive trigger
 const BUCKET_MAX_AGE_MS = envNum('ZCODE_WEBUI_QUOTA_RESET_BUCKET_MAX_AGE_MS', 2 * 3600_000);
 
@@ -154,7 +181,7 @@ function writeState(extra = {}) {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     const tmp = STATE_FILE + '.tmp-' + process.pid;
     fs.writeFileSync(tmp, JSON.stringify({
-      at: Date.now(), mode: CFG.mode, pid: process.pid, stats: STATS,
+      at: Date.now(), mode: effectiveMode(), pid: process.pid, stats: STATS,
       headersAt: S.headers ? S.headers.at : null,
       status: S.status, buckets: S.buckets, busy: S.busy,
       exhaustion: { at: S.exhaustionAt, byType: S.exhaustionByType, last: S.lastSignal },
@@ -539,6 +566,7 @@ async function tick() {
     drainSignals();
     refreshBusy();
     const now = Date.now();
+    const mode = effectiveMode();
     const headersOk = S.headers && now - S.headers.at <= CFG.headerMaxAgeMs;
     const statusStale = !S.status || now - S.status.at > CFG.statusRefreshMs
       || (S.wantStatusRefreshAt && now >= S.wantStatusRefreshAt);
@@ -549,7 +577,7 @@ async function tick() {
 
     if (S.usesDay !== dayKey(now)) { S.usesDay = dayKey(now); S.usesToday = 0; }
     const d = decide({
-      now, mode: CFG.mode,
+      now, mode,
       fiveHourResets: S.status ? S.status.fiveHourResets : [],
       weekResets: S.status ? S.status.weekResets : [],
       // stale balance data must not drive the predictive trigger — with no UI
@@ -579,10 +607,10 @@ async function tick() {
       log((d.fired ? 'DECISION use ' + d.type + ' — ' : 'decision: ') + d.reason
         + ' (chances 5h=' + ((S.status && S.status.fiveHourResets || []).length) + ' week=' + ((S.status && S.status.weekResets || []).length)
         + ', pools ' + poolSummary() + ', busy=' + S.busy + ')'
-        + (CFG.mode === 'dry-run' ? ' [dry-run: not sending]' : ''));
+        + (mode === 'dry-run' ? ' [dry-run: not sending]' : ''));
     }
     if (d.fired) {
-      if (CFG.mode === 'dry-run') { writeState(); return; }
+      if (mode === 'dry-run') { writeState(); return; }
       S.lastUsedAt = now;
       S.lastUsedType = d.type;
       S.confirmed = false;
@@ -672,9 +700,10 @@ function start() {
     || (process.env.ZCODE_WEBUI_QUOTA_RESET_ROLE || '') === 'host';
   if (globalThis[STATE_KEY]) { log('already installed in this process, nothing to do'); return; }
   globalThis[STATE_KEY] = { cfg: CFG, stats: STATS };
+  S.modeSeen = effectiveMode();
   install();
   if (isHost) {
-    log('armed (' + CFG.mode + ') — observes reset/billing traffic, decides every '
+    log('armed (' + S.modeSeen + (readSwitchMode() ? ' ← ui switch' : ' ← env/default') + ') — observes reset/billing traffic, decides every '
       + Math.round(CFG.tickMs / 1000) + 's; thresholds: 5h≤' + CFG.fiveHourMinRatio + ' busy, week≤' + CFG.weekMinRatio
       + ' busy, exhausted-signal rescue ≤' + Math.round(CFG.exhaustionSignalMs / 60000) + 'min'
       + (CFG.dryIdle ? ', bone-dry idle reset' : ', dry-idle off')
@@ -682,26 +711,33 @@ function start() {
       + Math.round(CFG.naturalResetFloorWeekMs / 60000) + 'min'
       + ', rescue≤' + Math.round(CFG.expirySoonFiveHourMs / 60000) + 'min/' + Math.round(CFG.expirySoonWeekMs / 60000)
       + 'min with ≥' + CFG.rescueMinUsed + ' used; cap ' + CFG.maxUsesPerDay + '/day'
-      + (CFG.mode === 'off' ? ' (disabled)' : ''));
+      + (S.modeSeen === 'off' ? ' (currently disabled — the ♻ web switch or ZCODE_WEBUI_QUOTA_RESET enables it)' : ''));
     const t = setInterval(() => { tick(); }, CFG.tickMs);
     if (t.unref) t.unref();
     const s = setInterval(() => { writeState(); }, 5 * 60_000);
     if (s.unref) s.unref();
+    // UI switch watcher: the web panel writes quota-reset-switch.json; pick it
+    // up within seconds, log the transition, and run an immediate tick when the
+    // guard just woke up (no need to wait for the next cadence slot).
+    const w = setInterval(() => {
+      const m = effectiveMode();
+      if (m === S.modeSeen) return;
+      log('mode ' + S.modeSeen + ' → ' + m + ' (ui switch file)');
+      S.modeSeen = m;
+      writeState();
+      if (m !== 'off') tick();
+    }, 10_000);
+    if (w.unref) w.unref();
   } else {
     log('observer mode (child process ' + process.pid + ') — captures quota-exhaustion signals only');
   }
 }
 
-if (CFG.mode === 'off') {
-  log('skipped — ZCODE_WEBUI_QUOTA_RESET=off');
-  globalThis[STATE_KEY] = { cfg: CFG, stats: STATS, disabled: true };
-} else {
-  start();
-}
+start();
 
 module.exports = {
   cfg: CFG, stats: STATS, decide, classifyBucket, classifyLimit, fieldsFromLimit,
-  usedRatioOf, exhaustionScopeOf, apiUrl,
+  usedRatioOf, exhaustionScopeOf, apiUrl, readSwitchMode, effectiveMode,
   __state: S, __captureHeaders: captureHeaders, __observeJson: observeResponse,
   __tick: tick, __useReset: useReset, __fetchStatus: fetchStatus,
 };
