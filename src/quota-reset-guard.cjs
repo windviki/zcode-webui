@@ -563,7 +563,11 @@ async function fetchLimit() {
         if (S.limitUrl !== url) S.limitUrl = url;
         return true;
       }
-      lastErr = new Error('HTTP ' + res.status + (parsed ? '' : ' (unparsed body)'));
+      // 200 + unparseable body is usually a WAF/auth rejection in disguise —
+      // keep a snippet so the field failure is diagnosable from the log
+      let snippet = '';
+      try { snippet = (await res.clone().text()).replace(/\s+/g, ' ').slice(0, 160); } catch (_e) { /* unread */ }
+      lastErr = new Error('HTTP ' + res.status + (parsed ? '' : ' unparsed body: ' + (snippet || '(empty)')));
     } catch (e) { lastErr = e; }
   }
   throw lastErr || new Error('no quota/limit endpoint answered');
@@ -597,6 +601,11 @@ async function useReset(type) {
 }
 
 // ---------- task activity (read-only, same access pattern as the webui reaper) ----------
+// On a transient read failure (DB lock at turn boundaries, etc.) the PREVIOUS
+// busy value is kept — clobbering to false would blind the busy trigger
+// exactly during active turns (a 2026-09-28 observation: the row of a turn
+// that errored at the wall stayed 'error' while the turn resumed, and the
+// running write lagged the turn start by ~a minute).
 function refreshBusy() {
   try {
     const { DatabaseSync } = require('node:sqlite');
@@ -609,9 +618,8 @@ function refreshBusy() {
       S.busyCount = (row && row.n) || 0;
     } finally { db.close(); }
     S.busyCheckedAt = Date.now();
-  } catch (_e) {
-    S.busy = false;   // conservative for the main rule; the signal/dry paths do not need it
-    S.busyCount = 0;
+  } catch (e) {
+    log('task activity read failed (' + (e && e.message) + ') — keeping busy=' + S.busy);
   }
 }
 
@@ -696,7 +704,13 @@ async function tick() {
     const poolEntryAt = (k) => num(S.buckets && S.buckets[k] && S.buckets[k].at) || 0;
     const newestPoolAt = Math.max(poolEntryAt('FIVE_HOUR'), poolEntryAt('WEEK'));
     const prevPoolAt = S.lastTickPoolAt ?? 0;
-    const wasBlind = prevPoolAt === 0 || now - prevPoolAt > CFG.reviveGapMs;
+    // Blindness = the engine HAD pool data at a previous tick and then lost
+    // sight of it. A first-ever sighting (fresh host, prevPoolAt=0) or a
+    // deliberate switch-on (the watcher resets lastTickPoolAt) is NOT a
+    // revival — 2026-09-28 second incident: the operator flipped ♻ ON onto a
+    // bone-dry pool and the grace held the rescue for 60s, the wall killed
+    // their turn and they had to reset manually.
+    const wasBlind = prevPoolAt > 0 && now - prevPoolAt > CFG.reviveGapMs;
     const headersOk = S.headers && now - S.headers.at <= CFG.headerMaxAgeMs;
     const statusStale = !S.status || now - S.status.at > CFG.statusRefreshMs
       || (S.wantStatusRefreshAt && now >= S.wantStatusRefreshAt);
@@ -764,6 +778,7 @@ async function tick() {
       log((d.fired ? 'DECISION use ' + d.type + ' — ' : 'decision: ') + d.reason
         + ' (chances 5h=' + ((S.status && S.status.fiveHourResets || []).length) + ' week=' + ((S.status && S.status.weekResets || []).length)
         + ', pools ' + poolSummary() + ', busy=' + S.busy + ')'
+        + (dryHoldMs > 0 ? ' [idle hold ' + Math.ceil(dryHoldMs / 1000) + 's — data revived after a blind gap]' : '')
         + (mode === 'dry-run' ? ' [dry-run: not sending]' : ''));
     }
     if (d.fired) {
@@ -875,12 +890,16 @@ function start() {
     if (s.unref) s.unref();
     // UI switch watcher: the web panel writes quota-reset-switch.json; pick it
     // up within seconds, log the transition, and run an immediate tick when the
-    // guard just woke up (no need to wait for the next cadence slot).
+    // guard just woke up (no need to wait for the next cadence slot). Waking by
+    // deliberate switch-on also FORGIVES accumulated data blindness (the
+    // operator is telling the engine to act NOW — the return grace must not
+    // second-guess them; see the 2026-09-28 second incident in the header).
     const w = setInterval(() => {
       const m = effectiveMode();
       if (m === S.modeSeen) return;
       log('mode ' + S.modeSeen + ' → ' + m + ' (ui switch file)');
       S.modeSeen = m;
+      if (m !== 'off') { S.lastTickPoolAt = null; S.revivedAt = 0; }
       writeState();
       if (m !== 'off') tick();
     }, 10_000);

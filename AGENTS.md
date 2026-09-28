@@ -348,7 +348,7 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   （机会数、两池 `usedPct/remaining/naturalResetAt`、信号时间、最近决策、当日使用次数、busy）。
 - **注意**：授权头只能从运行时真实请求捕获——**界面长期不打开时头会过期**（默认 12h 窗口），
   引擎会安全停摆并在日志说明；打开一次页面即恢复。`dry-run` 先跑一段时间观察决策是否符合预期
-  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（81 项，全离线 mock，
+  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（82 项，全离线 mock，
   绝不触真实 API；含 09-19 线上真实 payload 与 429 撞墙回放、开关文件优先级与运行中唤醒、
   09-28 事故重放：盲区自主刷新/宽限期/busy 不受宽限）。
 - **2026-09-28 事故复盘（开关后首战翻车，已修）**：用户 14:51 开启开关时 5h 池 92%，随后离开；任务把池子烧穿撞墙，
@@ -366,6 +366,17 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
     控制权；busy 触发、耗尽信号、机会临期路径不受影响。盲区判定用上一 tick 记录的 `lastTickPoolAt`
     （页面加载的被动刷新发生在两 tick 之间时，只看当前值会漏判）。
   - 信号通路维持现状（best-effort）：模型 429 走内置 undici 补不到，但池子 remaining=0 本身就是墙，靠自主刷新可见。
+- **2026-09-28 二次事故复盘（宽限期误伤 deliberate 开启，已修）**：用户重启后点亮 ♻（此刻周池 99.96% 用尽、4 个机会在手），
+  唤醒 tick 判 busy=false（「继续」回合的任务行还没登记）+ 宽限期把**空闲救援按住了 60 秒**（日志 `pool data revived
+  after a blind gap`——把「宿主刚启动的第一瞥」误判成「用户刚回来」）；期间 agent 回合烧掉最后 23 点、15:55:20 撞墙
+  报错（任务行卡在 error，恢复重试期间 busy 也读不到 running），用户 ~15:55:3x 手动重置救场（周机会 4→3）。
+  修复：**宽限只在「引擎曾有数据 → 断流 >10min → 数据恢复」时触发**（`wasBlind` 要求 `lastTickPoolAt > 0`，
+  第一瞥不触发）；开关 off→on 的主动唤醒由 watcher 显式清零 `lastTickPoolAt/revivedAt`——**deliberate 开启立即生效，
+  宽限不得替用户「再想想」**。决策行在挂起时会标注 `[idle hold Ns — data revived after a blind gap]`。
+  附带：①撞墙报错的回合恢复重试期间任务行停在 error、且 running 写入滞后回合开始约 1 分钟——busy 检测对这种回合有盲区，
+  `refreshBusy` 读取失败时改为**保留上一次 busy 值**并打日志（原来吞错置 false）；②现场抓到
+  `pool refresh failed: HTTP 200 (unparsed body)`——重放请求被上游以 200+非预期正文拒绝（疑 WAF/鉴权差异），
+  fetchLimit 现在把失败正文前 160 字符打进日志，待下次现场确诊。
 - **2026-09-19 事故复盘**：周额度撞墙（`[1310]您已达到每周/每月使用上限…2026-09-22 21:55 重置`），
   手上 1 个周机会（10-18 到期）+ 1 个 5h 机会全没用，服务停摆 3.6 天。三个叠加原因：
   ①`remaining ÷ number` 口径错 → 撞墙前池看着「200% 健康」，≤5% 规则形同虚设；

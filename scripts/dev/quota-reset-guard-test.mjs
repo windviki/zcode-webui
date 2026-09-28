@@ -354,9 +354,22 @@ await withTaskIndex(idleHome, () => guard.__tick());
 check('blind engine refreshes the pool data itself (no UI needed)',
   calls.some((c) => c.url.includes('/api/monitor/usage/quota/limit')) && guard.stats.limitFetches > limitFetchesBefore);
 check('refreshed data reveals the drained pool', S.buckets.FIVE_HOUR.usedRatio === 1 && S.buckets.FIVE_HOUR.remaining === 0);
-check('return grace: the idle reset is HELD on the revival tick (operator just came back)',
+// 2026-09-28 SECOND incident: the operator flipped ♻ ON onto a bone-dry pool
+// and the return grace held the rescue for 60s (they had to reset manually).
+// A FIRST sighting (fresh host / deliberate wake) must NOT trigger the grace —
+// only data reviving after the engine had already been watching does.
+check('deliberate switch-on onto a bone-dry pool fires IMMEDIATELY (no first-sighting grace)',
+  useCallCount() === 1 && S.lastUsedType === 'FIVE_HOUR' && S.revivedAt === 0,
+  'uses=' + useCallCount() + ' revivedAt=' + S.revivedAt);
+
+// the grace still applies to a REAL blind gap: the engine had data, lost
+// sight of it (>10min), and the data comes back — give the operator a beat
+resetIncidentState();
+S.lastTickPoolAt = now - 30 * 60_000;    // engine HAD data half an hour ago
+await withTaskIndex(idleHome, () => guard.__tick());
+check('return grace: the idle reset is HELD when data revives after a real blind gap',
   S.revivedAt > 0 && S.lastDecision && S.lastDecision.fired === false && useCallCount() === 0,
-  'fired=' + (S.lastDecision && S.lastDecision.fired) + ' uses=' + useCallCount());
+  'fired=' + (S.lastDecision && S.lastDecision.fired) + ' uses=' + useCallCount() + ' revivedAt=' + S.revivedAt);
 S.revivedAt = Date.now() - 61_000;     // grace window elapsed
 S.lastDecision = null;
 calls.length = 0;
@@ -366,7 +379,8 @@ check('after the grace the idle reset fires on its own', useCallCount() === 1 &&
 
 // a RUNNING task is not delayed by the grace — the busy trigger needs no wait
 resetIncidentState();
-S.revivedAt = Date.now();              // grace ACTIVE
+S.lastTickPoolAt = now - 30 * 60_000;  // real blind gap + grace ACTIVE after refresh
+S.revivedAt = Date.now();
 await withTaskIndex(busyHome, () => guard.__tick());
 check('busy + drained pool fires DESPITE the active grace', useCallCount() === 1
   && /with an active task/.test(S.lastDecision && S.lastDecision.reason || ''),
