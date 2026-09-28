@@ -16,7 +16,9 @@
 #
 # Env: ZWEBUI_IDLE_PORT (default from config.json), ZWEBUI_IDLE_POLL (s, 20),
 #      ZWEBUI_IDLE_CHECKS (consecutive quiet polls required, 3),
-#      ZWEBUI_IDLE_MAX_WAIT (s, 21600), ZWEBUI_IDLE_LOG (/tmp/zwebui-idle-restart.log)
+#      ZWEBUI_IDLE_MAX_WAIT (s, 21600), ZWEBUI_IDLE_LOG (/tmp/zwebui-idle-restart.log),
+#      ZWEBUI_IDLE_GRACE (s before the first check, 0) — set when the scheduling
+#      session is itself mid-stream and the server predates /api/active
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -28,20 +30,22 @@ PORT="${ZWEBUI_IDLE_PORT:-$(node -e '
   try { process.stdout.write(String(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).port || 3102)); }
   catch { process.stdout.write("3102"); }
 ' "$REPO/config.json")}"
-URL="http://127.0.0.1:${PORT}/api/active"
+CHECK="$REPO/scripts/dev/activity-check.mjs"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
 {
-  log "watching $URL (quiet checks: $CHECKS x ${POLL}s, give up after ${MAX_WAIT}s)"
+  GRACE="${ZWEBUI_IDLE_GRACE:-0}"
+  [ "$GRACE" -gt 0 ] && { log "grace period: ${GRACE}s before the first check"; sleep "$GRACE"; }
+  log "watching activity via $CHECK (quiet checks: $CHECKS x ${POLL}s, give up after ${MAX_WAIT}s)"
   quiet=0
   waited=0
   while [ "$waited" -lt "$MAX_WAIT" ]; do
-    body="$(curl -sf -m 3 "$URL" 2>/dev/null || true)"
+    body="$(node "$CHECK" "$PORT" 2>/dev/null || true)"
     active="$(printf '%s' "$body" | tr -d ' ' | sed -n 's/.*"active":\(true\|false\).*/\1/p')"
-    why="$(printf '%s' "$body" | tr -d ' ' | sed -n 's/.*"reasons":\[\([^]]*\)\].*/\1/p' | head -c 160)"
+    why="$(printf '%s' "$body" | sed -n 's/.*"reasons":\[\(.*\)\].*/\1/p' | head -c 200)"
     if [ "$active" != "true" ] && [ "$active" != "false" ]; then
-      log "service not answering yet (it may already be restarting) — retrying"
+      log "activity check not answering (server down or restarting) — retrying"
       quiet=0
     elif [ "$active" = "false" ]; then
       quiet=$((quiet + 1))

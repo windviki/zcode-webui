@@ -28,9 +28,11 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 
 正确做法是把重启脚本本身脱离进程树，让它替我们"点火"：
 
-1. **确认安全窗口**：`curl /api/active` 返回 `active:false`（v0.8.2 起的权威信号：宿主流式帧速率
-   ≥30 帧/分钟、**无视图但有新近帧的会话**、tasks-index 的 running/新近 error 行三路合并，任何一路
-   命中即 active；index 读不到时 fail-safe 视为 active）。**不要**再用 `/api/background` 的
+1. **确认安全窗口**：`node scripts/dev/activity-check.mjs` 返回 `active:false`（决定性信号是
+   **宿主进程树 CPU 探针**——任何 zcode-server.cjs 后代在 2s 采样窗内烧 CPU ≥200ms 或 90s 内新
+   spawn；另有 /api/active 帧速率信号与 tasks-index 行信号合并；index 读不到 fail-safe 视为
+   active）。进程探针是 2026-09-28 事故后才加的：当时任务行卡 error 26 分钟无写入、任务页附着
+   （/api/background 恒 0），两路旧信号全漏，重启杀掉了正在跑的任务。**不要**再用 `/api/background` 的
    `activeCount` 判断——它只统计「无视图」的后台会话，任务页面挂着就恒为 0；2026-09-28 事故：
    另一个任务正跑（页面附着 + 任务行卡在 error 不刷新），两个旧信号都没报警，重启把它杀了。
    用户明说重启时可跳过。`scripts/dev/restart-when-idle.sh` 已改用 `/api/active`，可以脱管调度：

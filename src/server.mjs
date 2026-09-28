@@ -1577,7 +1577,7 @@ function handleRequest(req, res) {
   //   2. a DETACHED session with frames inside ACTIVE_FRAME_MS — a turn
   //      running on a device that already left (subsumes /api/background);
   //   3. tasks-index: running rows inside the 2h staleness window, or error
-  //      rows written within the last 10 min (the retry blind spot).
+  //      rows written within the last 30 min (the retry limbo writes nothing).
   if (urlPath === '/api/active' && req.method === 'GET') {
     const now = Date.now();
     const streaming = [];
@@ -1609,7 +1609,9 @@ function handleRequest(req, res) {
         }
       } finally { db.close(); }
     } catch (_e) { indexOk = false; }
-    const busy = tasks.filter((t) => t.status === 'running' || (t.status === 'error' && t.ageSec <= 10 * 60));
+    // error rows: the retry limbo writes NOTHING (verified live: a turn ran 26min
+    // past its error transition) — keep the restart-safety window generous
+    const busy = tasks.filter((t) => t.status === 'running' || (t.status === 'error' && t.ageSec <= 30 * 60));
     const reasons = [];
     if (streaming.length > 0) reasons.push(streaming.length + ' host(s) streaming hard (' + streaming[0].framesLastMin + ' frames/min)');
     if (detachedBusy.length > 0) reasons.push(detachedBusy.length + ' detached host(s) mid-turn');
