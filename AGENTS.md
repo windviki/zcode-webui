@@ -28,8 +28,13 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 
 正确做法是把重启脚本本身脱离进程树，让它替我们"点火"：
 
-1. **确认安全窗口**：无进行中任务——`/api/background` 的 `activeCount` 为 0，且
-   `~/.zcode/v2/tasks-index.sqlite` 的 `tasks.task_status` 无 running 类状态。用户明说重启时可跳过。
+1. **确认安全窗口**：`curl /api/active` 返回 `active:false`（v0.8.2 起的权威信号：宿主流式帧速率
+   ≥30 帧/分钟、**无视图但有新近帧的会话**、tasks-index 的 running/新近 error 行三路合并，任何一路
+   命中即 active；index 读不到时 fail-safe 视为 active）。**不要**再用 `/api/background` 的
+   `activeCount` 判断——它只统计「无视图」的后台会话，任务页面挂着就恒为 0；2026-09-28 事故：
+   另一个任务正跑（页面附着 + 任务行卡在 error 不刷新），两个旧信号都没报警，重启把它杀了。
+   用户明说重启时可跳过。`scripts/dev/restart-when-idle.sh` 已改用 `/api/active`，可以脱管调度：
+   它会自己等空闲窗口再重启（连续 N 次采样 quiet 才动手）。
 2. **写延迟重启脚本**（如 `/tmp/zwebui-selfrestart.sh`）：
    ```bash
    #!/usr/bin/env bash
@@ -361,8 +366,31 @@ ZCodeTaskMode 六值：yolo/plan/edit/auto/autoEdit/build；auto 走宿主旧 op
 `repo-snapshot-guard-test`（+4：node:http request/get 拦截与放行）、新增
 `sidebar-toggle-test`（6 项）。hot-reconnect 11 项复跑全绿。
 
-## 「完全访问」模式的官方语义（2026-09-18 排查结论）
+## 文件树点不开的残留根因 + 重启误杀活跃任务（2026-09-28，v0.8.2）
 
+**问题一「侧栏内文件夹图标偶发点不开」**——源码级根因链（`packages/ui/src/workspace-file-tree/
+useWorkspaceFileTreeData.ts`）：点展开 = `loadDirectory`（无超时）+ `loading` 集合去重——**只要
+readdir 挂起，`loading` 永不清除，后续所有点击被去重守卫提前 return**，直到刷新。挂起的三个来源：
+①点击帧在断线窗口被静默丢弃（v0.8.0 的上行队列已修）；②响应在断线瞬间发进垂死 socket 永久丢失
+（**本轮修**）；③请求序号被并发刷新作废且后继请求也挂起（归约到②）。处置：**resume 重连时对
+断线前发出、始终无响应的 pending 调用合成 202 PromiseError**（官方 body 形状 {message,name}，
+本地 id 已还原；真实响应迟到会被 mux 当 stale 丢弃）——渲染层把「永久挂起」变成「可重试错误」，
+文件树的 error 路径不会卡（下次点击重新加载）。断线期间排队的新调用（pending.at > parkedAt）不受
+影响。官方兜底仍在：文件树的「刷新」按钮走 force 路径必清 loading。
+
+**问题二「重启前活跃判断有误」**——见「自我点火」步骤 1 的事故复盘。新增 `/api/active` 端点
+（restart-when-idle.sh 同步切换）：`{active, reasons[], streaming[], detachedBusy[], tasks[]}`，
+三路信号合并（帧速率 ring buffer `session.frameTimes` 256 条、无视图+ACTIVE_FRAME_MS、
+running<2h / error 新近<10min）。注意挂着页面没事闲聊不会误报：空闲页面的轮询帧速率远低于
+30 帧/分钟阈值。
+
+自检：`resume-replay-test` 扩到 19 项（丢失调用合成 202、resume 后新调用不被合成、
+/api/active 三态：附着空闲 false / 脱离有帧 true / index 不可读 fail-safe）。
+
+
+
+
+## 「完全访问」模式的官方语义（2026-09-18 排查结论）
 
 用户反馈「选了完全访问也不管用，每次都问」。受控复现（`scripts/dev/mode-switch-repro.mjs`，
 真浏览器跑官方渲染层）证明**垫片层没有问题**——空闲时或回合流式输出中切换都正常：

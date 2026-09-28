@@ -96,3 +96,15 @@ export function pinAckFor(call, id) {
     serializeObjectRpc(meta),
   ]);
 }
+
+// A 202 PromiseError frame for a call id — official body shape {message, name}
+// (the client reconstructs an Error from these). Used by the resume path to
+// answer calls whose responses were lost across a disconnect: without it the
+// renderer's promise settles never, and e.g. the file tree's expand dedup
+// (`loading` set) stays stuck until a page refresh.
+export function errorAckFor(id, message) {
+  return Buffer.concat([
+    encodeRpcHeader([202, id]),
+    serializeObjectRpc({ message: String(message), name: 'Error' }),
+  ]);
+}

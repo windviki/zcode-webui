@@ -4,10 +4,11 @@
 # Why: shim-side guards that must live *inside* the host process (the NODE_OPTIONS
 # preload injected by src/host.mjs, e.g. src/repo-snapshot-guard.cjs) only apply to
 # hosts spawned by a server started AFTER the change. Restarting while a turn is in
-# flight kills it, so this waits for a quiet window first — the /api/background
-# `activeCount` signal documented in AGENTS.md — and then does stop -> start -> health
-# gate on its own. It is meant to be fired detached so it survives the session that
-# started it.
+# flight kills it, so this waits for a quiet window first — the /api/active signal
+# (streaming hosts + running/error-fresh task rows; /api/background alone missed
+# attached tabs and error-stuck rows, which cost us one interrupted turn on
+# 2026-09-28) — and then does stop -> start -> health gate on its own. It is meant
+# to be fired detached so it survives the session that started it.
 #
 # Usage:
 #   setsid nohup bash scripts/dev/restart-when-idle.sh >/dev/null 2>&1 & disown
@@ -27,7 +28,7 @@ PORT="${ZWEBUI_IDLE_PORT:-$(node -e '
   try { process.stdout.write(String(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).port || 3102)); }
   catch { process.stdout.write("3102"); }
 ' "$REPO/config.json")}"
-URL="http://127.0.0.1:${PORT}/api/background"
+URL="http://127.0.0.1:${PORT}/api/active"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
@@ -36,15 +37,18 @@ log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
   quiet=0
   waited=0
   while [ "$waited" -lt "$MAX_WAIT" ]; do
-    active="$(curl -sf -m 3 "$URL" 2>/dev/null | tr -d ' ' | sed -n 's/.*"activeCount":\([0-9]*\).*/\1/p')"
-    if [ -z "$active" ]; then
+    body="$(curl -sf -m 3 "$URL" 2>/dev/null || true)"
+    active="$(printf '%s' "$body" | tr -d ' ' | sed -n 's/.*"active":\(true\|false\).*/\1/p')"
+    why="$(printf '%s' "$body" | tr -d ' ' | sed -n 's/.*"reasons":\[\([^]]*\)\].*/\1/p' | head -c 160)"
+    if [ "$active" != "true" ] && [ "$active" != "false" ]; then
       log "service not answering yet (it may already be restarting) — retrying"
       quiet=0
-    elif [ "$active" = "0" ]; then
+    elif [ "$active" = "false" ]; then
       quiet=$((quiet + 1))
       log "quiet window $quiet/$CHECKS"
     else
-      [ "$quiet" -gt 0 ] && log "activity returned (activeCount=$active) — waiting"
+      [ "$quiet" -gt 0 ] && log "activity returned — waiting"
+      log "ACTIVE: ${why:-<no reasons>}"
       quiet=0
     fi
     if [ "$quiet" -ge "$CHECKS" ]; then

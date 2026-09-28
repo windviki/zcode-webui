@@ -77,11 +77,19 @@ const path = require('path');
 })();
 `;
 
-function makeSandbox(prefix) {
+async function makeSandbox(prefix) {
   const sandbox = mkdtempSync(prefix);
   for (const d of ['home', 'zcode/v2', 'data/vendor/renderer']) mkdirSync(path.join(sandbox, d), { recursive: true });
   writeFileSync(path.join(sandbox, 'zcode/v2/credentials.json'),
     JSON.stringify({ 'oauth:bigmodel:access_token': 't', 'oauth:bigmodel:user_info': '{"id":"resumetest"}' }));
+  // /api/active reads the tasks index (read-only); give it a valid empty one
+  try {
+    const { createRequire } = await import('node:module');
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+    const db = new DatabaseSync(path.join(sandbox, 'zcode/v2/tasks-index.sqlite'));
+    db.exec('CREATE TABLE IF NOT EXISTS tasks (task_id TEXT, task_status TEXT, updated_at INTEGER, title TEXT)');
+    db.close();
+  } catch (_e) { console.log('WARN sandbox tasks-index fixture failed:', _e.message); }
   // minimal renderer index: readRendererIndex only needs the viewport meta to inject into
   writeFileSync(path.join(sandbox, 'data/vendor/renderer/index.html'),
     '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0" /></head><body><div id="root"></div></body></html>');
@@ -172,7 +180,7 @@ process.on('SIGINT', () => process.exit(130));
 
 try {
   // ============================== Part A ==============================
-  sandbox = makeSandbox('/tmp/zwebui-resume.XXXXXX');
+  sandbox = await makeSandbox('/tmp/zwebui-resume.XXXXXX');
   // fake runtime: ZCODE_HOME/server is the default runtime root (resolveServerRoot)
   mkdirSync(path.join(sandbox, 'zcode/server'), { recursive: true });
   symlinkSync(process.execPath, path.join(sandbox, 'zcode/server/node'));
@@ -215,11 +223,53 @@ try {
   const health = await (await fetch(base + 'api/health')).json();
   check('A: both tabs attached as views', health.sessions.views === 2, JSON.stringify(health.sessions));
 
+  // ---- /api/active: restart-safety signal. At this moment the session is
+  // ATTACHED and only trickling handshake frames (well under the streaming
+  // threshold), and the sandbox index is empty — the all-clear state.
+  const active = await (await fetch(base + 'api/active')).json();
+  check('A: /api/active answers with a boolean + detail', active && typeof active.active === 'boolean'
+    && Array.isArray(active.reasons) && Array.isArray(active.tasks), JSON.stringify(active).slice(0, 140));
+  check('A: attached-but-idle session reports NOT active', active.active === false && active.indexOk === true,
+    'reasons=' + JSON.stringify(active.reasons));
+
   t1b.close(); t2.close();
   await sleep(200);
 
+  // ---- lost-call synthesis: a call whose response never arrived before the
+  // disconnect must be answered with a synthesized 202 on resume — otherwise
+  // the renderer's promise hangs forever and consumers like the file tree
+  // wedge on their `loading` dedup ("folder won't open until refresh")
+  const t3 = await wsClient(base, id, 'tab-A3', false);
+  t3.portReady();
+  await sleep(250);
+  t3.sendCall(1, 'hold');                    // the fake host never answers holds
+  await sleep(250);
+  t3.close();                                // era parks with the call in flight
+  await sleep(400);
+  const t3b = await wsClient(base, id, 'tab-A3', true);
+  await sleep(400);
+  const lost = t3b.frames.find((f) => f.hdr && f.hdr.type === 202 && f.hdr.id === 1);
+  check('A: in-flight call lost across the gap answered with synthesized 202', !!lost,
+    lost ? JSON.stringify(lost.hdr) : 'none received');
+  check('A: synthesis logged', server.log.some((l) => l.includes('synthesizing timeout errors')));
+  // calls made AFTER the resume are untouched (fresh pending.at > parkedAt)
+  t3b.sendCall(2, 'hold');
+  await sleep(400);
+  const lateSynth = t3b.frames.find((f) => f.hdr && f.hdr.type === 202 && f.hdr.id === 2);
+  check('A: post-resume calls are not synthesized away', !lateSynth);
+  t3b.close();
+  await sleep(200);
+
+  // after the last tab leaves, a DETACHED session with fresh frames reads as
+  // active (it may be mid-turn with the viewer gone — exactly what the
+  // restart guard must respect)
+  const activeAfter = await (await fetch(base + 'api/active')).json();
+  check('A: detached session with fresh frames reads as active',
+    activeAfter.active === true && activeAfter.detachedBusy.length === 1,
+    'reasons=' + JSON.stringify(activeAfter.reasons));
+
   // ============================== Part B ==============================
-  sandbox2 = makeSandbox('/tmp/zwebui-ka.XXXXXX');
+  sandbox2 = await makeSandbox('/tmp/zwebui-ka.XXXXXX');
   mkdirSync(path.join(sandbox2, 'zcode/server'), { recursive: true });
   symlinkSync(process.execPath, path.join(sandbox2, 'zcode/server/node'));
   writeFileSync(path.join(sandbox2, 'zcode/server/zcode-server.cjs'), FAKE_HOST);

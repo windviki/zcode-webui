@@ -9,13 +9,14 @@
 import http from 'node:http';
 import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, truncateSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
-import { interceptPinRpc, pinAckFor } from './pin.mjs';
+import { interceptPinRpc, pinAckFor, errorAckFor } from './pin.mjs';
 import { buildSetModeCall, normalizeBoostMode, scanCommandSessionId, scanTopicSessionId, INJECTED_ID_BASE } from './mode-boost.mjs';
 import { spawnHost, handshake, resolveServerRoot, ensureCliProviderConfig } from './host.mjs';
 import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
@@ -1150,9 +1151,14 @@ async function createSession(userKey, tabId) {
 
   // stdout must be drained forever — even with no view attached — so the pipe
   // never fills up and blocks the host while it keeps working in the background.
+  // frameTimes keeps a bounded timestamp ring of outbound frames so /api/active
+  // can tell "a turn is streaming" (dozens of frames per minute) apart from the
+  // trickle an idle open page produces.
   const parser = new FrameParser((payload) => {
     session.framesOut++;
     session.lastFrameAt = Date.now();
+    (session.frameTimes || (session.frameTimes = [])).push(session.lastFrameAt);
+    if (session.frameTimes.length > 256) session.frameTimes.splice(0, session.frameTimes.length - 256);
     if (!session.firstDownstream) {
       // the host emits exactly one Initialize at startup; remember it so later
       // views can be replayed the full bootstrap
@@ -1559,6 +1565,63 @@ function handleRequest(req, res) {
     return sendJson(res, 200, { activeCount: background.length, hosts: background });
   }
 
+  // Restart-safety signal: is ANY agent turn running right now? This is the
+  // authoritative pre-restart check — /api/background only counts DETACHED
+  // hosts (a task whose tab is attached is invisible to it), and the tasks
+  // index has documented blind spots (an errored turn keeps its row at 'error'
+  // with no updated_at writes while it retries). Combined here (fail-safe when
+  // the index cannot be read):
+  //   1. heavy streaming: >=30 host frames in the trailing minute (a turn in
+  //      flight streams continuously; an idle open page only trickles a few
+  //      polling frames per minute);
+  //   2. a DETACHED session with frames inside ACTIVE_FRAME_MS — a turn
+  //      running on a device that already left (subsumes /api/background);
+  //   3. tasks-index: running rows inside the 2h staleness window, or error
+  //      rows written within the last 10 min (the retry blind spot).
+  if (urlPath === '/api/active' && req.method === 'GET') {
+    const now = Date.now();
+    const streaming = [];
+    const detachedBusy = [];
+    for (const s of sessions.values()) {
+      if (s.closed || !s.lastFrameAt) continue;
+      let burst = 0;
+      for (const t of s.frameTimes || []) if (now - t <= 60_000) burst++;
+      if (burst >= 30) streaming.push({ pid: s.child.pid, views: s.views.size, framesLastMin: burst });
+      if (s.views.size === 0 && now - s.lastFrameAt < ACTIVE_FRAME_MS) {
+        detachedBusy.push({ pid: s.child.pid, lastFrameAgeSec: Math.round((now - s.lastFrameAt) / 1000) });
+      }
+    }
+    const tasks = [];
+    let indexOk = true;
+    try {
+      const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite');
+      const db = new DatabaseSync(tasksIndexPath(), { readOnly: true });
+      try {
+        const rows = db.prepare(
+          "SELECT task_id, task_status, updated_at, title FROM tasks WHERE updated_at > ? ORDER BY updated_at DESC LIMIT 12"
+        ).all(now - RUNNING_TASK_STALE_MS);
+        for (const r of rows) {
+          tasks.push({
+            taskId: r.task_id, status: r.task_status,
+            ageSec: Math.round((now - r.updated_at) / 1000),
+            title: String(r.title || '').slice(0, 60),
+          });
+        }
+      } finally { db.close(); }
+    } catch (_e) { indexOk = false; }
+    const busy = tasks.filter((t) => t.status === 'running' || (t.status === 'error' && t.ageSec <= 10 * 60));
+    const reasons = [];
+    if (streaming.length > 0) reasons.push(streaming.length + ' host(s) streaming hard (' + streaming[0].framesLastMin + ' frames/min)');
+    if (detachedBusy.length > 0) reasons.push(detachedBusy.length + ' detached host(s) mid-turn');
+    for (const t of busy) reasons.push('task ' + String(t.taskId).slice(0, 18) + ' ' + t.status + ' ' + Math.max(1, Math.round(t.ageSec / 60)) + 'min ago');
+    if (!indexOk) reasons.push('tasks-index unreadable (fail-safe)');
+    return sendJson(res, 200, {
+      ok: true,
+      active: streaming.length > 0 || detachedBusy.length > 0 || busy.length > 0 || !indexOk,
+      reasons, streaming, detachedBusy, indexOk, tasks,
+    });
+  }
+
   // instant collaboration-mode push for the conversation the user is looking
   // at (see src/mode-boost.mjs): POST {mode:'yolo'|'完全访问'|…, taskId?}.
   // The host maps the mode and runs the v4 switchCollaborationMode command
@@ -1953,6 +2016,31 @@ wss.on('connection', (ws, req, session, meta) => {
       console.error('[ws] resume replay tab=' + tabId.slice(0, 8) + ': ' + gap.length +
         ' buffered frame(s), ' + gapBytes + 'B, covering the offline gap');
       for (const p of gap) { try { ws.send(p, { binary: true }); } catch (_e) { break; } }
+    }
+    // Calls this tab had in flight when its socket dropped, whose responses
+    // never made it out (emitted into the dying socket) would hang the
+    // renderer FOREVER — the official client has no per-call timeout on this
+    // path, and consumers like the file tree dedup further clicks on a
+    // `loading` flag that only a completed response clears ("folder won't
+    // open until refresh"). Answer them with a synthesized timeout error: the
+    // renderer surfaces a retryable error instead, and the host's (possibly
+    // late) real response is dropped by the mux as stale. Calls queued while
+    // offline arrive AFTER this point (fresh pending.at) and are untouched.
+    if (session.mux && prevView.parkedAt) {
+      const stale = [];
+      for (const [gid, e] of session.mux.pending) {
+        if (e.view === view && !e.injected && e.at && e.at <= prevView.parkedAt) stale.push([gid, e]);
+      }
+      if (stale.length > 0) {
+        console.error('[ws] resume tab=' + tabId.slice(0, 8) + ': synthesizing timeout errors for ' +
+          stale.length + ' in-flight call(s) lost across the disconnect');
+        for (const [gid, e] of stale) {
+          session.mux.pending.delete(gid);
+          view.sent.delete(gid);
+          session.mux.dropped++;
+          try { sendToView(session, e, { id: gid }, errorAckFor(gid, 'zcode-webui: response lost during disconnect (synthesized timeout)')); } catch (_e) { /* view may close again immediately */ }
+        }
+      }
     }
   }
 
