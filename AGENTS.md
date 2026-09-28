@@ -337,13 +337,18 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   `/api/health` → `guards.quotaReset.switch` 显示意图状态、`mode` 显示守卫实际生效模式。其余阈值 env 见文件头
   （比例/过期窗口/冷却/日上限/头最大年龄/活跃窗口/余额新鲜度/
   信号有效期 `_EXHAUSTION_SIGNAL_MS`/自然重置地板 `_NATURAL_RESET_FLOOR_*`/`_DRY_IDLE`/
-  池子自主刷新 `_LIMIT_REFRESH_MS`/盲区判定 `_REVIVE_GAP_MS`/恢复宽限 `_RETURN_GRACE_MS`）。
-- **观测**：stderr `[zcode-webui] quota-reset-guard:`（决策行带 chances / pools 已用% / busy）；
+  池子自主刷新 `_LIMIT_REFRESH_MS`/盲区判定 `_REVIVE_GAP_MS`/恢复宽限 `_RETURN_GRACE_MS`/决策复写 `_LOG_EVERY_MS`）。
+- **实时观测**：`node scripts/dev/quota-reset-watch.mjs [pollSec]`——打印守卫全景（开关/模式/两池/机会/busy/
+  决策/统计），之后每次变化打一行，并实时 tail 日志里的 quota-reset 行（含里程碑行）。撞墙现场用它盯着；
+  注意本机 Node 的 `readFileSync` 忽略 `{start,end}`，脚本里是 fd 定位读，别改回 readFileSync。
+- **观测**：stderr `[zcode-webui] quota-reset-guard:`（决策行带 chances / pools 已用% / busy，
+  未变化的决策每 5min 复写一次 `_LOG_EVERY_MS`；池子**里程碑行**——`entering the trigger zone`（跨入 ≤5% 阈值）、
+  `POOL … HIT THE WALL`（余量归零）、`refilled`（重置生效回满））；
   状态 JSON 在 `<dataHome>/data/guard-stats/quota-reset-guard.json`，`/api/health` → `guards.quotaReset`
   （机会数、两池 `usedPct/remaining/naturalResetAt`、信号时间、最近决策、当日使用次数、busy）。
 - **注意**：授权头只能从运行时真实请求捕获——**界面长期不打开时头会过期**（默认 12h 窗口），
   引擎会安全停摆并在日志说明；打开一次页面即恢复。`dry-run` 先跑一段时间观察决策是否符合预期
-  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（76 项，全离线 mock，
+  是安全的验证方式。自检：`node scripts/dev/quota-reset-guard-test.mjs`（81 项，全离线 mock，
   绝不触真实 API；含 09-19 线上真实 payload 与 429 撞墙回放、开关文件优先级与运行中唤醒、
   09-28 事故重放：盲区自主刷新/宽限期/busy 不受宽限）。
 - **2026-09-28 事故复盘（开关后首战翻车，已修）**：用户 14:51 开启开关时 5h 池 92%，随后离开；任务把池子烧穿撞墙，
@@ -352,7 +357,8 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   `/reset/status`（机会数）不刷池子——离开的 29 分钟里引擎一直拿 92%/剩 920 的旧数据判「不紧急」；
   ②430 耗尽信号零捕获：agent 的模型调用走**运行时内置 undici**（与 repo-snapshot 守卫「preload 补不到」同一个问题），
   globalThis.fetch 包装根本看不到，`stats.signals` 恒 0。修复（都在 `src/quota-reset-guard.cjs`）：
-  - **池子自主刷新**：`fetchLimit()` 用重放头主动 GET `quota/limit`（URL 从观察到的真实流量学习，默认 bigmodel.cn），
+  - **池子自主刷新**：`fetchLimit()` 用重放头主动 GET `quota/limit`（端点域名按部署不同，
+    bigmodel.cn / api.z.ai 双候选自动发现：先试已学到的，失败换另一个，成功即记住，厂商迁移域名会自愈），
     开关开着时数据龄超过 `_LIMIT_REFRESH_MS`（默认 90s；busy 时一个 tick）就刷新——UI 不打开也能看到池子在烧穿，
     撞墙后 ≤1-2 个 tick 内就会出手；UI 开着时基本命中 api-cache-guard 的 30s 缓存，不加上游压力。off 状态不轮询。
   - **盲区恢复宽限**：数据龄超过 `_REVIVE_GAP_MS`（默认 10min）算「盲」，首次拿到新数据后 `_RETURN_GRACE_MS`

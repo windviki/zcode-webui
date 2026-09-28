@@ -152,6 +152,9 @@ const CFG = {
   // operator keeps agency (2026-09-28 incident: the fire landed 6s before the
   // user's OFF click). Busy/signal/expiry paths are not held.
   returnGraceMs: envNum('ZCODE_WEBUI_QUOTA_RESET_RETURN_GRACE_MS', 60_000),
+  // re-log an unchanged decision at this cadence (default 5min) so a pool
+  // draining towards a wall stays visible in the log tick by tick
+  logEveryMs: envNum('ZCODE_WEBUI_QUOTA_RESET_LOG_EVERY_MS', 5 * 60_000),
 };
 
 const STATS_DIR = process.env.ZCODE_WEBUI_GUARD_STATS_DIR || '';
@@ -204,6 +207,7 @@ const S = {
   limitUrl: null,         // last OBSERVED quota/limit URL — replayed verbatim by fetchLimit
   lastTickPoolAt: null,   // pool-data age as of the end of the last tick (blind-gap detection)
   revivedAt: 0,           // pool data came back after a blind gap (idle-reset grace)
+  poolSeen: {},           // last logged per-pool {rem,tot,used} — wall/refill transition logs
   lastDecision: null,     // { at, fired, type, reason } for observability
   busyCheckedAt: 0,
   busy: false,
@@ -425,9 +429,10 @@ function fieldsFromLimit(L, now) {
 
 async function observeResponse(url, res) {
   let json = null;
-  try { json = await res.clone().json(); } catch (_e) { return; }
+  try { json = await res.clone().json(); } catch (_e) { return false; }
   const data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : null;
-  if (!data) return;
+  if (!data) return false;
+  let saw = false;
   // remember the exact origin/path the runtime itself uses for pool data, so
   // fetchLimit can replay it verbatim (bigmodel.cn vs api.z.ai differ per env)
   if (/\/api\/monitor\/usage\/quota\/limit/.test(url)) {
@@ -435,6 +440,7 @@ async function observeResponse(url, res) {
     if (u && u[1] !== S.limitUrl) S.limitUrl = u[1];
   }
   if (url.indexOf(RESET_BASE + '/status') >= 0 && Array.isArray(data.available_five_hour_resets)) {
+    saw = true;
     STATS.statusObservations++;
     S.status = {
       at: Date.now(),
@@ -450,6 +456,7 @@ async function observeResponse(url, res) {
   // fieldsFromLimit above for the field truth). limits carry explicit
   // type+unit identities and outrank the balance heuristics below.
   if (Array.isArray(data.limits)) {
+    saw = true;
     STATS.limitObservations++;
     const now = Date.now();
     if (!S.buckets) S.buckets = { at: 0 };
@@ -463,6 +470,7 @@ async function observeResponse(url, res) {
     S.buckets.at = now;
   }
   if (Array.isArray(data.balances)) {
+    saw = true;
     STATS.balanceObservations++;
     const now = Date.now();
     // Named classifications win over window heuristics; within the same kind the
@@ -497,6 +505,7 @@ async function observeResponse(url, res) {
     }
     S.buckets.at = now;
   }
+  return saw;
 }
 
 // ---------- authorized calls (header replay — same headers the runtime sent) ----------
@@ -528,16 +537,36 @@ async function fetchStatus() {
 
 // Pool usage self-refresh (2026-09-28 incident ①): with no UI attached nothing
 // re-requests quota/limit, and the engine would keep deciding on stale pool
-// data straight through a wall. Replays the same double-JWT headers against
-// the endpoint the runtime itself was seen using (S.limitUrl). Read-only GET;
-// while the UI IS attached this mostly hits the api-cache-guard's 30s cache.
+// data straight through a wall. Replays the same double-JWT headers. The
+// endpoint ORIGIN differs per deployment (bigmodel.cn vs api.z.ai), so try the
+// learned URL first, then the other known candidate — whichever answers gets
+// remembered, and a vendor origin migration self-heals on the next refresh.
+// Read-only GET; while the UI IS attached this mostly hits the api-cache-guard
+// cache, so it adds no upstream pressure.
+const LIMIT_URL_CANDIDATES = [
+  'https://bigmodel.cn/api/monitor/usage/quota/limit',
+  'https://api.z.ai/api/monitor/usage/quota/limit',
+];
 async function fetchLimit() {
   const h = replayHeaders();
   if (!h) return;
-  const url = S.limitUrl || 'https://bigmodel.cn/api/monitor/usage/quota/limit';
-  STATS.limitFetches++;
-  const res = await fetch(url, { method: 'GET', headers: h, signal: AbortSignal.timeout(15_000) });
-  await observeResponse(url, res);
+  const order = S.limitUrl
+    ? [S.limitUrl, ...LIMIT_URL_CANDIDATES.filter((u) => u !== S.limitUrl)]
+    : LIMIT_URL_CANDIDATES;
+  let lastErr = null;
+  for (const url of order) {
+    STATS.limitFetches++;
+    try {
+      const res = await fetch(url, { method: 'GET', headers: h, signal: AbortSignal.timeout(15_000) });
+      const parsed = await observeResponse(url, res);
+      if (res.ok && parsed) {
+        if (S.limitUrl !== url) S.limitUrl = url;
+        return true;
+      }
+      lastErr = new Error('HTTP ' + res.status + (parsed ? '' : ' (unparsed body)'));
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('no quota/limit endpoint answered');
 }
 
 async function useReset(type) {
@@ -618,6 +647,39 @@ function poolSummary() {
   return one('FIVE_HOUR', '5h') + ', ' + one('WEEK', 'week');
 }
 
+// milestone lines for the observation window: entering the trigger zone,
+// hitting the wall, refilling. Logged on TRANSITIONS only, so a draining pool
+// produces a short readable trail instead of one noisy line per tick.
+function logPoolTransitions(now) {
+  for (const kind of ['FIVE_HOUR', 'WEEK']) {
+    const b = S.buckets && S.buckets[kind];
+    if (!b) continue;
+    const used = usedRatioOf(b);
+    const rem = num(b.remaining), tot = num(b.total);
+    const prev = S.poolSeen[kind];
+    const minRatio = kind === 'FIVE_HOUR' ? CFG.fiveHourMinRatio : CFG.weekMinRatio;
+    if (prev) {
+      const wasZero = prev.rem !== null && prev.rem <= 0;
+      const isZero = rem !== null && rem <= 0;
+      const natIn = b.expiresAt && Number.isFinite(b.expiresAt) ? Math.round((b.expiresAt - now) / 60000) : null;
+      if (!wasZero && isZero) {
+        log('POOL ' + kind + ' HIT THE WALL — remaining 0' + (tot !== null ? '/' + tot : '')
+          + ', natural reset ' + (natIn === null ? 'unknown' : 'in ' + natIn + 'min')
+          + ', busy=' + S.busy + (S.status ? ' (chances ' + kind.toLowerCase() + '='
+            + ((kind === 'FIVE_HOUR' ? S.status.fiveHourResets : S.status.weekResets) || []).length + ')' : ''));
+      } else if (wasZero && rem !== null && rem > 0) {
+        log('pool ' + kind + ' refilled: remaining ' + prev.rem + ' → ' + rem
+          + (tot !== null ? '/' + tot : '') + ' — back in service');
+      } else if (prev.used !== null && used !== null && prev.used < 1 - minRatio && used >= 1 - minRatio) {
+        log('pool ' + kind + ' entering the trigger zone: ' + Math.round(used * 1000) / 10 + '% used'
+          + (rem !== null ? ' (' + rem + (tot !== null ? '/' + tot : '') + ' left)' : '')
+          + (S.busy ? ' with a task running — the busy trigger is live' : ' (idle — waits for ≤0% or a signal)'));
+      }
+    }
+    S.poolSeen[kind] = { rem, tot, used };
+  }
+}
+
 let engineRunning = false;
 async function tick() {
   if (engineRunning) return;
@@ -665,6 +727,7 @@ async function tick() {
     } else if (S.revivedAt && now - S.revivedAt < CFG.returnGraceMs) {
       dryHoldMs = CFG.returnGraceMs - (now - S.revivedAt);
     }
+    logPoolTransitions(now);
 
     if (S.usesDay !== dayKey(now)) { S.usesDay = dayKey(now); S.usesToday = 0; }
     const d = decide({
@@ -695,7 +758,7 @@ async function tick() {
       naturalResetFloorWeekMs: CFG.naturalResetFloorWeekMs,
     });
     const changed = !S.lastDecision || S.lastDecision.fired !== d.fired || S.lastDecision.reason !== d.reason
-      || (now - (S.lastDecision.at || 0) > 30 * 60_000);
+      || (now - (S.lastDecision.at || 0) > CFG.logEveryMs);
     S.lastDecision = { at: now, fired: d.fired, type: d.type || null, reason: d.reason };
     if (changed) {
       log((d.fired ? 'DECISION use ' + d.type + ' — ' : 'decision: ') + d.reason

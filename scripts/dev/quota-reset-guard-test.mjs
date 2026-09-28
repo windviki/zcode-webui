@@ -76,6 +76,10 @@ globalThis.fetch = async (input, init) => {
     });
   }
   if (url.includes('/api/monitor/usage/quota/limit')) {
+    // origin gate for the endpoint-discovery tests ('' = every origin answers)
+    if (upstream.limitOkOrigin && !url.includes(upstream.limitOkOrigin)) {
+      return new Response('not found', { status: 404 });
+    }
     return jsonResponse({ code: 0, data: { level: 'max', limits: upstream.limits || [] } });
   }
   if (url.includes('/chat/completions')) {
@@ -378,6 +382,62 @@ check('mode off: no pool refresh, no use', !calls.some((c) => c.url.includes('/q
 rmSync(switchFile, { force: true });
 S.lastTickPoolAt = Date.now();
 S.busy = false;
+
+// ---------- 4d. quota/limit endpoint discovery (origin fallback) ----------
+// The origin differs per deployment; with nothing learned yet the engine tries
+// the known candidates until one answers, then sticks to it (and re-discovers
+// if the vendor migrates origins).
+upstream.limitOkOrigin = 'api.z.ai';     // bigmodel.cn is dead in this scenario
+resetIncidentState();
+S.limitUrl = null;
+await withTaskIndex(idleHome, () => guard.__tick());
+check('dead default origin → falls back to the alternate and learns it',
+  S.limitUrl === 'https://api.z.ai/api/monitor/usage/quota/limit' && S.buckets.FIVE_HOUR.usedRatio === 1,
+  'limitUrl=' + S.limitUrl);
+resetIncidentState();
+S.limitUrl = 'https://api.z.ai/api/monitor/usage/quota/limit';   // learned above
+upstream.limitOkOrigin = 'bigmodel.cn';  // the learned origin just died
+await withTaskIndex(idleHome, () => guard.__tick());
+check('learned origin gone → re-discovers on the next refresh',
+  S.limitUrl === 'https://bigmodel.cn/api/monitor/usage/quota/limit', 'limitUrl=' + S.limitUrl);
+upstream.limitOkOrigin = '';
+
+// ---------- 4e. pool milestone lines (trigger zone / wall / refill) ----------
+const healthy5h = [{ type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 12000, currentValue: 6000, remaining: 6000, percentage: 50, nextResetTime: now + 2 * H }];
+const nearly5h = [{ type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 12000, currentValue: 11560, remaining: 440, percentage: 96.3, nextResetTime: now + 2 * H }];
+const ageBuckets = (ms) => {
+  if (!S.buckets) return;
+  S.buckets.at -= ms;
+  for (const k of ['FIVE_HOUR', 'WEEK']) if (S.buckets[k]) S.buckets[k].at -= ms;
+};
+const captured = [];
+const origStderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, ...rest) => { captured.push(String(chunk)); return origStderrWrite(chunk, ...rest); };
+try {
+  resetIncidentState();
+  upstream.limits = healthy5h;
+  await withTaskIndex(idleHome, () => guard.__tick());   // first sighting: seeds poolSeen, no milestone yet
+  const seeded = captured.length;
+  ageBuckets(2 * 60_000);
+  upstream.limits = nearly5h;                            // drains past the threshold without hitting zero
+  await withTaskIndex(idleHome, () => guard.__tick());
+  check('entering the trigger zone logs a milestone line',
+    captured.slice(seeded).some((l) => /quota-reset-guard: pool FIVE_HOUR entering the trigger zone/.test(l)));
+  captured.length = 0;
+  ageBuckets(2 * 60_000);
+  upstream.limits = drain5h;                             // the wall
+  await withTaskIndex(idleHome, () => guard.__tick());
+  check('hitting the wall logs a milestone line',
+    captured.some((l) => /POOL FIVE_HOUR HIT THE WALL/.test(l)));
+  captured.length = 0;
+  ageBuckets(2 * 60_000);
+  upstream.limits = healthy5h;                           // a reset refills the pool
+  await withTaskIndex(idleHome, () => guard.__tick());
+  check('refill logs a milestone line', captured.some((l) => /refilled: remaining 0 → 6000/.test(l)));
+} finally {
+  process.stderr.write = origStderrWrite;
+}
+S.lastTickPoolAt = Date.now();
 
 // ---------- 5. mode behaviours via fresh subprocesses ----------
 const probe = (env, script) => new Promise((resolve) => {
