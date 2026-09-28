@@ -214,6 +214,28 @@ const HTTP_RELAY_MAX = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_MAX || 8) || 0;
 // without a cap a rogue client could buffer unbounded memory server-side
 const BRIDGE_MAX_BODY_BYTES = Math.max(1, Number(process.env.ZCODE_WEBUI_BRIDGE_MAX_BODY_MB) || 32) * 1024 * 1024;
 
+// ws keepalive leniency: ping every WS_PING_MS and terminate only after
+// WS_PING_MAX_MISS consecutive unanswered pings. One missed pong used to be
+// enough to kill the socket — a desktop browser tab parked in the background
+// (timer/network throttling through proxies) regularly trips that within a
+// minute, so the default now tolerates two misses (~60–90s) before detaching.
+const WS_PING_MS = Math.max(5000, Number(process.env.ZCODE_WEBUI_WS_PING_MS) || 30000);
+const WS_PING_MAX_MISS = Math.max(1, Number(process.env.ZCODE_WEBUI_WS_PING_MAX_MISS) || 2);
+
+// Offline-gap replay: while a tab's renderer era is parked (socket gone, page
+// still alive in the background), downstream frames destined to it — task-list
+// events, call responses — are buffered per era and replayed when that tab
+// hot-resumes, so the session list does not silently go stale ("had to refresh
+// to see new sessions"). Bounded; an overflowed gap forces a page reload on the
+// next resume instead of replaying a hole. Parking older than RESUME_PARK_MS
+// disposes the era's host-side subscriptions (also fixes a slow leak of ghost
+// event listeners for tabs that never return). 0 disables buffering entirely.
+const RESUME_PARK_MS = Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) === 0
+  ? 0
+  : Math.max(30 * 1000, Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) || 10 * 60 * 1000);
+const RESUME_BUF_MAX_BYTES = Math.max(64 * 1024, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_MB) || 16) * 1024 * 1024;
+const RESUME_BUF_MAX_FRAMES = Math.max(16, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES) || 2048);
+
 function tasksIndexPath() {
   const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
   return path.join(zhome, 'v2', 'tasks-index.sqlite');
@@ -1026,20 +1048,49 @@ function routeDownstream(session, payload) {
   }
 }
 
+// Queue one downstream frame into a parked era's replay buffer (see
+// RESUME_PARK_MS above). Returns false when buffering is disabled or the gap
+// already overflowed — the frame is then simply lost, as it always was.
+function bufferForResume(view, out) {
+  if (!view.parkedAt || RESUME_PARK_MS <= 0 || view.resumeOverflow) return false;
+  if (view.resumeBuf.length >= RESUME_BUF_MAX_FRAMES || view.resumeBytes + out.length > RESUME_BUF_MAX_BYTES) {
+    view.resumeOverflow = true;
+    view.resumeBuf.length = 0;
+    view.resumeBytes = 0;
+    console.error('[ws] resume gap buffer overflowed tab=' + view.tabId.slice(0, 8) +
+      ' — the next resume of this tab will be forced to reload');
+    return false;
+  }
+  view.resumeBuf.push(Buffer.from(out));
+  view.resumeBytes += out.length;
+  return true;
+}
+
 // Rewrite a downstream frame back into the owning view's local id space and
-// deliver it (buffered in-order while that view is still mounting).
+// deliver it. Three delivery regimes, in order:
+//   mounting → holdBuf (fresh view, Initialize replay gated on port-ready);
+//   live     → straight onto the socket;
+//   parked   → resumeBuf, replayed when this tab hot-reconnects (resume=1), so
+//              events fired while the page sat in the background are not lost.
+// A view that is neither live nor parked belonged to a replaced renderer era —
+// nothing of it survives, the frame is dropped.
 function sendToView(session, entry, hdr, payload) {
   const view = entry.view;
-  if (session.views.get(view.tabId) !== view) return;   // renderer era replaced
   let out = payload;
   if (entry.origId !== hdr.id) out = rewriteRpcId(payload, entry.origId) || payload;
   if (view.holdFrames) {
     if (view.holdBuf.length < 512) view.holdBuf.push(Buffer.from(out));
     return;
   }
-  const ws = view.ws;
-  if (!ws || ws.readyState !== 1) return;
-  try { ws.send(out, { binary: true }); } catch (_e) { /* ignore */ }
+  if (session.views.get(view.tabId) === view) {
+    const ws = view.ws;
+    if (ws && ws.readyState === 1) {
+      try { ws.send(out, { binary: true }); return; } catch (_e) { /* socket died mid-send — buffer below */ }
+    }
+    bufferForResume(view, out);                    // closed socket, close event not fired yet
+    return;
+  }
+  if (view.parkedAt) bufferForResume(view, out);
 }
 
 // Tear down a view's host-side event subscriptions by sending EventDispose
@@ -1089,7 +1140,6 @@ async function createSession(userKey, tabId) {
     pendingInbound: [],                     // {view, payload} frames seen before the host handshake finished
     closed: false,
     firstDownstream: null, initForwarded: false,
-    resumeBuf: [], resumeMode: false,
     mux: MUX_ENABLED ? makeMux() : null,
     activeConvSession: '',                  // mode-boost: sessionId from the latest renderer conversation command
     lastTopicSession: '',                   // mode-boost: sessionId from the latest conversation topic frame
@@ -1304,6 +1354,7 @@ function handleRequest(req, res) {
       sessions: {
         total: all.filter((s) => !s.closed).length,
         views: all.reduce((n, s) => n + (s.closed ? 0 : s.views.size), 0),
+        detached: all.filter((s) => !s.closed && s.views.size === 0).length,
       },
       reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS },
       httpRelays: httpRelays.size,
@@ -1773,8 +1824,7 @@ function handleUpgrade(req, socket, head) {
     let adopted = false;
     if (session) {
       adopted = true;
-      if (MUX_ENABLED && !session.mux) { session.mux = makeMux(); session.eraByTab ??= new Map(); session.resumeBuf = []; }
-      if (!resume) session.resumeBuf = [];   // fresh page: no offline-gap replay
+      if (MUX_ENABLED && !session.mux) { session.mux = makeMux(); session.eraByTab ??= new Map(); }
       rebindView(session, tabId);
       session.detachedAt = 0;
       console.error('[zcode-webui] view attached pid=' + session.child.pid +
@@ -1840,11 +1890,23 @@ wss.on('connection', (ws, req, session, meta) => {
     sent: new Set(),                       // globalIds this renderer is awaiting
     holdFrames: false, holdBuf: [], holdSkipOnce: false, replayInitOnCapture: false,
     lastFrameAt: 0,
+    missed: 0,                             // consecutive unanswered keepalive pings
+    parkedAt: 0,                           // ws closed, era parked in eraByTab (resume replay active)
+    resumeBuf: [], resumeBytes: 0, resumeOverflow: false,
   };
   // prevView is the previous renderer era of this tab — looked up in eraByTab
   // because the ws close handler may already have removed it from views (the
   // close of a hot-reconnecting socket always races the reconnect)
   const prevView = session.eraByTab.get(tabId) || null;
+  // A resume whose offline gap overflowed the replay buffer cannot be bridged:
+  // the renderer would see a hole in its event stream and quietly go stale. Send
+  // it down the established recovery path instead (close 4000 → page reload).
+  // Checked BEFORE any state mutation so the half-attached view leaves no trace.
+  if (resume && prevView && prevView.resumeOverflow) {
+    console.error('[ws] resume rejected tab=' + tabId.slice(0, 8) + ' — offline gap overflowed the replay buffer, forcing reload');
+    try { ws.close(4000, 'gap overflow'); } catch (_e) { /* ignore */ }
+    return;
+  }
   if (adopted && !resume) {
     // fresh renderer bootstrapping against a mid-stream host: gate downstream
     // until its port-ready ack (or failsafe) so it sees Initialize first
@@ -1872,11 +1934,27 @@ wss.on('connection', (ws, req, session, meta) => {
       }
       prevView.sent.clear();
       prevView.holdBuf.length = 0;           // eraByTab keeps the object alive — drop its buffers
+      prevView.resumeBuf.length = 0;         // a fresh era replays nothing from the old one
+      prevView.resumeBytes = 0;
     }
   }
   session.views.set(tabId, view);
   session.eraByTab.set(tabId, view);
   session.detachedAt = 0;
+  // resume replay: flush the frames buffered while this tab's socket was gone
+  // BEFORE any new downstream frame can be sent — per-socket send ordering then
+  // preserves the era's original sequence. (prevView parked buffers only; the
+  // new view starts with an empty one.)
+  if (resume && prevView && prevView !== view) {
+    const gap = prevView.resumeBuf.splice(0);
+    const gapBytes = prevView.resumeBytes;
+    prevView.resumeBytes = 0;
+    if (gap.length > 0) {
+      console.error('[ws] resume replay tab=' + tabId.slice(0, 8) + ': ' + gap.length +
+        ' buffered frame(s), ' + gapBytes + 'B, covering the offline gap');
+      for (const p of gap) { try { ws.send(p, { binary: true }); } catch (_e) { break; } }
+    }
+  }
 
   // listeners FIRST (a client answering the ready signal instantly must not
   // lose its first frame), announcements after
@@ -1896,6 +1974,8 @@ wss.on('connection', (ws, req, session, meta) => {
     session.views.delete(tabId);
     view.sent.clear();
     view.holdBuf.length = 0;               // eraByTab keeps the object alive — drop its buffers
+    view.holdFrames = false;               // never mounted or still holding: parked buffering takes over
+    view.parkedAt = Date.now();            // era parks: downstream frames buffer for resume replay
     if (session.views.size === 0) {
       if (session.framesIn === 0 && session.framesOut === 0) {
         console.error('[ws] closed before traffic, terminating host pid=' + session.child.pid);
@@ -1909,8 +1989,10 @@ wss.on('connection', (ws, req, session, meta) => {
     }
   });
   ws.on('error', () => { /* onclose follows */ });
-  ws.on('pong', () => { view.alive = true; });
+  ws.on('pong', () => { view.alive = true; view.missed = 0; });
   view.alive = true;
+  view.missed = 0;
+  view.parkedAt = 0;
 
   try { ws.send(WS_READY); } catch (_e) { /* ignore */ }
   const announce = (line) => {
@@ -1923,25 +2005,62 @@ wss.on('connection', (ws, req, session, meta) => {
   }
 });
 
-// ws keepalive: ping attached clients every 30s and terminate the socket when
-// a pong is missed (phone app frozen in background, dead network). Terminating
-// DETACHES the host cleanly — it parks in the background and the client hot-
-// reconnects (and re-adopts the same host) when the user comes back.
+// ws keepalive: ping attached clients every WS_PING_MS and terminate the socket
+// only after WS_PING_MAX_MISS consecutive pings went unanswered (phone app
+// frozen in background, dead network, throttled tab). Terminating DETACHES the
+// host cleanly — it parks in the background and the client hot-reconnects (and
+// re-adopts the same host, with the offline gap replayed) when the user comes
+// back.
 setInterval(() => {
   for (const s of [...sessions.values()]) {
     for (const v of s.views.values()) {
       const ws = v.ws;
       if (!ws || ws.readyState !== 1) continue;
       if (v.alive === false) {
-        console.error('[ws] client unresponsive (no pong), terminating socket tab=' + v.tabId.slice(0, 8));
-        ws.terminate();                       // close event removes the view
-        continue;
+        v.missed = (v.missed || 0) + 1;
+        if (v.missed >= WS_PING_MAX_MISS) {
+          console.error('[ws] client unresponsive (no pong for ' + v.missed + ' ping(s)), terminating socket tab=' + v.tabId.slice(0, 8));
+          ws.terminate();                       // close event removes the view; era parks with replay
+          continue;
+        }
+      } else {
+        v.missed = 0;
       }
       v.alive = false;
       try { ws.ping(); } catch (_e) { /* ignore */ }
     }
   }
-}, 30000).unref();
+}, WS_PING_MS).unref();
+
+// Parked-era expiry: a tab whose socket closed buffers downstream frames for a
+// resume that may never come. After RESUME_PARK_MS the era is retired — its
+// host-side event subscriptions are disposed (a tab that never returns would
+// otherwise keep ghost listeners firing forever) and its replay buffer freed.
+// The eraByTab entry goes too, so a late resume=1 from that tab takes the
+// clean reload path instead of pretending nothing was lost.
+if (RESUME_PARK_MS > 0) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const s of [...sessions.values()]) {
+      if (s.closed || !s.eraByTab) continue;
+      for (const [tabId, era] of s.eraByTab) {
+        if (s.views.get(tabId) === era || !era.parkedAt) continue;
+        if (now - era.parkedAt <= RESUME_PARK_MS) continue;
+        disposeViewEvents(s, era);
+        if (s.mux) {
+          for (const [gid, e] of s.mux.pending) if (e.view === era) s.mux.pending.delete(gid);
+        }
+        era.resumeBuf.length = 0;
+        era.resumeBytes = 0;
+        era.resumeOverflow = false;
+        era.parkedAt = 0;
+        s.eraByTab.delete(tabId);
+        console.error('[ws] parked era expired tab=' + tabId.slice(0, 8) +
+          ' after ' + Math.round(RESUME_PARK_MS / 1000) + 's — subscriptions disposed, late resume will reload');
+      }
+    }
+  }, 30000).unref();
+}
 
 // Stale-call sweeper: a mux pending entry whose host never answered would
 // otherwise live forever (tiny leak, but it also pins the view's `sent` set).

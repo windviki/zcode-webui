@@ -248,6 +248,49 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 - **`zcode-update.sh` 校验链加了第五步**：`guard_check`（跑 repo-snapshot-guard-status.mjs，任一 WARN
   视为失败走回滚路径；`--no-guard-check` 跳过）。AGENTS 里「升级后必跑」从此自动执行。
 
+## 后台回来连不上 / 会话列表不更新 / 侧栏折叠点不开（2026-09-28，v0.8.0）
+
+用户报的两个体感问题，拆开是五条根因，全部修掉：
+
+**问题一「浏览器放后台没多久回来很难连上、不刷新看不到最新会话」**，日志实证（含 51 次
+`send 410` 未处理拒绝、12 次 `client unresponsive`、`bridge-open-failed | Failed to fetch` 现场）：
+
+1. **服务端 keepalive 太狠**：一次 30s ping 没回 pong 就 `terminate()`。后台标签页（浏览器节流/代理
+   缓发 pong）经常一分钟内中招，而此刻任务可能正在跑。现在默认容忍 **2 次**连续未回
+   （约 60~90s 才判死），`ZCODE_WEBUI_WS_PING_MS`（默认 30000，下限 5000）与
+   `ZCODE_WEBUI_WS_PING_MAX_MISS`（默认 2）可调。terminate 仍然只是 detach，host 照旧后台续跑。
+2. **断线帧无重放**（`resumeBuf` 声明了但从没实现）：热重连成功后，断线窗口里的任务列表事件/
+   呼叫响应全部被丢——「不刷新就看不到最新会话」的直接原因。现在每个**渲染层时代（era）**在
+   停靠期间把发给它的下行帧缓冲（默认 2048 帧 / 16MB，`ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES`/
+   `_MB`），resume=1 热重连时按序重放（本地 id 已还原）；缓冲溢出则下次 resume 直接 close 4000
+   走整页刷新（比静默漏帧诚实）。停靠超时（默认 10min，`ZCODE_WEBUI_RESUME_PARK_MS`，0=关闭缓冲）
+   会 `disposeViewEvents` + 清缓冲 + 删 eraByTab 条目——**顺带修掉了标签页永不回来时宿主侧
+   ghost 事件订阅无限堆积的存量泄漏**。
+3. **上行帧静默丢弃**：socket 断开期间渲染层发的服务调用（文件树展开、列表刷新等）直接蒸发，
+   对应 UI promise 永远挂起。bootstrap 现在把断线期间的上行帧排队（256 帧 / 4MB），传输恢复
+   （ws verify 或 http open 成功）时冲刷。测试钩子 `window.__zwebui_send(data)` 等价于渲染层发帧。
+4. **HTTP 回退死路**（三条）：① 页面已引导成功后，一次 ws open 失败就永久切到 http 长轮询——
+   对着**全新 host** 说话、era 丢失；现在引导后要连续 5 次 open 失败才降级，期间一直热重试 ws。
+   ② `/bridge/open` 失败只报一次错就躺平（无重试、visibilitychange 也不救）；现在带退避重试，
+   回到前台优先走 ws 热重连（`recoverTransport()`）。③ relay 被回收后 `pollLoop` 对着 410 每秒
+   空转永不恢复；现在 410 → 清 session → 尝试 ws 热重连（era 还在就续上，不在则服务端 4000 →
+   刷新）。附带修掉 `bridge/send 410` 抛进 promise 链造成的未处理拒绝风暴（51 次的那批）。
+5. **服务端 `/api/health` 补回 `sessions.detached`**（早前重构弄丢，reattach-test 一直在等它）。
+
+**问题二「左侧工作区目录折叠了点不开」**：shim 的左下角错误横幅（`#zcode-webui-error`）此前
+**永不消失、可吃点击、不限高**——任何 console.error（渲染层噪声、上述 410 风暴）都会常驻一块
+盖住侧栏底部的横幅，折叠分组/文件树落在下面就「点不开」，刷新（横幅清掉）才恢复。现在：
+`pointer-events:none`（只有通知按钮可点）、限高 132px、普通报错 20s 自动消失（服务端日志仍全量
+留存）、`ResizeObserver loop completed` 这类浏览器噪声只记日志不出横幅、活动通知（带按钮）不会被
+后续报错覆盖。渲染层黑盒内部若有自己的卡死无法从垫片修——但垫片侧的挡点击因素已清零。
+
+自检：`node scripts/dev/resume-replay-test.mjs`（13 项，协议级：可编程假 host 验证断线补帧重放 +
+keepalive 宽限；沙箱会显式钉 `ZCODE_SERVER_RUNTIME_ROOT` 并清 `NODE_OPTIONS`，避免从生产进程树
+继承环境串台）、`node scripts/dev/hot-reconnect-test.mjs`（11 项，真浏览器：热重连不刷新、上行
+冲刷、ws 失败不退 http、横幅穿透 + 自动消失）。注意 `scripts/dev/reattach-test.mjs` 是**过时存量**
+（断言的是多视图重构前的「每渲染层一个 host」架构，case 2 起必失败），现行覆盖以
+hot-reconnect/resume-replay 为准。
+
 ## 「完全访问」模式的官方语义（2026-09-18 排查结论）
 
 用户反馈「选了完全访问也不管用，每次都问」。受控复现（`scripts/dev/mode-switch-repro.mjs`，

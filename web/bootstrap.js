@@ -27,8 +27,28 @@
   }
 
   // ---- browser-side diagnostics: forward errors to the server log + visible banner ----
+  // Banner rules (learned the hard way): it floats over the bottom-left of the
+  // app, so it must NEVER take pointer events — a collapsed sidebar section
+  // underneath used to become unclickable until a page refresh. Plain error
+  // lines also self-remove after 20s (log forwarding keeps the full record);
+  // notices with action buttons stay until clicked and are never clobbered by
+  // later transient errors.
   var reported = 0;
   var lastDelivered = [];
+  var bannerTimer = 0;
+  var BANNER_NOISE = [
+    'ResizeObserver loop completed',   // browser layout noise, always benign
+  ];
+  function bannerEl() {
+    var el = document.getElementById('zcode-webui-error');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'zcode-webui-error';
+      el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:min(60%,520px);max-height:132px;overflow:hidden;background:#2b0f10;color:#ffb4ab;font:12px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre-wrap;word-break:break-all;pointer-events:none;';
+      document.body.appendChild(el);
+    }
+    return el;
+  }
   function noteDelivered(hex, len) {
     window.__zb_debug = true;
     lastDelivered.push(len + 'B:' + hex);
@@ -46,15 +66,20 @@
         keepalive: true
       }).catch(function () { /* ignore */ });
     } catch (e) { /* ignore */ }
+    var msg = String(message || '');
+    for (var i = 0; i < BANNER_NOISE.length; i++) {
+      if (msg.indexOf(BANNER_NOISE[i]) >= 0) return;   // log-only, no banner
+    }
     try {
-      var el = document.getElementById('zcode-webui-error');
-      if (!el) {
-        el = document.createElement('div');
-        el.id = 'zcode-webui-error';
-        el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:60%;background:#2b0f10;color:#ffb4ab;font:12px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre-wrap;word-break:break-all;';
-        document.body.appendChild(el);
-      }
-      el.textContent = '[zcode-webui] ' + kind + ': ' + (message || '') + (stack ? '\n' + String(stack).slice(0, 600) : '');
+      var el = bannerEl();
+      if (el.querySelector('button')) return;          // an active notice outranks this line
+      el.textContent = '[zcode-webui] ' + kind + ': ' + msg + (stack ? '\n' + String(stack).slice(0, 600) : '');
+      if (bannerTimer) clearTimeout(bannerTimer);
+      bannerTimer = setTimeout(function () {
+        bannerTimer = 0;
+        var b = document.getElementById('zcode-webui-error');
+        if (b && !b.querySelector('button')) b.remove();
+      }, 20000);
     } catch (e2) { /* ignore */ }
   }
   window.addEventListener('error', function (ev) {
@@ -75,19 +100,14 @@
   // banner with an action button (parked tab / lost connection)
   function showNotice(text, buttonText, onClick) {
     try {
-      var el = document.getElementById('zcode-webui-error');
-      if (!el) {
-        el = document.createElement('div');
-        el.id = 'zcode-webui-error';
-        el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;max-width:60%;background:#2b0f10;color:#ffb4ab;font:12px/1.5 monospace;padding:8px 10px;border-radius:8px;white-space:pre-wrap;word-break:break-all;';
-        document.body.appendChild(el);
-      }
+      if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = 0; }
+      var el = bannerEl();
       el.innerHTML = '';
       var t = document.createElement('div');
       t.textContent = '[zcode-webui] ' + text;
       var b = document.createElement('button');
       b.textContent = buttonText;
-      b.style.cssText = 'margin-top:8px;background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;';
+      b.style.cssText = 'margin-top:8px;background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;pointer-events:auto;';
       b.addEventListener('click', onClick);
       el.appendChild(t);
       el.appendChild(b);
@@ -176,6 +196,34 @@
   var uplinkChain = Promise.resolve();
   var reloadAttempts = 0;
   var portQueue = []; // binary frames that arrive before the renderer's port exists
+  var wsOpenFails = 0;      // consecutive ws open failures (http-fallback ladder, see onclose)
+  var httpRetryTimer = 0;   // bridge/open retry when the http fallback itself cannot open
+  var httpRetryDelay = 2000;
+  // Frames the renderer sent while no transport was open — flushed as soon as a
+  // transport comes back. Without this, service calls made during a dead-socket
+  // window (backgrounded tab, network blip) vanish silently and the UI promises
+  // waiting on them never settle: file-tree opens, list refreshes etc. hang.
+  var uplinkBuf = [];
+  var uplinkBufBytes = 0;
+
+  function queueUplink(data) {
+    var n = (data && data.length) || 0;
+    if (uplinkBuf.length < 256 && uplinkBufBytes + n <= 4 * 1024 * 1024) {
+      uplinkBuf.push(data);
+      uplinkBufBytes += n;
+      return;
+    }
+    uplinkBuf.length = 0;                      // a hole in the ordering — drop all
+    uplinkBufBytes = 0;
+    try { console.warn('[zcode-webui] uplink queue overflow; dropped buffered frames'); } catch (e) { /* ignore */ }
+  }
+  function flushUplink() {
+    if (!uplinkBuf.length) return;
+    var q = uplinkBuf;
+    uplinkBuf = [];
+    uplinkBufBytes = 0;
+    for (var i = 0; i < q.length; i++) sendToBridge(q[i]);
+  }
 
   function deliverToRenderer(u8) {
     if (port2) {
@@ -283,16 +331,25 @@
     }
     if (mode === 'ws') {
       if (ws && ws.readyState === 1) { try { ws.send(data); } catch (e) { /* ignore */ } }
+      else queueUplink(data);                       // socket down: replay when it returns
       return;
     }
-    if (mode === 'http' && httpSessionId) {
+    if (mode === 'http') {
+      if (!httpSessionId) { queueUplink(data); return; }
       uplinkChain = uplinkChain.then(function () {
         return fetch('bridge/send?id=' + httpSessionId, {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
           body: data
         });
-      }).then(function (r) { if (!r.ok) throw new Error('send ' + r.status); }, function () { /* keep chain alive */ });
+      }).then(function (r) {
+        // never throw from this chain: a dead relay turned every queued send
+        // into an unhandledrejection storm (51 logged occurrences) that kept
+        // re-painting the error banner. The 410 recovery path is pollLoop's job.
+        if (!r.ok && r.status !== 410) {
+          try { console.warn('[zcode-webui] bridge/send HTTP ' + r.status); } catch (e) { /* ignore */ }
+        }
+      }, function () { /* keep chain alive */ });
     }
   }
 
@@ -325,12 +382,37 @@
       })
       .then(function (buf) { parseHttpFrames(buf); pollLoop(); })
       .catch(function (e) {
-        if (mode === 'http') setTimeout(pollLoop, 1000);
+        if (mode !== 'http') return;
+        if (e && e.message === 'session-gone') {
+          // relay reaped server-side (idle TTL / restart). Without this branch
+          // the loop used to spin on 410s forever with no recovery. Prefer the
+          // ws hot-resume path — the tab's era may still be parked on the
+          // session host; if it is gone the server answers close 4000 and the
+          // page reloads clean.
+          httpSessionId = null;
+          recoverTransport();
+          return;
+        }
+        setTimeout(pollLoop, 1000);
       });
+  }
+
+  // Bring SOME transport back when the current one is verifiably dead, always
+  // preferring the ws hot-resume path (it keeps the renderer era alive and the
+  // server replays the offline gap; the http fallback can do neither).
+  function recoverTransport() {
+    if (mode === 'ws') {
+      if (!ws || ws.readyState > 1) connect();
+      return;
+    }
+    if (httpRetryTimer) { clearTimeout(httpRetryTimer); httpRetryTimer = 0; }
+    mode = 'ws';
+    connect();
   }
 
   function startHttpMode() {
     if (mode === 'http' && httpSessionId) return;
+    if (httpRetryTimer) { clearTimeout(httpRetryTimer); httpRetryTimer = 0; }
     mode = 'http';
     console.warn('[zcode-webui] websocket unavailable, switching to http polling bridge');
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
@@ -339,12 +421,24 @@
       .then(function (o) {
         if (!o.ok) throw new Error(o.error || 'open failed');
         httpSessionId = o.id;
+        httpRetryDelay = 2000;
         reloadAttempts = 0;
+        wsOpenFails = 0;
         deliverPort();
         pollLoop();
+        flushUplink();
       })
       .catch(function (e) {
         report('bridge-open-failed', String(e.message || e));
+        // retry with backoff: a single failed open used to leave the page with
+        // NO transport and NO recovery path — only a manual refresh could save it
+        if (mode === 'http' && !httpSessionId) {
+          httpRetryDelay = Math.min(httpRetryDelay * 2, 30000);
+          httpRetryTimer = setTimeout(function () {
+            httpRetryTimer = 0;
+            if (mode === 'http' && !httpSessionId) startHttpMode();
+          }, httpRetryDelay);
+        }
       });
   }
 
@@ -395,7 +489,7 @@
     wsOpened = false;
     ws = new WebSocket(wsUrl());
     ws.binaryType = 'arraybuffer';
-    ws.onopen = function () { wsOpened = true; reloadAttempts = 0; hotAttempts = 0; };
+    ws.onopen = function () { wsOpened = true; reloadAttempts = 0; hotAttempts = 0; wsOpenFails = 0; };
     ws.onmessage = function (ev) {
       // the very first message MUST be our ready signal; a foreign websocket
       // server (e.g. code-server's own /ws when the URL lacked a trailing slash)
@@ -404,6 +498,7 @@
         if (typeof ev.data === 'string' && ev.data === WS_READY) {
           wsVerified = true;
           deliverPort();
+          flushUplink();                         // frames the renderer sent while offline
         } else {
           console.warn('[zcode-webui] unexpected ws peer, closing and falling back to http');
           try { ws.close(); } catch (e) { /* ignore */ }
@@ -434,7 +529,18 @@
     };
     ws.onclose = function (ev) {
       if (mode !== 'ws') return;
-      if (!wsOpened) { startHttpMode(); return; }
+      if (!wsOpened) {
+        // Open failure. Before the first successful bootstrap this is the
+        // "proxy refuses websocket upgrades" case → http fallback. AFTER the
+        // page has booted it is almost always transient (laptop waking, parked
+        // tab, network blip): keep hot-retrying ws — flipping to http here used
+        // to strand an already-booted renderer on a brand-new host. Only after
+        // several consecutive failures do we accept ws is really gone.
+        wsOpenFails++;
+        if (!everDelivered || wsOpenFails >= 5) { startHttpMode(); return; }
+        scheduleHotReconnect();
+        return;
+      }
       if (ev.code === 4000 || ev.code === 1011) {
         // host exited (crash / server restart): the renderer must re-bootstrap
         // against a fresh host, which needs a page reload — but NEVER while the
@@ -478,22 +584,32 @@
     // back in the foreground: fresh recovery budget + immediate action
     hotAttempts = 0;
     reloadAttempts = 0;
+    wsOpenFails = 0;
     if (pendingHostReboot) { pendingHostReboot = false; window.location.reload(); return; }
-    if (mode === 'ws' && (!ws || ws.readyState > 1)) connect();
-  });
-  window.addEventListener('pageshow', function (ev) {
-    if (!ev.persisted) return;                     // bfcache restore: socket is dead
-    hotAttempts = 0; reloadAttempts = 0;
     if (mode === 'ws') {
       if (!ws || ws.readyState > 1) connect();
     } else if (mode === 'http' && !httpSessionId) {
-      startHttpMode();
+      // parked in http mode with a dead relay (bridge/open failed while the tab
+      // was hidden): prefer the ws hot-resume path now that we are visible
+      recoverTransport();
+    }
+  });
+  window.addEventListener('pageshow', function (ev) {
+    if (!ev.persisted) return;                     // bfcache restore: socket is dead
+    hotAttempts = 0; reloadAttempts = 0; wsOpenFails = 0;
+    if (mode === 'ws') {
+      if (!ws || ws.readyState > 1) connect();
+    } else if (mode === 'http' && !httpSessionId) {
+      recoverTransport();
     }
   });
 
   // debug/test hook: current socket readiness (0 connecting, 1 open, 3 closed)
   window.__zwebui_ws = function () { return ws ? ws.readyState : -1; };
   window.__zwebui_wsDrop = function () { try { if (ws) ws.close(); } catch (e) { /* ignore */ } };
+  // debug/test hook: enqueue a frame exactly as the renderer's port would
+  // (goes through the uplink buffer when the transport is down)
+  window.__zwebui_send = function (data) { sendToBridge(data); };
 
   // debug/transport override: ?transport=http forces the HTTP polling bridge
   // (useful behind proxies that never forward WebSocket upgrades)
