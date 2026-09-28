@@ -291,7 +291,78 @@ keepalive 宽限；沙箱会显式钉 `ZCODE_SERVER_RUNTIME_ROOT` 并清 `NODE_O
 （断言的是多视图重构前的「每渲染层一个 host」架构，case 2 起必失败），现行覆盖以
 hot-reconnect/resume-replay 为准。
 
+## 官方源码对照与垫片强化（2026-09-28，v0.8.1）
+
+官方已开源 ZCode（`github.com/zai-org/ZCode`，HEAD 与线上 v3.14.3 一致），克隆在
+**`/home/coder/dsh-projects/zcode-src`**（pnpm monorepo：`packages/rpc` 协议层、`packages/server`
+宿主、`packages/services` 服务面、`packages/ui` 渲染层、`apps/zcode-cli` Agent CLI 与运行时）。
+六路对照（协议/快照/配额/pin+mode/引导握手/任务索引+侧栏）已把历史黑盒结论逐条验证，要点：
+
+**证实（不再需要猜）**：13 字节帧头与 preset 0-6；100~104/200~204 消息类型；stdio 握手
+zcode-hello/hello-ack；cancel/dispose 引用调用方原始 id 且宿主对未知 id 静默忽略；
+`zcode-task` 通道、`setTaskPinned`/`setMode` 单元素数组参数、`handler.apply(ctx, args)` 解包；
+yolo 放行（`permission/service.ts`："Yolo mode bypasses permission prompts"，例外：requiresUser
+Interaction/alwaysAsk 工具仍弹窗、planEnabled 优先）；quota/limit 口径（usage=额度、percentage=
+已用%、number 是身份键非除数）；reset 幂等键在 **body 字段 `idempotency_key`**（uuid，≤64 字符）；
+双 JWT 头（`Authorization` + `X-Bigmodel-Authorization` + `Bigmodel-Target-Type`，仅 reset 与
+official-MCP 通道带，模型调用只带单 Authorization）；3.12+ 引导握手（service-port 对象形式 +
+database-startup-state strict schema + 30s 超时合成 `startup-channel-unavailable`）；`window.zcode`
+共 114 个方法（非 130）。
+
+**勘误（黑盒结论与源码不符）**：
+1. **202=PromiseError（结构化 Error）、203=PromiseErrorObj**，不是"further/cancelled"——我们
+   routeDownstream 把 201/202/203 一律按"响应"路由，行为正确，注释已正。
+2. **`fault.connection.clientChanged` 是每连接 scope 级**（每条 WS/MessagePort 一个
+   connectionScope，stdio hello 层的 clientId 只记日志不校验），不是"一个 host 只认一个
+   clientId"；共享 deviceId 的做法仍安全。
+3. **官方没有「1308=5h、1310=周」的 scope 二分**（workflow-model-failure-policy.ts 把全家当同一种
+   quota 停机）——该二分是我们从上游文案推断的启发式，保留为精确映射；守卫已扩到官方全集
+   {1005,1308,1310,1313,1316~1321,2056,20097}（其余→ANY，按实际耗尽的池施救），正则补
+   `error_code` 字段变体。
+4. **`billing/current` 已废弃**（v3.14.3 无调用方）；api-cache-guard 模式里保留属防御性兼容。
+5. localStorage 键拼接：drafts 键带 `encodeURIComponent(wsKey)`，recent 键无 `:v1` 后缀。
+6. **开源树里没有 repo 快照上传功能**（captureBeforePromptUnsafe/upload-credential/checkpoints
+   目录均不存在）——发行 bundle 与 OSS 树**不同源**；但开源树证实宿主 API 层走内置 undici、
+   OSS 类上传走 node:http/https，**globalThis.fetch 补丁对官方两大出口都不可见**。守卫已加
+   layer 1b：`node:http/https.request` 层拦 `/api/v1/snapshot/upload-credential`（构造真实
+   ClientRequest 后 nextTick destroy，对调用方表现为网络错误；`http.get` 同步覆盖）。
+7. tasks-index 的 `task_status` 合法值只有 **running/completed/error**（无 pending；可空）；
+   **error 行在重试期间不刷新 updated_at**（zcodeTaskIndexSyncer 只在首次可见/终态/标题变化/
+   用户操作时写库）——quota-reset 守卫的 busy 检测已补「error 行 10 分钟内更新也算忙」
+   （`ZCODE_WEBUI_QUOTA_RESET_ERROR_FRESH_MS`）；官方 UI 自己也不信 sqlite 的 running
+   （只采信 sessions-index 的实时 phase）。
+8. 源码有而未用的信号，留档：`POST /reset/opportunity`（官方每次 status 轮询后顺带申请资格，
+   3301=denied+next_try_at、HTTP 429=throttled——若后端改为「机会需主动申请才发放」，纯观察
+   会拿不到机会）；`has_unread_history`（他端用过重置的免费信号）；429 的 `Retry-After` 头
+   （比 nextResetTime 轮询更及时）。
+
+**侧栏折叠点不开——真凶修正**（接上节问题二）：线上 web 构建其实**有**左上角 28×28 官方切换
+按钮（实测在 (13,15)，折叠后仍在），但两个真实卡点依旧：**R1** 会话区 <360px 时任何去抖 resize
+都会自动收起侧栏（WorkspaceShellLayout 的 conversation-auto-collapse：点开→下个 resize 立刻收回
+＝「点不开」；刷新后无 resize 事件所以「好了」）；**R3** 侧栏子树的 ScopedErrorBoundary resetKeys
+不含可见性（渲染报错后冻结到刷新）。处置：⚡/♻ 浮窗新增 **◧ 侧栏 chip**——代发官方
+`toggleSidebar` 快捷键（Cmd/Ctrl+B，`SHORTCUT_COMMANDS` 默认绑定；快捷键内核监听 window 捕获
+阶段、不查 isTrusted，合成 KeyboardEvent 可触发），直接驱动命令通道，不经过可能已坏掉的侧栏
+子树渲染；折叠时 label 变「◧ 展开侧栏」并高亮（hint 样式）。测试钩子
+`window.__zwebui_sidebarHidden/__zwebui_sidebarToggle`；自检
+`node scripts/dev/sidebar-toggle-test.mjs [base]`（默认打生产，ZOOM_TEST_ALLOW_PROD=1 确认；
+已在生产真机验证折叠/展开全链路）。
+
+**其余强化**：pin 伪造应答 body 从 undefined 改为**完整 ZCodeTaskMeta 形状**（渲染层会把返回值
+upsert 进置顶 store，undefined/瘦对象会写脏数据；响应头也按官方改为 2 元素 `[201,id]`、body
+为返回值本身不包数组）；`normalizeBoostMode` 补 `自动→auto`、`autoedit→autoEdit`（官方
+ZCodeTaskMode 六值：yolo/plan/edit/auto/autoEdit/build；auto 走宿主旧 op、autoEdit 被宿主映射
+为 build，均放行由宿主裁决）；桥的官方模式下拉映射补「自动」；bootstrap 应答渲染层的
+`zcode:database-startup-control {action:'snapshot'}` 请求（官方 reload 竞态解法：main 进程重放
+最新 state；此前我们不答，靠 500ms 主动重发覆盖）。
+
+自检增量：`pin-guard-test`（+2：meta 形状、workspaceIdentity 透传）、`mode-boost-test`（46 项，含
+新别名）、`quota-reset-guard-test`（+8：官方码族、error_code 变体、error 行 busy）、
+`repo-snapshot-guard-test`（+4：node:http request/get 拦截与放行）、新增
+`sidebar-toggle-test`（6 项）。hot-reconnect 11 项复跑全绿。
+
 ## 「完全访问」模式的官方语义（2026-09-18 排查结论）
+
 
 用户反馈「选了完全访问也不管用，每次都问」。受控复现（`scripts/dev/mode-switch-repro.mjs`，
 真浏览器跑官方渲染层）证明**垫片层没有问题**——空闲时或回合流式输出中切换都正常：

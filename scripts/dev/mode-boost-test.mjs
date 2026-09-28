@@ -58,8 +58,8 @@ console.log('normalizeBoostMode accepts renderer value space + picker labels');
 for (const [input, want] of [
   ['yolo', 'yolo'], ['Yolo', 'yolo'], ['完全访问', 'yolo'], ['dontAsk', 'yolo'], ['bypassPermissions', 'yolo'],
   ['build', 'build'], ['变更前确认', 'build'], ['default', 'build'], ['默认模式', 'build'], ['defaultMode', 'build'],
-  ['edit', 'edit'], ['自动编辑', 'edit'], ['acceptEdits', 'edit'], ['autoEdit', 'edit'],
-  ['plan', 'plan'], ['计划模式', 'plan'], ['auto', 'auto'],
+  ['edit', 'edit'], ['自动编辑', 'edit'], ['acceptEdits', 'edit'], ['autoEdit', 'autoEdit'],
+  ['plan', 'plan'], ['计划模式', 'plan'], ['auto', 'auto'], ['自动', 'auto'],
 ]) check(String(input) + ' → ' + want, normalizeBoostMode(input) === want, 'got ' + normalizeBoostMode(input));
 for (const bad of ['', 'nonsense', null, undefined, 42, {}, 'yoloo']) {
   check('reject ' + JSON.stringify(bad), normalizeBoostMode(bad) === null, 'got ' + normalizeBoostMode(bad));

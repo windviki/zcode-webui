@@ -48,11 +48,25 @@ for (const [name, buf, want] of cases) {
 const hdr = interceptPinRpc(cases[0][1]);
 const ack = pinAckFor(hdr, 42);
 const d = decodeRpc(ack);   // {type, id, channel, method, body}
-const ackOk = d.type === 201 && d.id === 42
-  && d.channel === 'zcode-task' && d.method === 'setTaskPinned'
-  && d.body === undefined;
+// wire shape per the official ChannelServer: response header is [201, id] and
+// the body is the handler's return value itself — for setTaskPinned a full
+// ZCodeTaskMeta the renderer upserts into its pinned store
+const metaOk = d.body && typeof d.body === 'object'
+  && d.body.taskId === 'sess_x' && d.body.workspacePath === '/w' && d.body.pinned === true
+  && typeof d.body.createdAt === 'number' && typeof d.body.updatedAt === 'number'
+  && typeof d.body.mode === 'string' && typeof d.body.status === 'string'
+  && typeof d.body.title === 'string' && typeof d.body.traceId === 'string';
+const ackOk = d.type === 201 && d.id === 42 && metaOk;
 if (!ackOk) bad++;
-console.log((ackOk ? 'PASS' : 'FAIL') + '  synthetic ack is a 201 response with the caller id  (' + JSON.stringify(d) + ')');
+console.log((ackOk ? 'PASS' : 'FAIL') + '  synthetic ack is a 201 response with a full ZCodeTaskMeta body  (' + JSON.stringify(d) + ')');
+
+// workspaceIdentity passthrough when the renderer includes it (remote workspaces)
+const hdrR = interceptPinRpc(msg([100, 7, 'zcode-task', 'setTaskPinned'],
+  [{ taskId: 'sess_y', workspacePath: '/w', workspaceIdentity: 'ri:1', pinned: true }]));
+const ackR = decodeRpc(pinAckFor(hdrR, 43));
+const ackROk = ackR.type === 201 && ackR.id === 43 && ackR.body && ackR.body.workspaceIdentity === 'ri:1';
+if (!ackROk) bad++;
+console.log((ackROk ? 'PASS' : 'FAIL') + '  ack carries workspaceIdentity when the call did');
 
 console.log(bad === 0 ? '\nall pin guard checks passed' : '\n' + bad + ' check(s) failed');
 process.exit(bad ? 1 : 0);

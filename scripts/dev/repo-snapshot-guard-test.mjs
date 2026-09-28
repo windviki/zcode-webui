@@ -121,6 +121,36 @@ check('reading state.json works', fsResult.readBack === 'allowed', String(fsResu
 check('reading manifests works (delta base)', fsResult.manifestRead === 'allowed', String(fsResult.manifestRead));
 check('writes outside checkpoints/ are untouched', fsResult.outsideWrite === 'allowed', String(fsResult.outsideWrite));
 
+// ---------- node:http/https layer (1b) ----------
+// The official host's own API layer runs on bundled undici and its OSS uploader
+// on plain node:http/https — neither sees the globalThis.fetch patch. If the
+// deployed snapshot bundle ever moves the credential call there, the guard must
+// fail it before connect (a failed credential keeps the capture inert).
+const httpProbe = `
+const http = require('node:http');
+(async () => {
+  const out = {};
+  const attempt = (path) => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: 9, path, method: 'GET' });
+    req.on('error', (e) => resolve('error:' + String((e && e.message) || e).slice(0, 60)));
+    req.on('response', (r) => resolve('response:' + r.statusCode));
+    req.end();
+  });
+  out.blocked = await attempt('/api/v1/snapshot/upload-credential?x=1');
+  out.passthrough = await attempt('/health');
+  out.getBlocked = await new Promise((resolve) => {
+    http.get({ host: '127.0.0.1', port: 9, path: '/api/v1/snapshot/upload-credential' }, (r) => resolve('response:' + r.statusCode))
+      .on('error', (e) => resolve('error:' + String((e && e.message) || e).slice(0, 60)));
+  });
+  console.log(JSON.stringify(out));
+})();
+`;
+const httpRun = runProbe(httpProbe);
+check('node:http credential request is failed by the guard', httpRun.json && /^error:/.test(httpRun.json.blocked) && /zcode-webui/.test(httpRun.json.blocked), JSON.stringify(httpRun.json));
+check('node:http credential block is logged', /blocked upload-credential request #\d+ \(http\)/.test(httpRun.stderr));
+check('node:http unrelated request still reaches the real stack', httpRun.json && /^error:/.test(httpRun.json.passthrough) && !/zcode-webui/.test(httpRun.json.passthrough), JSON.stringify(httpRun.json));
+check('node:http.get credential request is failed too', httpRun.json && /^error:/.test(httpRun.json.getBlocked) && /zcode-webui/.test(httpRun.json.getBlocked), JSON.stringify(httpRun.json));
+
 // ---------- escape hatch ----------
 const disarmed = runProbe(passthroughProbe.replace('http://127.0.0.1:9/health', 'http://127.0.0.1:9/api/v1/snapshot/upload-credential?workspace_id=x'), {
   ZCODE_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-webui-guard-off-')),

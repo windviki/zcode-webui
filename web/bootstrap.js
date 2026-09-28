@@ -255,6 +255,7 @@
     return M > major || (M === major && m >= minor);
   }
 
+  var lastStartupStateMsg = null;
   function postDatabaseStartupState(startupId) {
     var now = Date.now();
     var msg = {
@@ -271,6 +272,7 @@
         disk: []
       }
     };
+    lastStartupStateMsg = msg;
     var send = function () { try { window.postMessage(msg, '*'); } catch (e) { /* ignore */ } };
     send();
     // the renderer registers its message listener in the same module execution that
@@ -278,6 +280,22 @@
     // ignored by the renderer's startupId+sequence rule)
     setTimeout(send, 500);
   }
+
+  // The renderer can also ASK for a state replay: at module end it posts
+  // {type:'zcode:database-startup-control', control:{action:'snapshot'}} (the
+  // desktop preload forwards that to the main process, whose relay re-sends the
+  // latest state — the official reload-race solution). We play the "main
+  // process" here and answer snapshot requests the same way, so a renderer
+  // that asks later than our proactive sends still boots instead of waiting
+  // out its 30s startup-status timeout. (Duplicate states are ignored by the
+  // renderer's same-startupId + sequence>=rule, so re-sending is always safe.)
+  window.addEventListener('message', function (ev) {
+    if (ev.source !== window || !ev.data || ev.data.type !== 'zcode:database-startup-control') return;
+    var c = ev.data.control || {};
+    if (c.action === 'snapshot' && lastStartupStateMsg) {
+      try { window.postMessage(lastStartupStateMsg, '*'); } catch (e) { /* ignore */ }
+    }
+  });
 
   function deliverPort() {
     if (delivered) {

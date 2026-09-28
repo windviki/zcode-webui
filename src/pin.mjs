@@ -55,10 +55,44 @@ export function interceptPinRpc(payload) {
   return call;
 }
 
-// Synthetic "ok" answer a swallowed call resolves with (201 = response).
+// Synthetic "ok" answer a swallowed call resolves with (201 = PromiseSuccess).
+// The official renderer upserts the returned ZCodeTaskMeta into its pinned store
+// (WorkspaceSidebarItem does upsertTask(result)), so the body must be a
+// full-shaped meta object — an undefined body would plant a malformed entry.
+// Fields we cannot know at intercept time get neutral defaults (the pinned
+// section is not rendered in this shell anyway; the goal is a clean no-op).
+function serializeObjectRpc(obj) {
+  const json = Buffer.from(JSON.stringify(obj), 'utf8');
+  // preset 5 (object/JSON) + VQL length + payload, same wire format as the
+  // official serializer's Object branch
+  const len = [];
+  let v = json.length;
+  if (v === 0) len.push(0);
+  else while (v !== 0) { len.push(v & 127); v = v >>> 7; }
+  for (let i = 0; i < len.length - 1; i++) len[i] |= 128;
+  return Buffer.concat([Buffer.from([5]), Buffer.from(len), json]);
+}
 export function pinAckFor(call, id) {
+  const p = (call && call.params) || {};
+  const now = Date.now();
+  const meta = {
+    taskId: typeof p.taskId === 'string' ? p.taskId : '',
+    traceId: '',
+    title: '',
+    workspacePath: typeof p.workspacePath === 'string' ? p.workspacePath : '',
+    createdAt: now,
+    updatedAt: now,
+    mode: 'build',
+    status: 'completed',
+    pinned: true,
+  };
+  if (typeof p.workspaceIdentity === 'string' && p.workspaceIdentity) meta.workspaceIdentity = p.workspaceIdentity;
+  // Response wire shape per the official ChannelServer: serialize([201, id]) +
+  // serialize(data) — the response header carries only [type, id] (no
+  // channel/method), and data is the handler's RETURN VALUE itself
+  // (ZCodeTaskMeta); the args-array wrapper exists only on the request side.
   return Buffer.concat([
-    encodeRpcHeader([201, id, call.channel, call.method]),
-    Buffer.from([0]),                     // body: preset 0 (undefined)
+    encodeRpcHeader([201, id]),
+    serializeObjectRpc(meta),
   ]);
 }

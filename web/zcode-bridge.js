@@ -412,6 +412,7 @@
       if (t === '完全访问') return 'yolo';
       if (t === '自动编辑') return 'edit';
       if (t === '计划模式') return 'plan';
+      if (t === '自动') return 'auto';       // ZCodeTaskMode 'auto' (legacy setMode path)
     } catch (e) { /* ignore */ }
     return 'build';
   }
@@ -469,6 +470,47 @@
       setTimeout(renderQresetButton, 4000);
     });
   }
+
+  // ---- official sidebar toggle (◧) ----
+  // Product gap confirmed in the open-source renderer (v3.14.3): the sidebar's
+  // expand/collapse button is DESKTOP-ONLY (DesktopTopOverlay renders it just
+  // for win/linux caption areas and mac), and sidebar visibility is a
+  // non-persistent in-memory state. In a browser there is NOTHING clickable to
+  // reopen a collapsed sidebar — only the Cmd/Ctrl+B shortcut — so a collapsed
+  // sidebar felt "stuck" until a page refresh (which resets visibility). This
+  // chip drives the OFFICIAL command path (SHORTCUT_COMMANDS.toggleSidebar,
+  // default CmdOrCtrl+B; the renderer's keyboard kernel listens on window in
+  // the capture phase and does not check isTrusted), so both directions work.
+  var sidebarBtn = null;
+  function sidebarHidden() {
+    var el = document.querySelector('[data-workspace-sidebar-panel]');
+    // hidden state applies the `opacity-0` utility class (plus pointer-events-none)
+    return !!(el && el.classList && el.classList.contains('opacity-0'));
+  }
+  function toggleOfficialSidebar() {
+    var mac = /mac/i.test(String((navigator && navigator.platform) || (navigator && navigator.userAgent) || ''));
+    try {
+      window.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'b', code: 'KeyB', bubbles: true, cancelable: true,
+        ctrlKey: !mac, metaKey: mac,
+      }));
+    } catch (e) { return false; }
+    try { console.info('[zcode-webui] sidebar toggle dispatched (official CmdOrCtrl+B path)'); } catch (e) { /* ignore */ }
+    return true;
+  }
+  function renderSidebarButton() {
+    if (!sidebarBtn) return;
+    var hidden = sidebarHidden();
+    sidebarBtn.className = 'zwebui-sidebar' + (hidden ? ' hint' : '');
+    sidebarBtn.__lbl.textContent = hidden ? '◧ 展开侧栏' : '◧ 侧栏';
+    sidebarBtn.title = hidden
+      ? '官方 Web 渲染层没有可点击的侧栏展开按钮（折叠后只能 Ctrl/Cmd+B 或刷新页面）——这里代发官方快捷键把侧栏展开。可拖动。'
+      : '收起/展开左侧栏（代发官方 Cmd/Ctrl+B 快捷键，与官方按钮等效）。可拖动。';
+  }
+
+  // debug/test hooks: official sidebar visibility + the toggle driver
+  window.__zwebui_sidebarHidden = sidebarHidden;
+  window.__zwebui_sidebarToggle = toggleOfficialSidebar;
 
   // ---- position / drag ----
   // Default berth: just OUTSIDE the top-right corner of the composer surface
@@ -539,16 +581,17 @@
         + '.zwebui-boost-panel{position:fixed;z-index:99999;display:flex;flex-direction:column;align-items:flex-end;gap:6px;'
         + 'user-select:none;-webkit-user-select:none;touch-action:none;}'
         + '.zwebui-boost-panel.dragging{opacity:.88;}'
-        + '.zwebui-boost-panel.dragging .zwebui-boost,.zwebui-boost-panel.dragging .zwebui-qreset{cursor:grabbing;}'
-        + '.zwebui-boost,.zwebui-qreset{display:inline-flex;align-items:center;gap:6px;'
+        + '.zwebui-boost-panel.dragging .zwebui-boost,.zwebui-boost-panel.dragging .zwebui-qreset,.zwebui-boost-panel.dragging .zwebui-sidebar{cursor:grabbing;}'
+        + '.zwebui-boost,.zwebui-qreset,.zwebui-sidebar{display:inline-flex;align-items:center;gap:6px;'
         + 'padding:7px 14px;border:1px solid var(--color-border,#2c3138);border-radius:999px;'
         + 'background:var(--color-surface,#1a1e23);color:var(--color-foreground,#e8eaed);'
         + 'font:600 12px/1 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;cursor:grab;'
         + 'box-shadow:0 6px 24px rgba(0,0,0,.35);user-select:none;-webkit-user-select:none;touch-action:none;}'
-        + '.zwebui-boost:hover,.zwebui-qreset:hover{background:var(--color-surface-hover,#262b31);}'
+        + '.zwebui-boost:hover,.zwebui-qreset:hover,.zwebui-sidebar:hover{background:var(--color-surface-hover,#262b31);}'
         + '.zwebui-boost.on,.zwebui-qreset.on{border-color:rgba(84,214,138,.6);background:rgba(84,214,138,.14);color:#63d68f;}'
         + '.zwebui-boost.err,.zwebui-qreset.err{border-color:rgba(255,99,99,.7);color:#ff8a8a;}'
-        + '.zwebui-boost .dot,.zwebui-qreset .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;}';
+        + '.zwebui-sidebar.hint{border-color:rgba(255,212,121,.7);background:rgba(255,212,121,.12);color:#ffd479;}'
+        + '.zwebui-boost .dot,.zwebui-qreset .dot,.zwebui-sidebar .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto;}';
       var st = document.createElement('style');
       st.textContent = css;
       (document.head || document.documentElement).appendChild(st);
@@ -556,12 +599,15 @@
       boostPanel.className = 'zwebui-boost-panel';
       boostBtn = makeBoostChip('zwebui-boost');
       qresetBtn = makeBoostChip('zwebui-qreset');
+      sidebarBtn = makeBoostChip('zwebui-sidebar');
       boostPanel.appendChild(boostBtn);
       boostPanel.appendChild(qresetBtn);
+      boostPanel.appendChild(sidebarBtn);
       (document.body || document.documentElement).appendChild(boostPanel);
       installBoostDrag();
       renderBoostButton();
       renderQresetButton();
+      renderSidebarButton();
       loadQuotaReset();
       var saved = savedBoostPos();
       if (saved) { boostDragged = true; placeBoost(saved.x, saved.y); }
@@ -571,6 +617,7 @@
         if (!boostPanel) return;
         if (!boostDragged) dockBoost();
         else placeBoost(parseFloat(boostPanel.style.left) || 0, parseFloat(boostPanel.style.top) || 0);
+        renderSidebarButton();          // label follows the official visibility state
       }, 500);
     } catch (e) { boostPanel = null; }
   }
@@ -581,7 +628,7 @@
     var drag = null;
     boostPanel.addEventListener('pointerdown', function (e) {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
-      var chip = e.target && e.target.closest ? e.target.closest('.zwebui-boost,.zwebui-qreset') : null;
+      var chip = e.target && e.target.closest ? e.target.closest('.zwebui-boost,.zwebui-qreset,.zwebui-sidebar') : null;
       drag = {
         id: e.pointerId, sx: e.clientX, sy: e.clientY, chip: chip,
         bx: parseFloat(boostPanel.style.left) || 0, by: parseFloat(boostPanel.style.top) || 0,
@@ -620,6 +667,7 @@
       } else if (chip) {
         if (chip === boostBtn) setBoost(!boostOn, true);
         else if (chip === qresetBtn) setQreset(!qresetOn);
+        else if (chip === sidebarBtn) toggleOfficialSidebar();
       }
     };
     boostPanel.addEventListener('pointerup', finish);

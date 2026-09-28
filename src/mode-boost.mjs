@@ -75,11 +75,17 @@ export function buildSetModeCall(gid, taskId, mode) {
 }
 
 // Accept the renderer's full mode value space plus the zh/en picker labels.
+// Official ZCodeTaskMode = yolo|plan|edit|auto|autoEdit|build (zcode-task-types-
+// core.ts); the composer's submission space is only build|edit|plan|yolo
+// (submission.ts). 'auto' routes to a legacy session/setMode RPC inside the
+// host instead of the v4 command, 'autoEdit' is host-mapped onto build — both
+// are accepted and passed through; the host owns the mapping.
 const MODE_ALIASES = {
   default: 'build', build: 'build', 自动编辑: 'edit', edit: 'edit', acceptedits: 'edit',
   计划模式: 'plan', plan: 'plan', 完全访问: 'yolo', yolo: 'yolo',
   defaultmode: 'build', 默认模式: 'build', 变更前确认: 'build',
-  dontask: 'yolo', bypasspermissions: 'yolo', autoedit: 'edit', auto: 'auto',
+  dontask: 'yolo', bypasspermissions: 'yolo', autoedit: 'autoEdit',
+  自动: 'auto', auto: 'auto',
 };
 export function normalizeBoostMode(v) {
   if (typeof v !== 'string') return null;

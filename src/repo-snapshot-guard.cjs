@@ -138,6 +138,70 @@ function installFetchGuard() {
   };
 }
 
+// --- layer 1b: credential requests over node:http / node:https -------------------------
+// The open-source tree (v3.14.3) shows the official host's API layer runs on the
+// runtime's bundled undici (nodeApiNetwork.ts) and its OSS uploader on plain
+// node:http/https request + createReadStream — NEITHER passes through the
+// globalThis.fetch patch above. The deployed snapshot bundle currently still
+// uses fetch (layer 1 keeps firing in production), but if it ever follows the
+// same pattern, this layer fails the credential call before it connects: a
+// failed credential request leaves the capture pipeline inert exactly like a
+// null credential (the runtime swallows the failure itself).
+function requestUrlOf(args) {
+  const a = args && args[0];
+  try {
+    if (typeof a === 'string') return a;
+    if (a instanceof URL) return a.href;
+    if (a && typeof a === 'object') {
+      const host = a.hostname || a.host || '';
+      const proto = a.protocol || (a.secureEndpoint ? 'https:' : 'http:');
+      return proto + '//' + host + (a.path || a.pathname || '/');
+    }
+  } catch (_e) { /* never break traffic over parsing */ }
+  return '';
+}
+
+function blockedHttpRequest(mod, modName, originalRequest) {
+  STATS.credential += 1;
+  log('blocked upload-credential request #' + STATS.credential + ' (' + modName + ') — failing the call before connect');
+  // A genuine ClientRequest against an unroutable target, destroyed on the next
+  // tick with our error: callers keep a real request object (on/error/destroy),
+  // and the failure surfaces exactly like a network error.
+  let req = null;
+  try { req = originalRequest.call(mod, { host: '127.0.0.1', port: 1, path: '/', method: 'GET' }); } catch (_e) { /* fall through */ }
+  if (req) {
+    process.nextTick(() => { try { req.destroy(new Error('repo snapshot upload disabled by zcode-webui')); } catch (_e) { /* ignore */ } });
+    return req;
+  }
+  throw new Error('repo snapshot upload disabled by zcode-webui');
+}
+
+function installHttpGuard() {
+  for (const [name, mod] of [['http', require('node:http')], ['https', require('node:https')]]) {
+    const originalRequest = mod.request;
+    const originalGet = mod.get;
+    if (typeof originalRequest !== 'function' || PATCHED.has(originalRequest)) continue;
+    PATCHED.add(originalRequest);
+    mod.request = function guardedHttpRequest(...args) {
+      if (ENABLED && isCredentialRequest(requestUrlOf(args))) {
+        return blockedHttpRequest(mod, name, originalRequest);
+      }
+      return originalRequest.apply(mod, args);
+    };
+    if (typeof originalGet === 'function' && !PATCHED.has(originalGet)) {
+      PATCHED.add(originalGet);
+      mod.get = function guardedHttpGet(...args) {
+        if (ENABLED && isCredentialRequest(requestUrlOf(args))) {
+          const req = blockedHttpRequest(mod, name, originalRequest);
+          if (req && typeof req.end === 'function') { try { req.end(); } catch (_e) { /* ignore */ } }
+          return req;
+        }
+        return originalGet.apply(mod, args);
+      };
+    }
+  }
+}
+
 // --- layer 3: checkpoint artifact writes ---------------------------------------------
 
 const PATCHED = new WeakSet();
@@ -264,6 +328,7 @@ function installFsGuard() {
 
 function install() {
   installFetchGuard();
+  installHttpGuard();
   installFsGuard();
   if (ENABLED) {
     log('armed — repo-snapshot capture/upload disabled (checkpoint root: ' + CHECKPOINT_ROOT

@@ -239,6 +239,13 @@ check('429 + code 1308 → FIVE_HOUR-scoped signal', await guard.exhaustionScope
 check('plain 429 rate limit (RPM) → no signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429(undefined, 'too many requests')) === null);
 check('non-quota failure (502) → no signal', await guard.exhaustionScopeOf('https://zcode.z.ai/api/v1/mcp/usage', new Response('{}', { status: 502 })) === null);
 check('429 text-only quota message → unscoped signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', new Response('{"msg":"您的额度已用完"}', { status: 429 })) === 'ANY');
+// official WORKFLOW_QUOTA_PROVIDER_CODES family members beyond 1308/1310 (the
+// official client makes no per-pool distinction; we map the rest to ANY)
+check('429 + code 1313 → ANY signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429('1313', '[1310][您已达到每周/每月使用上限。]')) === 'ANY');
+check('429 + code 1318 → ANY signal', await guard.exhaustionScopeOf('https://api.z.ai/api/anthropic', quota429('1318', 'quota')) === 'ANY');
+check('429 + code 1005 → ANY signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429('1005', 'insufficient quota')) === 'ANY');
+check('429 + plain code 1311 (non-quota family) → no signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', quota429('1311', 'request failed')) === null);
+check('429 + error_code variant → scoped signal', await guard.exhaustionScopeOf('https://open.bigmodel.cn/api/anthropic', new Response('{"error_code":"1310","message":"已达到每周使用上限"}', { status: 429 })) === 'WEEK');
 // …and the child-observer path writes it to the signal file the host drains
 await globalThis.fetch('https://open.bigmodel.cn/api/anthropic/v1/messages', { method: 'POST', headers: { authorization: 'Bearer x' }, body: '{}' });
 check('429 wall appends a WEEK-scoped signal for the host', existsSync(signalFile) && /"scope":"WEEK"/.test(readFileSync(signalFile, 'utf8')));
@@ -331,6 +338,25 @@ const withTaskIndex = (home, fn) => {
     if (prev === undefined) delete process.env.ZCODE_HOME; else process.env.ZCODE_HOME = prev;
   });
 };
+// fresh 'error' rows also mean "a session is alive": the official syncer writes
+// no updated_at while an errored turn retries (the 2026-09-28 wall incident)
+const errFreshHome = mkdtempSync(path.join(tmpdir(), 'quota-reset-errfresh-'));
+const errStaleHome = mkdtempSync(path.join(tmpdir(), 'quota-reset-errstale-'));
+{
+  const { DatabaseSync } = require('node:sqlite');
+  const mk = (home, status, age) => {
+    mkdirSync(path.join(home, 'v2'), { recursive: true });
+    const db = new DatabaseSync(path.join(home, 'v2', 'tasks-index.sqlite'));
+    db.exec('CREATE TABLE tasks (task_status TEXT, updated_at INTEGER)');
+    db.prepare('INSERT INTO tasks VALUES (?, ?)').run(status, Date.now() - age);
+    db.close();
+  };
+  mk(errFreshHome, 'error', 60_000);       // errored one minute ago
+  mk(errStaleHome, 'error', 30 * 60_000);  // errored half an hour ago
+}
+check('fresh error row counts as busy', await withTaskIndex(errFreshHome, () => { guard.__refreshBusy(); return S.busy; }) === true);
+check('stale error row does not count as busy', await withTaskIndex(errStaleHome, () => { guard.__refreshBusy(); return S.busy; }) === false);
+check('running row still counts as busy', await withTaskIndex(busyHome, () => { guard.__refreshBusy(); return S.busy; }) === true);
 const drain5h = [{ type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 12000, currentValue: 12000, remaining: 0, percentage: 100, nextResetTime: now + 2 * H }];
 const resetIncidentState = () => {
   S.lastDecision = null;

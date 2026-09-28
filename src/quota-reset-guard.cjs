@@ -130,6 +130,9 @@ const CFG = {
   // the window must be as generous as the webui reaper's (2h), not 10 minutes,
   // otherwise a long turn looks idle exactly when the pool is draining.
   activityWindowMs: envNum('ZCODE_WEBUI_QUOTA_RESET_ACTIVITY_WINDOW_MS', 2 * 3600_000),
+  // how long a freshly-written 'error' row still counts as "a session is alive"
+  // (official syncer writes no updated_at while an errored turn retries)
+  errorFreshMs: envNum('ZCODE_WEBUI_QUOTA_RESET_ERROR_FRESH_MS', 10 * 60_000),
   // how long a provider "quota used up" (429 + business code) counts as "the
   // operator is blocked right now"
   exhaustionSignalMs: envNum('ZCODE_WEBUI_QUOTA_RESET_EXHAUSTION_SIGNAL_MS', 15 * 60_000),
@@ -614,8 +617,15 @@ function refreshBusy() {
     try {
       const row = db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE task_status = ? AND updated_at > ?')
         .get('running', Date.now() - CFG.activityWindowMs);
-      S.busy = (row && row.n) > 0;
-      S.busyCount = (row && row.n) || 0;
+      // Official zcodeTaskIndexSyncer fact: a turn that errors (e.g. AT THE
+      // QUOTA WALL) keeps its row at 'error' with NO further updated_at writes
+      // while the turn retries — running-only queries go blind exactly then.
+      // A fresh 'error' write therefore also means "a session is alive" (the
+      // transition itself is the activity signal; stale error rows age out).
+      const errRow = db.prepare('SELECT COUNT(*) AS n FROM tasks WHERE task_status = ? AND updated_at > ?')
+        .get('error', Date.now() - CFG.errorFreshMs);
+      S.busy = (row && row.n) > 0 || (errRow && errRow.n) > 0;
+      S.busyCount = ((row && row.n) || 0) + ((errRow && errRow.n) || 0);
     } finally { db.close(); }
     S.busyCheckedAt = Date.now();
   } catch (e) {
@@ -810,14 +820,23 @@ async function tick() {
 }
 
 // ---------- child-process observation (append-only signal sink) ----------
-// Scope of a provider quota refusal: 1310 = 每周/每月上限, 1308 = 5 小时上限.
+// Scope of a provider quota refusal. The official client makes NO per-pool
+// distinction: workflow-model-failure-policy.ts puts the whole code family in
+// one "quota" stop bucket. The 1308→5h / 1310→week split below is OUR
+// observation from the 2026-09-19 wall (upstream message text named the pool)
+// and is kept as the precise mapping; every other family member still signals
+// "some pool hit the wall" (ANY) so the engine rescues whichever pool is
+// actually depleted.
 const QUOTA_CODE_SCOPE = { 1308: 'FIVE_HOUR', 1310: 'WEEK' };
+const QUOTA_CODE_ANY = new Set(['1005', '1313', '1316', '1317', '1318', '1319', '1320', '1321', '2056', '20097']);
 const QUOTA_TEXT_RE = /已达到[^"]{0,12}(?:每周|每月|5\s*小时)[^"]{0,12}使用上限|使用上限|额度已用完|余额不足|quota exceeded/i;
 
 // The runtime surfaces "quota used up" as HTTP 429 with an Anthropic-shaped
 // body ({"type":"error","error":{"type":"rate_limit_error","code":"1310",…}})
 // — the 0.7.1 guard only looked for 402, so it never saw a single signal
-// (stats.signals stayed 0 and the exhaustion path was dead code).
+// (stats.signals stayed 0 and the exhaustion path was dead code). The official
+// reader tries body.providerCode → error.providerCode → error_code → error.code,
+// so the regex covers the code-carrying field variants seen on the wire.
 async function exhaustionScopeOf(url, res) {
   if (!res || !/bigmodel|z\.ai|zhipu/.test(url)) return null;
   if (res.status === 402) return 'ANY';
@@ -829,9 +848,10 @@ async function exhaustionScopeOf(url, res) {
     body = await res.clone().text();
   } catch (_e) { return null; }
   if (body.length > 64 * 1024) body = body.slice(0, 64 * 1024);
-  const code = (/"(?:providerCode|code)"\s*:\s*"?(1\d{3})"?/.exec(body) || [])[1]
+  const code = (/"(?:providerCode|code|error_code)"\s*:\s*"?(1\d{3})"?/.exec(body) || [])[1]
     || (/\[(1\d{3})\]/.exec(body) || [])[1];
   if (code && QUOTA_CODE_SCOPE[code]) return QUOTA_CODE_SCOPE[code];
+  if (code && QUOTA_CODE_ANY.has(code)) return 'ANY';
   if (code && /rate_limit_error|quota/i.test(body) && QUOTA_TEXT_RE.test(body)) return 'ANY';
   if (QUOTA_TEXT_RE.test(body) && /使用上限|额度已用完|余额不足/.test(body)) return 'ANY';
   return null;
@@ -916,4 +936,5 @@ module.exports = {
   usedRatioOf, exhaustionScopeOf, apiUrl, readSwitchMode, effectiveMode,
   __state: S, __captureHeaders: captureHeaders, __observeJson: observeResponse,
   __tick: tick, __useReset: useReset, __fetchStatus: fetchStatus, __fetchLimit: fetchLimit,
+  __refreshBusy: refreshBusy,
 };
