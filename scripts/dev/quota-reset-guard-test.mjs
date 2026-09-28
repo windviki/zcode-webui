@@ -302,6 +302,83 @@ check('invalid switch file falls back to the env baseline', guard.effectiveMode(
 rmSync(switchFile, { force: true });
 check('removed switch file falls back to the env baseline', guard.effectiveMode() === 'on');
 
+// ---------- 4c. pool self-refresh + blind-gap return grace (2026-09-28 incident) ----------
+// Field replay: switch ON, the last pool sighting is 30min old and shows a
+// healthy 5h pool, the REAL pool is drained to 0, no UI attached. The old
+// engine kept deciding "nothing urgent" on the stale snapshot until the
+// operator returned — then fired 6s before their OFF click.
+// Synthetic task indexes pin `busy` deterministically (the real index varies
+// with whatever the operator is running while the suite executes).
+const idleHome = mkdtempSync(path.join(tmpdir(), 'quota-reset-idle-'));
+mkdirSync(path.join(idleHome, 'v2'), { recursive: true });
+const busyHome = mkdtempSync(path.join(tmpdir(), 'quota-reset-busy-'));
+{
+  mkdirSync(path.join(busyHome, 'v2'), { recursive: true });
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(path.join(busyHome, 'v2', 'tasks-index.sqlite'));
+  db.exec('CREATE TABLE tasks (task_status TEXT, updated_at INTEGER)');
+  db.prepare('INSERT INTO tasks VALUES (?, ?)').run('running', Date.now());
+  db.close();
+}
+const withTaskIndex = (home, fn) => {
+  const prev = process.env.ZCODE_HOME;
+  process.env.ZCODE_HOME = home;
+  return Promise.resolve(fn()).finally(() => {
+    if (prev === undefined) delete process.env.ZCODE_HOME; else process.env.ZCODE_HOME = prev;
+  });
+};
+const drain5h = [{ type: 'CREDIT_LIMIT', unit: 3, number: 5, usage: 12000, currentValue: 12000, remaining: 0, percentage: 100, nextResetTime: now + 2 * H }];
+const resetIncidentState = () => {
+  S.lastDecision = null;
+  S.lastUsedAt = 0; S.usesToday = 0; S.confirmed = true;
+  S.revivedAt = 0; S.lastTickPoolAt = null;
+  // earlier sections left live exhaustion signals (15min window); the signal
+  // rescue path is urgent by design and ignores the grace — clear them so the
+  // replay exercises the pure pool-based paths
+  S.exhaustionAt = 0; S.exhaustionByType = { FIVE_HOUR: 0, WEEK: 0 };
+  S.headers = { at: Date.now(), Authorization: 'Bearer zj7', XBigmodelAuthorization: 'Bearer pj7', targetType: 'PERSONAL' };
+  S.status = { at: Date.now(), fiveHourResets: [now + 5 * H], weekResets: [], lastFiveHourUsedAt: 0, lastWeekUsedAt: 0 };
+  // stale local view: 5h looked healthy 30 minutes ago
+  S.buckets = { at: now - 30 * 60_000, FIVE_HOUR: { total: 12000, remaining: 920, usedRatio: 0.92, at: now - 30 * 60_000, src: 'limit' } };
+  S.busy = false;
+  upstream.limits = drain5h;
+  calls.length = 0;
+};
+resetIncidentState();
+const limitFetchesBefore = guard.stats.limitFetches;
+await withTaskIndex(idleHome, () => guard.__tick());
+check('blind engine refreshes the pool data itself (no UI needed)',
+  calls.some((c) => c.url.includes('/api/monitor/usage/quota/limit')) && guard.stats.limitFetches > limitFetchesBefore);
+check('refreshed data reveals the drained pool', S.buckets.FIVE_HOUR.usedRatio === 1 && S.buckets.FIVE_HOUR.remaining === 0);
+check('return grace: the idle reset is HELD on the revival tick (operator just came back)',
+  S.revivedAt > 0 && S.lastDecision && S.lastDecision.fired === false && useCallCount() === 0,
+  'fired=' + (S.lastDecision && S.lastDecision.fired) + ' uses=' + useCallCount());
+S.revivedAt = Date.now() - 61_000;     // grace window elapsed
+S.lastDecision = null;
+calls.length = 0;
+await withTaskIndex(idleHome, () => guard.__tick());
+check('after the grace the idle reset fires on its own', useCallCount() === 1 && S.lastUsedType === 'FIVE_HOUR',
+  'uses=' + useCallCount());
+
+// a RUNNING task is not delayed by the grace — the busy trigger needs no wait
+resetIncidentState();
+S.revivedAt = Date.now();              // grace ACTIVE
+await withTaskIndex(busyHome, () => guard.__tick());
+check('busy + drained pool fires DESPITE the active grace', useCallCount() === 1
+  && /with an active task/.test(S.lastDecision && S.lastDecision.reason || ''),
+  'uses=' + useCallCount() + ' reason=' + (S.lastDecision && S.lastDecision.reason));
+
+// an OFF guard polls nothing upstream (self-refresh only runs while enabled)
+resetIncidentState();
+writeSwitch('off');
+calls.length = 0;
+await withTaskIndex(idleHome, () => guard.__tick());
+check('mode off: no pool refresh, no use', !calls.some((c) => c.url.includes('/quota/limit')) && useCallCount() === 0
+  && S.lastDecision && S.lastDecision.reason === 'mode off');
+rmSync(switchFile, { force: true });
+S.lastTickPoolAt = Date.now();
+S.busy = false;
+
 // ---------- 5. mode behaviours via fresh subprocesses ----------
 const probe = (env, script) => new Promise((resolve) => {
   const { spawnSync } = require('node:child_process');

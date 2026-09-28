@@ -52,6 +52,29 @@
 //              /status until the chance count drops (confirm). In dry-run the
 //              decision is logged and nothing is sent.
 //
+// 2026-09-28 incident postmortem (both fixes below are load-bearing):
+//   The operator enabled the switch at 92% 5h-pool usage and left. The task
+//   drained the pool to the wall ~30min later — the guard did NOTHING until
+//   the operator returned and opened the page, at which point it fired within
+//   10s (6s before their OFF click landed). Two stacked causes:
+//   ① pool usage was only ever OBSERVED passively from the runtime's own
+//     billing/quota responses — with no UI attached that traffic stops, so the
+//     engine decided on a 30-minute-old "92% used" snapshot all the way past
+//     the wall. Fix: the engine now refreshes the pool data itself
+//     (fetchLimit, replayed headers, URL learned from observed traffic) while
+//     enabled, so a draining pool is seen within ~1-2 ticks even with no UI.
+//   ② the 429 exhaustion signals never arrive: the agent's model calls go
+//     through the runtime's BUNDLED undici (same "preload 补不到" issue the
+//     repo-snapshot guard hit), so the globalThis.fetch wrapper in the child
+//     observer never sees them. The signal path stays as a best-effort net,
+//     but detection no longer depends on it — a pool at remaining=0 IS the
+//     wall, visible through ①.
+//   Plus a UX guard: when pool data REVIVES after a blind gap (headers
+//   expired >12h while away, or the switch just flipped on after a long
+//   off), idle resets hold for RETURN_GRACE_MS so the returning operator
+//   keeps agency for a beat instead of being preempted mid-click. Busy /
+//   hard-signal / expiring-chance paths are not delayed — those are urgent.
+//
 // Everything lands on stderr ("[zcode-webui] quota-reset-guard: …") and in
 // ${ZCODE_WEBUI_GUARD_STATS_DIR}/quota-reset-guard.json (surfaced in
 // /api/health → guards.quotaReset).
@@ -64,7 +87,7 @@
 //
 // Knobs (env): ZCODE_WEBUI_QUOTA_RESET=on|dry-run|off (baseline while no
 // switch file exists; default off),
-// _TICK_MS, _STATUS_REFRESH_MS, _FIVE_HOUR_MIN_RATIO, _WEEK_MIN_RATIO,
+// _TICK_MS, _STATUS_REFRESH_MS, _LIMIT_REFRESH_MS, _FIVE_HOUR_MIN_RATIO, _WEEK_MIN_RATIO,
 // _EXPIRY_SOON_FIVE_HOUR_MS, _EXPIRY_SOON_WEEK_MS, _RESCUE_MIN_USED,
 // _COOLDOWN_MS, _MAX_USES_PER_DAY, _HEADER_MAX_AGE_MS, _ACTIVITY_WINDOW_MS,
 // _EXHAUSTION_SIGNAL_MS, _NATURAL_RESET_FLOOR_FIVE_HOUR_MS,
@@ -116,6 +139,19 @@ const CFG = {
   naturalResetFloorWeekMs: envNum('ZCODE_WEBUI_QUOTA_RESET_NATURAL_RESET_FLOOR_WEEK_MS', 2 * 3600_000),
   // bone-dry pool (≈100% used) is reset even while idle — see the header
   dryIdle: !envOff('ZCODE_WEBUI_QUOTA_RESET_DRY_IDLE'),
+  // pool-data self-refresh (fetchLimit): while enabled, refresh the pool
+  // buckets whenever they are older than this (older than one tick while a
+  // task is running). Passive observation only updates them when the UI is
+  // attached — this is what keeps the engine from deciding on stale data
+  // through a wall (2026-09-28 incident ①).
+  limitRefreshMs: envNum('ZCODE_WEBUI_QUOTA_RESET_LIMIT_REFRESH_MS', 90_000),
+  // a pool-data gap longer than this counts as "blind"; the first fresh data
+  // after it triggers the idle-reset grace below
+  reviveGapMs: envNum('ZCODE_WEBUI_QUOTA_RESET_REVIVE_GAP_MS', 10 * 60_000),
+  // after a blind gap ends, hold IDLE resets for this long so the returning
+  // operator keeps agency (2026-09-28 incident: the fire landed 6s before the
+  // user's OFF click). Busy/signal/expiry paths are not held.
+  returnGraceMs: envNum('ZCODE_WEBUI_QUOTA_RESET_RETURN_GRACE_MS', 60_000),
 };
 
 const STATS_DIR = process.env.ZCODE_WEBUI_GUARD_STATS_DIR || '';
@@ -143,7 +179,8 @@ function effectiveMode() {
 const BUCKET_MAX_AGE_MS = envNum('ZCODE_WEBUI_QUOTA_RESET_BUCKET_MAX_AGE_MS', 2 * 3600_000);
 
 const STATS = {
-  statusFetches: 0, statusObservations: 0, balanceObservations: 0, limitObservations: 0,
+  statusFetches: 0, limitFetches: 0,
+  statusObservations: 0, balanceObservations: 0, limitObservations: 0,
   limitsUnclassified: 0, signals: 0, usesAttempted: 0, usesConfirmed: 0, usesFailed: 0,
 };
 
@@ -164,6 +201,9 @@ const S = {
   usesDay: '',            // YYYY-MM-DD for the daily cap
   usesToday: 0,
   wantStatusRefreshAt: 0, // bump to pull a fresh /status sooner than the cadence
+  limitUrl: null,         // last OBSERVED quota/limit URL — replayed verbatim by fetchLimit
+  lastTickPoolAt: null,   // pool-data age as of the end of the last tick (blind-gap detection)
+  revivedAt: 0,           // pool data came back after a blind gap (idle-reset grace)
   lastDecision: null,     // { at, fired, type, reason } for observability
   busyCheckedAt: 0,
   busy: false,
@@ -388,6 +428,12 @@ async function observeResponse(url, res) {
   try { json = await res.clone().json(); } catch (_e) { return; }
   const data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : null;
   if (!data) return;
+  // remember the exact origin/path the runtime itself uses for pool data, so
+  // fetchLimit can replay it verbatim (bigmodel.cn vs api.z.ai differ per env)
+  if (/\/api\/monitor\/usage\/quota\/limit/.test(url)) {
+    const u = /^(https:\/\/[^/]+\/api\/monitor\/usage\/quota\/limit)/.exec(url);
+    if (u && u[1] !== S.limitUrl) S.limitUrl = u[1];
+  }
   if (url.indexOf(RESET_BASE + '/status') >= 0 && Array.isArray(data.available_five_hour_resets)) {
     STATS.statusObservations++;
     S.status = {
@@ -480,6 +526,20 @@ async function fetchStatus() {
   await observeResponse(apiUrl(RESET_BASE + '/status'), res);
 }
 
+// Pool usage self-refresh (2026-09-28 incident ①): with no UI attached nothing
+// re-requests quota/limit, and the engine would keep deciding on stale pool
+// data straight through a wall. Replays the same double-JWT headers against
+// the endpoint the runtime itself was seen using (S.limitUrl). Read-only GET;
+// while the UI IS attached this mostly hits the api-cache-guard's 30s cache.
+async function fetchLimit() {
+  const h = replayHeaders();
+  if (!h) return;
+  const url = S.limitUrl || 'https://bigmodel.cn/api/monitor/usage/quota/limit';
+  STATS.limitFetches++;
+  const res = await fetch(url, { method: 'GET', headers: h, signal: AbortSignal.timeout(15_000) });
+  await observeResponse(url, res);
+}
+
 async function useReset(type) {
   const h = replayHeaders();
   if (!h) return { ok: false, error: 'no headers' };
@@ -567,12 +627,43 @@ async function tick() {
     refreshBusy();
     const now = Date.now();
     const mode = effectiveMode();
+    // per-pool freshness (NOT buckets.at — that bumps on empty balance arrays
+    // too). Blindness must be judged against what the LAST tick saw
+    // (S.lastTickPoolAt): if the page load's passive observation refreshed the
+    // buckets between ticks, the current value alone would hide the gap.
+    const poolEntryAt = (k) => num(S.buckets && S.buckets[k] && S.buckets[k].at) || 0;
+    const newestPoolAt = Math.max(poolEntryAt('FIVE_HOUR'), poolEntryAt('WEEK'));
+    const prevPoolAt = S.lastTickPoolAt ?? 0;
+    const wasBlind = prevPoolAt === 0 || now - prevPoolAt > CFG.reviveGapMs;
     const headersOk = S.headers && now - S.headers.at <= CFG.headerMaxAgeMs;
     const statusStale = !S.status || now - S.status.at > CFG.statusRefreshMs
       || (S.wantStatusRefreshAt && now >= S.wantStatusRefreshAt);
     if (headersOk && statusStale) {
       S.wantStatusRefreshAt = 0;
       await fetchStatus().catch((e) => log('status refresh failed: ' + (e && e.message)));
+    }
+    // pool self-refresh — only while enabled (an OFF guard polls nothing
+    // upstream), tighter while a task is running (that is when a draining
+    // pool must be seen in time for the busy trigger)
+    if (headersOk && mode !== 'off') {
+      const limitStale = now - newestPoolAt > (S.busy ? CFG.tickMs : CFG.limitRefreshMs);
+      if (limitStale) {
+        await fetchLimit().catch((e) => log('pool refresh failed: ' + (e && e.message)));
+      }
+    }
+    // blind-gap revival → idle-reset grace: the operator just came back (or
+    // just flipped the switch on after a long off); give them a beat before
+    // any IDLE reset fires. Busy/signal/expiry paths stay immediate.
+    let dryHoldMs = 0;
+    const newestNow = Math.max(poolEntryAt('FIVE_HOUR'), poolEntryAt('WEEK'));
+    S.lastTickPoolAt = newestNow;
+    if (wasBlind && newestNow > 0) {
+      S.revivedAt = now;
+      dryHoldMs = CFG.returnGraceMs;
+      log('pool data revived after a blind gap — idle resets hold for '
+        + Math.round(CFG.returnGraceMs / 1000) + 's (the operator just came back)');
+    } else if (S.revivedAt && now - S.revivedAt < CFG.returnGraceMs) {
+      dryHoldMs = CFG.returnGraceMs - (now - S.revivedAt);
     }
 
     if (S.usesDay !== dayKey(now)) { S.usesDay = dayKey(now); S.usesToday = 0; }
@@ -596,7 +687,10 @@ async function tick() {
       fiveHourMinRatio: CFG.fiveHourMinRatio, weekMinRatio: CFG.weekMinRatio,
       expirySoonFiveHourMs: CFG.expirySoonFiveHourMs, expirySoonWeekMs: CFG.expirySoonWeekMs,
       rescueMinUsed: CFG.rescueMinUsed, headerMaxAgeMs: CFG.headerMaxAgeMs,
-      exhaustionSignalMs: CFG.exhaustionSignalMs, dryIdle: CFG.dryIdle,
+      exhaustionSignalMs: CFG.exhaustionSignalMs,
+      // idle dry-reset held while the return grace is running (see above);
+      // busy/signal/expiry paths below do not consult this flag
+      dryIdle: CFG.dryIdle && dryHoldMs <= 0,
       naturalResetFloorFiveHourMs: CFG.naturalResetFloorFiveHourMs,
       naturalResetFloorWeekMs: CFG.naturalResetFloorWeekMs,
     });
@@ -739,5 +833,5 @@ module.exports = {
   cfg: CFG, stats: STATS, decide, classifyBucket, classifyLimit, fieldsFromLimit,
   usedRatioOf, exhaustionScopeOf, apiUrl, readSwitchMode, effectiveMode,
   __state: S, __captureHeaders: captureHeaders, __observeJson: observeResponse,
-  __tick: tick, __useReset: useReset, __fetchStatus: fetchStatus,
+  __tick: tick, __useReset: useReset, __fetchStatus: fetchStatus, __fetchLimit: fetchLimit,
 };
