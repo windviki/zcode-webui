@@ -777,6 +777,12 @@
     },
     getDesktopWindowChromeState: val({ maximized: false, fullscreen: false, focused: true }),
     getWindowControlsOverlayMetrics: val(null),
+    // 3.15's settings shell fetches close-to-tray capabilities and then renders
+    // `capability.supported` without a null guard. The generic Proxy fallback
+    // used to resolve `undefined`, which stored undefined in state and crashed
+    // the whole settings section ("Cannot read properties of undefined
+    // (reading 'supported')"). The browser has no close-to-tray support.
+    getCloseToTrayCapability: val({ supported: false, gnomeLikeWithoutTray: false }),
     setTitleBarTheme: ok,
     // workspaces / remote (unsupported in webui; official UI will show local-only)
     listSSHConfigAliases: val([]),

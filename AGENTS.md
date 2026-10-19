@@ -427,6 +427,16 @@ DB `turn_usage` 里 7 条 cancelled 全是 `TURN_CANCELLED` + cause
 - 自检：`node scripts/dev/reaper-guard-test.mjs`（A 帧保活 / B DB 保活 / C 模型请求保活 /
   D pagehide 延迟关闭）；`resume-replay-test` 19 项复跑。
 
+### 3.15.3 设置页 / 使用统计崩溃（2026-10-19，v0.8.4）
+
+3.15 的设置页新增 `window.zcode.getCloseToTrayCapability`（桌面托盘能力查询）。垫片的 Proxy 对
+未知方法统一回 `ok`（`Promise.resolve(undefined)`），渲染层把 `undefined` 存进 state，随后在
+`E9` 里读 `capability.supported` 时没有空值保护，整段设置被 error boundary 替换成
+`Cannot read properties of undefined (reading 'supported')`——用户点「使用统计」时最明显。
+处置：`web/zcode-bridge.js` 显式返回 `{supported:false, gnomeLikeWithoutTray:false}`；
+自检 `node scripts/dev/settings-usage-test.mjs`（打生产需 `ZOOM_TEST_ALLOW_PROD=1`，只读页面）。
+客户端改动刷新页面即可生效（bridge 是 `Cache-Control: no-cache` + ETag，不必重启服务）。
+
 
 ## 「完全访问」模式的官方语义（2026-09-18 排查结论）
 
