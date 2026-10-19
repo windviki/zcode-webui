@@ -66,13 +66,12 @@ SITE_PAGES=(
 # 兜底版本（官网不可达时用）也是「已知可用」版本，不是最新版本：
 # 与 scripts/fetch-renderer.sh 的 ZCODE_VERSION 默认值、src/upgrade.mjs 的
 # DEFAULT_VERSION 保持一致。
-PINNED_VERSION="3.14.3"
+PINNED_VERSION="3.15.3"
 
 # shim 能驱动的最高官方版本（与 src/upgrade.mjs 的 SHIM_MAX_SUPPORTED 保持一致）。
 # 超过它的版本默认不升，只提示（显式 -v 可绕过，装完照样校验界面、起不来自动回滚）。
-# 3.12.x 已适配（启动通道 + 对象形式的服务端口消息，见 web/bootstrap.js），
-# 再往上的版本尚未验证，所以上限钉在 3.12.3。
-SHIM_MAX_SUPPORTED="3.14.3"
+# 3.15.3 已在本机通过完整升级校验（渲染层 + 运行时 + smoke + headless 界面启动 + 守卫自检）。
+SHIM_MAX_SUPPORTED="3.15.3"
 
 DATA_HOME="${ZCODE_WEBUI_HOME:-$SCRIPT_DIR}"
 RENDERER_DIR="$DATA_HOME/vendor/renderer"

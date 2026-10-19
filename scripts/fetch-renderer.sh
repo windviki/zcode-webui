@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch the official ZCode desktop client and extract its renderer (the web UI)
-# into vendor/renderer. Version pinned via ZCODE_VERSION (default 3.12.3 — keep
+# into vendor/renderer. Version pinned via ZCODE_VERSION (default 3.15.3 — keep
 # in sync with PINNED_VERSION in zcode-update.sh and DEFAULT_VERSION in
 # src/upgrade.mjs).
 #
@@ -14,7 +14,7 @@
 #      ZCODE_URL (override the .deb URL), ZCODE_WEBUI_HOME (data home override).
 set -euo pipefail
 
-VERSION="${ZCODE_VERSION:-3.14.3}"
+VERSION="${ZCODE_VERSION:-3.15.3}"
 ARCH="${ZCODE_ARCH:-x64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # ZCODE_WEBUI_HOME redirects all mutable state away from the package directory

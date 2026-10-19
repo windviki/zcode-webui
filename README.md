@@ -86,7 +86,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # 运行时依赖只有 ws
 
 npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取界面
-                                       # （默认 3.14.3，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
+                                       # （默认 3.15.3，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
 
 cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
@@ -166,9 +166,13 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.14.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | 回收条件之一：最近该时长内无 host→浏览器帧 |
+| `ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS` | — | `600000` | CLI 数据库（message/part/session_entry）最近写入在该窗口内时不回收（长回合的静默模型调用） |
+| `ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS` | — | `7200000` | CLI 日志里未配对的 `model.request.started` 视为在途请求，超过该时长才忽略 |
+| `ZCODE_WEBUI_REAP_INTERVAL_MS` | — | `60000` | 空闲回收扫描间隔 |
+| `ZCODE_WEBUI_DEFERRED_RELAY_CLOSE_IDLE_MS` | — | `300000` | pagehide 触发 `/bridge/close` 时，若 agent 仍忙则延迟到该空闲窗口后再关闭 HTTP relay |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | 回收的全局保险：索引里有窗口内的 running 任务时不回收任何会话 |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | 关 | 设 `1` 在日志打印协议消息预览（联调用） |
 
@@ -205,7 +209,7 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 > **3.12.x 已适配**：官方 3.12 起服务端口消息改成 `{type:'zcode:service-port', databaseStartupId}`
 > 对象，并要求桌面端再下发「数据库启动通道」状态（`zcode:database-startup-state`，phase=ready 且
 > startupId 对齐），否则界面停在「未能收到启动状态 / startup-channel-unavailable」。`web/bootstrap.js`
-> 现按渲染层版本自动二选一（<=3.11 裸字符串，>=3.12 对象+启动状态），`SHIM_MAX_SUPPORTED` 已提到 3.12.3。
+> 现按渲染层版本自动二选一（<=3.11 裸字符串，>=3.12 对象+启动状态），`SHIM_MAX_SUPPORTED` 已提到 3.15.3。
 >
 > 3.12 的 `zcode.cjs` 还需要 `<runtime>/agents/glm/provider/zcode-builtin.json`（官方只随桌面端分发），
 > 缺了它登录和 agent 都起不来；server 启动与 host 握手后会自动从 `~/.zcode/v2/runtime/provider/bundled/`
@@ -214,13 +218,17 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 > 注意：3.12 起**模型可用性改为服务端 entitlement 校验**。若账号没有有效套餐（billing/balance 返回
 > `plans: []`），界面会显示「当前没有可用模型」——用「管理模型 → 添加自定义模型」填本地 API key 即可，
 > 或 `./zcode-update.sh --rollback` 退回 3.11.x（那一版直接信任本机 CLI 配置里的 key）。
+>
+> **3.15.3 已适配**（2026-10-19）：`./zcode-update.sh -v 3.15.3 --yes` 完成渲染层/运行时升级，
+> smoke、headless 界面启动、守卫自检全部通过；旧版 3.14.3 保留在 `vendor/renderer.bak-3.14.3-*`
+> 与 `~/.zcode/server.bak-3.14.3-*`，可随时回滚。
 
 ### 仓库内一键更新（git 部署 / 本机）
 
 ```bash
 ./zcode-update.sh              # 探测最新版本 → 拉包解包 → 原子替换 → 重启 → 校验（失败自动回滚）
 ./zcode-update.sh --check      # 只看当前 / 官网 / CDN 版本
-./zcode-update.sh -v 3.12.3    # 指定版本
+./zcode-update.sh -v 3.15.3    # 指定版本
 ./zcode-update.sh --rollback   # 回滚到最近一次更新前的备份
 ```
 

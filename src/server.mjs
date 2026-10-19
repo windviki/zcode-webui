@@ -191,24 +191,35 @@ function shortUserKey(userKey) {
 }
 
 // Detached hosts (tab closed) are kept alive so their tasks can finish. Auto-reap
-// them ONLY when they are verifiably idle, guarded three ways so in-progress
-// sessions (including ones waiting for user input) are never interrupted:
+// them ONLY when they are verifiably idle, guarded by independent signals so an
+// in-progress session (including a long, silent model request) is never killed:
 //   1. detached for at least ZCODE_WEBUI_DETACHED_TTL_MS (default 30 min; 0 = never)
 //   2. no host->client frames for at least ZCODE_WEBUI_FRAME_QUIET_MS (default 10 min;
 //      idle hosts are silent, working turns stream frames)
-//   3. no task marked "running" in the official tasks index (updated within the
-//      staleness window, default 2 h) — a global guard that also protects hosts
-//      parked in a wait-for-user-input state
+//   3. no task marked "running" in the official tasks index (2 h staleness window)
+//   4. no recent write in the official CLI database (message/part/session_entry)
+//   5. no model request currently in flight according to the official CLI log
+//   6. no descendant of the host burned measurable CPU in a short probe window
+// Signals 3-6 are global (any host/relay), deliberately conservative: one account
+// has only a few hosts, and a missed reap is far cheaper than killing a turn.
+// 2026-10-18 postmortem: a plain "sleep longer" change cannot cover a model
+// request that stayed silent for 27 minutes, so the reaper needs these signals.
 const DETACHED_TTL_MS = process.env.ZCODE_WEBUI_DETACHED_TTL_MS === undefined
   ? 30 * 60 * 1000
   : Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS) || 0;
 const FRAME_QUIET_MS = Number(process.env.ZCODE_WEBUI_FRAME_QUIET_MS || 10 * 60 * 1000);
 const RUNNING_TASK_STALE_MS = Number(process.env.ZCODE_WEBUI_RUNNING_TASK_STALE_MS || 2 * 60 * 60 * 1000);
+const AGENT_WRITE_ACTIVE_MS = Math.max(1000, Number(process.env.ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS) || 10 * 60 * 1000);
+const MODEL_REQUEST_ACTIVE_MS = Math.max(60 * 1000, Number(process.env.ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS) || 2 * 60 * 60 * 1000);
+const REAP_INTERVAL_MS = Math.max(1000, Number(process.env.ZCODE_WEBUI_REAP_INTERVAL_MS) || 60 * 1000);
+const DEFERRED_RELAY_CLOSE_IDLE_MS = Math.max(1000, Number(process.env.ZCODE_WEBUI_DEFERRED_CLOSE_IDLE_MS) || 5 * 60 * 1000);
+const RELAY_CLOSE_RECENT_FRAME_MS = 5000;   // a pagehide after this much silence is not "mid-stream"
 // "a sibling host is actively driving turns" heuristic: protocol frames flowing
 // this recently mean the agent is mid-execution (streaming, tool calls, thinking)
 const ACTIVE_FRAME_MS = Math.max(Number(process.env.ZCODE_WEBUI_ACTIVE_FRAME_MS) || 120000, 15000);
 // HTTP fallback bridge relays: bounded + idle-reaped. lastSeen is refreshed by
-// /bridge/send and /bridge/poll, so an actively polling page never ages out.
+// /bridge/send, /bridge/poll AND host frames, so an actively polling page or a
+// working host never ages out.
 const HTTP_RELAY_TTL_MS = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_TTL_MS || 30 * 60 * 1000);
 const HTTP_RELAY_MAX = Number(process.env.ZCODE_WEBUI_HTTP_RELAY_MAX || 8) || 0;   // 0 = unlimited
 // upper bound for one /bridge/send body — legit RPC frames are far smaller, and
@@ -228,18 +239,27 @@ const WS_PING_MAX_MISS = Math.max(1, Number(process.env.ZCODE_WEBUI_WS_PING_MAX_
 // events, call responses — are buffered per era and replayed when that tab
 // hot-resumes, so the session list does not silently go stale ("had to refresh
 // to see new sessions"). Bounded; an overflowed gap forces a page reload on the
-// next resume instead of replaying a hole. Parking older than RESUME_PARK_MS
-// disposes the era's host-side subscriptions (also fixes a slow leak of ghost
-// event listeners for tabs that never return). 0 disables buffering entirely.
+// next resume instead of replaying a hole. 0 disables buffering entirely.
+//
+// A parked era keeps its host-side subscriptions until the host itself is gone.
+// They used to be disposed after RESUME_PARK_MS, which also destroyed the
+// reaper's only frame-liveness signal: a long turn looked idle from minute 10
+// and the 30-minute detached reaper killed it mid-turn (2026-10-18 postmortem).
+// The host reaper now owns cleanup; the replay buffer stays bounded.
 const RESUME_PARK_MS = Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) === 0
   ? 0
-  : Math.max(30 * 1000, Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) || 10 * 60 * 1000);
+  : Math.max(1000, Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) || 10 * 60 * 1000);
 const RESUME_BUF_MAX_BYTES = Math.max(64 * 1024, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_MB) || 16) * 1024 * 1024;
 const RESUME_BUF_MAX_FRAMES = Math.max(16, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES) || 2048);
 
+function zcodeHome() {
+  return process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
+}
 function tasksIndexPath() {
-  const zhome = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
-  return path.join(zhome, 'v2', 'tasks-index.sqlite');
+  return path.join(zcodeHome(), 'v2', 'tasks-index.sqlite');
+}
+function cliDatabasePath() {
+  return path.join(zcodeHome(), 'cli', 'db', 'db.sqlite');
 }
 
 let sqliteWarningShown = false;
@@ -263,6 +283,225 @@ async function hasRunningTask(dbPath) {
     return true;
   }
 }
+
+// Official CLI activity DB: rows are appended throughout a turn (model steps,
+// tool calls, persisted messages). A turn that is waiting on a slow model call
+// may go quiet for many minutes, but every completed step still touches this DB.
+let cliDbWarningShown = false;
+const cliWriteCache = { at: 0, value: 0 };
+async function latestAgentWriteAt() {
+  const now = Date.now();
+  if (now - cliWriteCache.at < 2000) return cliWriteCache.value;
+  cliWriteCache.at = now;
+  const dbPath = cliDatabasePath();
+  if (!existsSync(dbPath)) { cliWriteCache.value = 0; return 0; }
+  try {
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare(
+        "SELECT MAX(t) AS t FROM (" +
+        "SELECT MAX(time_updated) AS t FROM message " +
+        "UNION ALL SELECT MAX(time_updated) FROM part " +
+        "UNION ALL SELECT MAX(time_updated) FROM session_entry)"
+      ).get();
+      cliWriteCache.value = Number(row && row.t) || 0;
+      return cliWriteCache.value;
+    } finally { db.close(); }
+  } catch (e) {
+    if (!cliDbWarningShown) {
+      cliDbWarningShown = true;
+      console.error('[zcode-webui] auto-reap: cannot read CLI activity db (' + ((e && e.message) || e) + '); DB signal disabled');
+    }
+    return cliWriteCache.value;
+  }
+}
+
+// In-flight model requests are the one activity signal the DB and CPU probe can
+// both miss: the runtime writes a model_usage row only when the request settles,
+// and an SSE response can stay silent for half an hour. The official CLI log
+// records model.request.started immediately and its terminal event later, so a
+// start without a matching terminal event is the authoritative "still working"
+// bit. We tail the current UTC log (plus yesterday's around midnight) and keep
+// only unmatched starts younger than MODEL_REQUEST_ACTIVE_MS.
+const modelLogState = {
+  path: '', offset: 0, active: new Map(), scannedAt: 0,
+};
+function cliLogPathFor(date) {
+  return path.join(zcodeHome(), 'cli', 'log', 'zcode-' + date.toISOString().slice(0, 10) + '.jsonl');
+}
+function readFileSlice(file, start, end) {
+  const len = Math.max(0, end - start);
+  if (len === 0) return '';
+  const fd = openSync(file, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(len);
+    let read = 0;
+    while (read < len) {
+      const n = readSync(fd, buf, read, len - read, start + read);
+      if (n <= 0) break;
+      read += n;
+    }
+    return buf.subarray(0, read).toString('utf8');
+  } finally { closeSync(fd); }
+}
+function modelLogKey(o) {
+  const ctx = o && o.context;
+  return (ctx && ctx.queryId) || (o && o.requestId) || (o && o.turnId) || '';
+}
+function scanModelRequestLog() {
+  const now = Date.now();
+  if (now - modelLogState.scannedAt < 1000) return;
+  modelLogState.scannedAt = now;
+  let file = cliLogPathFor(new Date());
+  if (!existsSync(file)) {
+    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+    file = cliLogPathFor(yesterday);
+    if (!existsSync(file)) return;
+  }
+  let size = 0;
+  try { size = statSync(file).size; } catch (_e) { return; }
+  if (modelLogState.path !== file) {
+    // first look at this file: replay enough tail to reconstruct in-flight starts.
+    // Do NOT clear `active` across a UTC-day rollover: a request that started
+    // just before midnight completes in today's file, and its completion must
+    // still be able to clear the entry (entries are age-pruned below anyway).
+    modelLogState.path = file;
+    modelLogState.offset = Math.max(0, size - 8 * 1024 * 1024);
+  } else if (size < modelLogState.offset) {
+    modelLogState.offset = 0;
+    modelLogState.active.clear();
+  }
+  if (size <= modelLogState.offset) {
+    for (const [k, v] of modelLogState.active) if (now - v.at > MODEL_REQUEST_ACTIVE_MS) modelLogState.active.delete(k);
+    return;
+  }
+  let chunk = readFileSlice(file, modelLogState.offset, size);
+  const startOffset = modelLogState.offset;
+  modelLogState.offset = size;
+  if (startOffset > 0 && chunk.length > 0 && chunk.charCodeAt(0) !== 0x7b /* '{' */) {
+    const nl = chunk.indexOf('\n');
+    if (nl < 0) return;
+    chunk = chunk.slice(nl + 1);
+  }
+  const lines = chunk.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] !== '') {
+    // trailing partial line: leave it for the next scan
+    const partial = lines.pop();
+    modelLogState.offset = size - Buffer.byteLength(partial, 'utf8');
+  }
+  for (const line of lines) {
+    if (!line || line.charCodeAt(0) !== 0x7b) continue;
+    let o;
+    try { o = JSON.parse(line); } catch (_e) { continue; }
+    const ev = o.event;
+    if (ev === 'model.request.started') {
+      const key = modelLogKey(o);
+      if (key) modelLogState.active.set(key, { at: Date.parse(o.timestamp) || now, turnId: o.turnId || '', sessionId: o.sessionId || '' });
+    } else if (ev === 'model.request.completed' || ev === 'model.request.failed' || ev === 'model.sdk.stream.failed') {
+      const key = modelLogKey(o);
+      if (key) modelLogState.active.delete(key);
+    } else if (ev === 'turn.completed' || ev === 'turn.failed') {
+      for (const [k, v] of modelLogState.active) if (v.turnId && v.turnId === o.turnId) modelLogState.active.delete(k);
+    } else if (ev === 'zcode_protocol.shutdown.completed') {
+      for (const [k, v] of modelLogState.active) if (v.sessionId && v.sessionId === o.sessionId) modelLogState.active.delete(k);
+    }
+  }
+  for (const [k, v] of modelLogState.active) if (now - v.at > MODEL_REQUEST_ACTIVE_MS) modelLogState.active.delete(k);
+}
+function hasActiveModelRequest() {
+  scanModelRequestLog();
+  return modelLogState.active.size > 0;
+}
+
+// Short /proc CPU probe over a host's process tree. This catches tool
+// execution even when the renderer is gone, the model is not streaming and the
+// DB write window has just lapsed (e.g. a long Bash command).
+function readProcSnapshot() {
+  const byPid = new Map();
+  let names;
+  try { names = readdirSync('/proc'); } catch (_e) { return byPid; }
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    let stat;
+    try { stat = readFileSync('/proc/' + pid + '/stat', 'utf8'); } catch (_e) { continue; }
+    const close = stat.lastIndexOf(')');
+    if (close < 0) continue;
+    const f = stat.slice(close + 2).split(' ');
+    byPid.set(pid, {
+      ppid: Number(f[1]) || 0,
+      cpu: (Number(f[11]) || 0) + (Number(f[12]) || 0),
+      start: Number(f[19]) || 0,
+    });
+  }
+  return byPid;
+}
+async function hostTreeBusy(rootPids, waitMs = 1000) {
+  const roots = [...new Set((rootPids || []).filter((n) => Number.isFinite(n) && n > 0))];
+  if (roots.length === 0) return false;
+  const first = readProcSnapshot();
+  const rootsSet = new Set(roots);
+  const tracked = new Set(roots);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const [pid, p] of first) {
+      if (tracked.has(pid)) continue;
+      if (tracked.has(p.ppid)) { tracked.add(pid); added = true; }
+    }
+  }
+  if (tracked.size === 0) return false;
+  await new Promise((r) => setTimeout(r, waitMs));
+  const second = readProcSnapshot();
+  let cpuDelta = 0;
+  let young = false;
+  let uptime = 0;
+  try { uptime = Number(readFileSync('/proc/uptime', 'utf8').split(' ')[0]) || 0; } catch (_e) { /* ignore */ }
+  for (const pid of tracked) {
+    const a = first.get(pid);
+    const b = second.get(pid);
+    if (!a || !b) continue;
+    if (b.cpu > a.cpu) cpuDelta += b.cpu - a.cpu;
+    // A fresh descendant means a turn just spawned a tool/subagent even before
+    // it burns CPU. Do not count the host itself: a just-spawned host is not
+    // "busy" proof (it may simply be waiting for its first prompt).
+    if (!rootsSet.has(pid) && uptime > 0 && b.start > 0 && (uptime - b.start / 100) < 90) young = true;
+  }
+  return cpuDelta >= 20 || young;   // 20 jiffies / ~1s ≈ 200ms CPU
+}
+
+let agentWorkActiveCache = { at: 0, promise: null };
+function agentWorkActive(opts) {
+  const now = Date.now();
+  const fresh = !!(opts && opts.fresh);
+  if (!fresh && now - agentWorkActiveCache.at < 5000 && agentWorkActiveCache.promise) {
+    return agentWorkActiveCache.promise;
+  }
+  agentWorkActiveCache.at = now;
+  agentWorkActiveCache.promise = (async () => {
+    if (hasActiveModelRequest()) return true;
+    if (await hasRunningTask(tasksIndexPath())) return true;
+    const writeAt = await latestAgentWriteAt();
+    if (writeAt && Date.now() - writeAt <= AGENT_WRITE_ACTIVE_MS) return true;
+    if (opts && opts.probe === false) return false;
+    const pids = [];
+    for (const s of sessions.values()) if (!s.closed && s.child) pids.push(s.child.pid);
+    for (const e of httpRelays.values()) if (!e.pipe.closed && e.pipe.child) pids.push(e.pipe.child.pid);
+    return hostTreeBusy(pids, 1000);
+  })();
+  return agentWorkActiveCache.promise;
+}
+
+// /api/active is a synchronous handler; keep a cheap async-refreshed copy of the
+// CLI DB watermark so restart-safety can see a turn that has no recent frames.
+let lastCliWriteAt = 0;
+setInterval(async () => {
+  try {
+    const t = await latestAgentWriteAt();
+    if (t) lastCliWriteAt = t;
+  } catch (_e) { /* ignore */ }
+}, 5000).unref();
 
 // Worktrees/workspace directories get deleted all the time (git worktree prune,
 // rm -rf). The official zcode-server treats a missing workspace cwd as a fatal
@@ -829,6 +1068,33 @@ function queueRelayFrame(entry, payload) {
   }
 }
 
+// pagehide used to close the HTTP relay immediately, killing whatever turn was
+// running on that host. Reloading a page while the agent is mid-turn therefore
+// looked exactly like a random interruption. Keep the host alive while the
+// agent is demonstrably busy; the relay reaper closes it once idle.
+async function requestRelayClose(id, entry, reason) {
+  if (!entry || !httpRelays.has(id) || entry.pipe.closed) return;
+  const now = Date.now();
+  const recentFrame = !!(entry.lastFrameAt && now - entry.lastFrameAt <= RELAY_CLOSE_RECENT_FRAME_MS);
+  let busy = recentFrame;
+  if (!busy) {
+    try { busy = await agentWorkActive({ fresh: true }); }
+    catch (_e) { busy = true; }   // fail-safe: never kill on an inconclusive check
+  }
+  if (busy) {
+    if (!entry.closeRequestedAt) {
+      entry.closeRequestedAt = now;
+      entry.closeReason = reason || 'client';
+      console.error('[bridge] close deferred id=' + id + ' (' + entry.closeReason +
+        ' while agent is active; relay kept until idle)');
+    }
+    return;
+  }
+  try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+  httpRelays.delete(id);
+  console.error('[bridge] http session closed id=' + id + ' (' + (reason || 'client') + ')');
+}
+
 function rpcLogOut(payload) {
   const l = rpcLogLine('RPC-out', payload);
   if (l) console.error('[rpc] ' + l);
@@ -1220,12 +1486,13 @@ function rebindView(session, tabId) {
 }
 
 // Idle-session reaper: a session whose views have ALL gone away parks detached;
-// after the TTL it is reaped unless it is verifiably still working (frames
-// flowing, or a recent running task in the official index).
+// after the TTL it is reaped unless it is verifiably still working. The busy
+// check is global and covers frames, tasks-index, CLI DB writes, an in-flight
+// model request in the CLI log, and a short CPU probe of every host tree.
 if (DETACHED_TTL_MS > 0) {
   setInterval(async () => {
     const now = Date.now();
-    if (await hasRunningTask(tasksIndexPath())) return;   // global busy-guard
+    if (await agentWorkActive()) return;   // global busy-guard
     for (const s of [...sessions.values()]) {
       if (s.closed || s.views.size > 0 || !s.detachedAt) continue;
       if (now - s.detachedAt <= DETACHED_TTL_MS) continue;
@@ -1235,25 +1502,43 @@ if (DETACHED_TTL_MS > 0) {
         Math.round((now - s.lastFrameAt) / 1000) + 's)');
       terminateSession(s, 'idle reap');
     }
-  }, 60000).unref();
+  }, REAP_INTERVAL_MS).unref();
 }
 
 // HTTP fallback relays are NOT protected by the sessions reaper above; without
 // this every abandoned long-poll page would keep a full zcode-server host alive
-// forever. Close relays whose client has not polled/sent recently.
+// forever. Close relays whose client has not polled/sent recently — but only
+// after the same global busy-guard, because a relay can be actively running a
+// turn while its page is backgrounded and not polling. A close requested by
+// pagehide gets a shorter idle grace (DEFERRED_RELAY_CLOSE_IDLE_MS) once the
+// host is idle, instead of killing an in-flight turn on reload.
 if (HTTP_RELAY_TTL_MS > 0) {
-  setInterval(() => {
+  setInterval(async () => {
     const now = Date.now();
+    const idle = [];
     for (const [id, entry] of httpRelays) {
       if (entry.pipe.closed) { httpRelays.delete(id); continue; }
-      if (now - entry.lastSeen > HTTP_RELAY_TTL_MS) {
-        console.error('[bridge] reaping idle http relay id=' + id +
-          ' (idle ' + Math.round((now - entry.lastSeen) / 1000) + 's)');
-        try { entry.pipe.close(); } catch (_e) { /* ignore */ }
-        httpRelays.delete(id);
-      }
+      const age = now - entry.lastSeen;
+      const closeAge = entry.closeRequestedAt ? now - entry.closeRequestedAt : 0;
+      const deferred = !!(entry.closeRequestedAt && closeAge > DEFERRED_RELAY_CLOSE_IDLE_MS);
+      if (age > HTTP_RELAY_TTL_MS || deferred) idle.push([id, entry, age, deferred]);
     }
-  }, 60000).unref();
+    if (idle.length === 0) return;
+    if (await agentWorkActive()) return;   // a turn is still running somewhere
+    for (const [id, entry, age, deferred] of idle) {
+      if (!httpRelays.has(id) || entry.pipe.closed) continue;
+      // re-check after the await: host frames may have arrived meanwhile
+      const ageNow = Date.now() - entry.lastSeen;
+      if (!deferred && ageNow <= HTTP_RELAY_TTL_MS) continue;
+      // A deferred pagehide close waits for the turn to settle, not for a
+      // permanently silent poller: idle event frames must not keep it alive.
+      if (deferred && Date.now() - entry.closeRequestedAt <= DEFERRED_RELAY_CLOSE_IDLE_MS) continue;
+      console.error('[bridge] reaping idle http relay id=' + id +
+        ' (idle ' + Math.round(ageNow / 1000) + 's' + (deferred ? ', deferred pagehide close' : '') + ')');
+      try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+      httpRelays.delete(id);
+    }
+  }, REAP_INTERVAL_MS).unref();
 }
 
 // mux kill switch lives here so both parser and writer see one definition
@@ -1362,8 +1647,9 @@ function handleRequest(req, res) {
         views: all.reduce((n, s) => n + (s.closed ? 0 : s.views.size), 0),
         detached: all.filter((s) => !s.closed && s.views.size === 0).length,
       },
-      reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS },
+      reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS, intervalMs: REAP_INTERVAL_MS },
       httpRelays: httpRelays.size,
+      httpRelayTtlMs: HTTP_RELAY_TTL_MS,
       bindHost: BIND_HOST,
       accessGate: !!ACCESS_TOKEN,
       guards: { apiCache: guardStatsSnapshot(), quotaReset: quotaResetSnapshot() },
@@ -1397,9 +1683,14 @@ function handleRequest(req, res) {
   if (urlPath === '/bridge/open' && req.method === 'POST') {
     return openHostPipe().then((pipe) => {
       const id = randomUUID();
-      const entry = { pipe, queue: [], waiter: null, waiterTimer: null, lastSeen: Date.now() };
+      const entry = {
+        pipe, queue: [], waiter: null, waiterTimer: null,
+        lastSeen: Date.now(), lastFrameAt: 0, closeRequestedAt: 0, closeReason: '',
+      };
       pipe.onFrame = (payload) => {
-        entry.lastSeen = Date.now();
+        const now = Date.now();
+        entry.lastSeen = now;
+        entry.lastFrameAt = now;
         if (entry.waiter) {
           const w = entry.waiter;
           entry.waiter = null;
@@ -1420,14 +1711,28 @@ function handleRequest(req, res) {
         httpRelays.delete(id);
       };
       if (HTTP_RELAY_MAX > 0) {
+        const now = Date.now();
         let oldest = null;
         for (const [rid, e] of httpRelays) {
+          // Never evict a relay that is demonstrably mid-turn or already waiting
+          // for an idle close; killing one here is exactly the interruption this
+          // reaper fix is about.
+          if (e.closeRequestedAt) continue;
+          if (e.lastFrameAt && now - e.lastFrameAt < ACTIVE_FRAME_MS) continue;
           if (!oldest || e.lastSeen < oldest.entry.lastSeen) oldest = { id: rid, entry: e };
+        }
+        const hardMax = HTTP_RELAY_MAX * 2;
+        if (httpRelays.size >= HTTP_RELAY_MAX && !oldest && httpRelays.size >= hardMax) {
+          for (const [rid, e] of httpRelays) {
+            if (!oldest || e.lastSeen < oldest.entry.lastSeen) oldest = { id: rid, entry: e };
+          }
         }
         if (oldest && httpRelays.size >= HTTP_RELAY_MAX) {
           console.error('[bridge] closing oldest http relay id=' + oldest.id + ' (max ' + HTTP_RELAY_MAX + ' reached)');
           try { oldest.entry.pipe.close(); } catch (_e) { /* ignore */ }
           httpRelays.delete(oldest.id);
+        } else if (httpRelays.size >= HTTP_RELAY_MAX) {
+          console.error('[bridge] all ' + httpRelays.size + ' http relays look active; allowing one extra (' + HTTP_RELAY_MAX + ' soft cap)');
         }
       }
       httpRelays.set(id, entry);
@@ -1518,8 +1823,11 @@ function handleRequest(req, res) {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
     const entry = httpRelays.get(id);
     if (entry) {
-      entry.pipe.close();
-      httpRelays.delete(id);
+      // Async: an active turn defers the close to the relay reaper instead of
+      // killing the host on pagehide/reload. The response is immediate either way.
+      requestRelayClose(id, entry, 'client close').catch((e) => {
+        console.error('[bridge] close check failed id=' + id + ': ' + ((e && e.message) || e));
+      });
     }
     return sendJson(res, 200, { ok: true });
   }
@@ -1617,10 +1925,20 @@ function handleRequest(req, res) {
     if (detachedBusy.length > 0) reasons.push(detachedBusy.length + ' detached host(s) mid-turn');
     for (const t of busy) reasons.push('task ' + String(t.taskId).slice(0, 18) + ' ' + t.status + ' ' + Math.max(1, Math.round(t.ageSec / 60)) + 'min ago');
     if (!indexOk) reasons.push('tasks-index unreadable (fail-safe)');
+    // Two extra truth sources for a silent turn: the CLI DB watermark is updated
+    // as the turn advances, and an unmatched model.request.started in the CLI log
+    // covers a single slow SSE call (the case that fooled the old reaper).
+    const writeAge = lastCliWriteAt ? now - lastCliWriteAt : Infinity;
+    const writeBusy = writeAge <= AGENT_WRITE_ACTIVE_MS;
+    if (writeBusy) reasons.push('CLI DB written ' + Math.max(1, Math.round(writeAge / 1000)) + 's ago');
+    const modelBusy = hasActiveModelRequest();
+    if (modelBusy) reasons.push('model request in flight (CLI log)');
     return sendJson(res, 200, {
       ok: true,
-      active: streaming.length > 0 || detachedBusy.length > 0 || busy.length > 0 || !indexOk,
+      active: streaming.length > 0 || detachedBusy.length > 0 || busy.length > 0 || writeBusy || modelBusy || !indexOk,
       reasons, streaming, detachedBusy, indexOk, tasks,
+      cliDbWriteAgeSec: Number.isFinite(writeAge) ? Math.round(writeAge / 1000) : null,
+      modelRequestActive: modelBusy,
     });
   }
 
@@ -2122,31 +2440,51 @@ setInterval(() => {
   }
 }, WS_PING_MS).unref();
 
-// Parked-era expiry: a tab whose socket closed buffers downstream frames for a
-// resume that may never come. After RESUME_PARK_MS the era is retired — its
-// host-side event subscriptions are disposed (a tab that never returns would
-// otherwise keep ghost listeners firing forever) and its replay buffer freed.
-// The eraByTab entry goes too, so a late resume=1 from that tab takes the
-// clean reload path instead of pretending nothing was lost.
+// Parked-era cleanup: a tab whose socket closed buffers downstream frames for a
+// resume that may never come. We deliberately DO NOT dispose its host-side
+// subscriptions on the old RESUME_PARK_MS timer: those subscriptions are the
+// reaper's frame-liveness signal, and disposing them at minute 10 made a long,
+// active turn look idle (2026-10-18 postmortem). The host reaper owns cleanup.
+// To bound ghost listeners we only retire a parked era once the host has been
+// quiet for a full FRAME_QUIET_MS and no model/DB activity is in flight, plus a
+// hard cap on parked eras per session (each still replayed on hot resume).
+const PARKED_ERA_MAX = 16;
 if (RESUME_PARK_MS > 0) {
-  setInterval(() => {
+  setInterval(async () => {
     const now = Date.now();
+    const writeAt = await latestAgentWriteAt();
+    const agentBusy = hasActiveModelRequest() || (writeAt && now - writeAt <= AGENT_WRITE_ACTIVE_MS);
     for (const s of [...sessions.values()]) {
       if (s.closed || !s.eraByTab) continue;
+      const candidates = [];
       for (const [tabId, era] of s.eraByTab) {
         if (s.views.get(tabId) === era || !era.parkedAt) continue;
         if (now - era.parkedAt <= RESUME_PARK_MS) continue;
+        candidates.push([tabId, era]);
+      }
+      if (candidates.length === 0) continue;
+      candidates.sort((a, b) => a[1].parkedAt - b[1].parkedAt);
+      const overCap = Math.max(0, candidates.length - PARKED_ERA_MAX);
+      for (let i = 0; i < candidates.length; i++) {
+        const [tabId, era] = candidates[i];
+        const force = i < overCap;
+        if (!force) {
+          if (s.lastFrameAt && now - s.lastFrameAt <= FRAME_QUIET_MS) continue;
+          if (agentBusy) continue;
+        }
         disposeViewEvents(s, era);
         if (s.mux) {
           for (const [gid, e] of s.mux.pending) if (e.view === era) s.mux.pending.delete(gid);
         }
+        const parkedFor = Math.max(0, Math.round((now - era.parkedAt) / 1000));
         era.resumeBuf.length = 0;
         era.resumeBytes = 0;
         era.resumeOverflow = false;
         era.parkedAt = 0;
         s.eraByTab.delete(tabId);
-        console.error('[ws] parked era expired tab=' + tabId.slice(0, 8) +
-          ' after ' + Math.round(RESUME_PARK_MS / 1000) + 's — subscriptions disposed, late resume will reload');
+        console.error('[ws] parked era retired tab=' + tabId.slice(0, 8) +
+          ' after ' + parkedFor + 's parked' +
+          (force ? ' (parked-era cap)' : ' (host idle; late resume will reload)'));
       }
     }
   }, 30000).unref();

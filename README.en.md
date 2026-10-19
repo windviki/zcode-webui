@@ -103,7 +103,7 @@ git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # only runtime dependency: ws
 
 npm run fetch-renderer                 # downloads the official installer from the CDN and extracts
-                                       # the UI (default 3.12.3; override ZCODE_VERSION=… ZCODE_ARCH=x64)
+                                       # the UI (default 3.15.3; override ZCODE_VERSION=… ZCODE_ARCH=x64)
 
 cp config.example.json config.json     # optional; common fields: workspace / oauthProxy / hostProxy
 
@@ -186,9 +186,13 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | Official runtime directory (rarely changed) |
 | `ZCODE_HOME` | — | `~/.zcode` | Official data/credential directory (shared with the CLI) |
 | `ZCODE_WEBUI_HOME` | — | see notes | Data home of this service (config, renderer, device id, logs); defaults to `~/.zcode-webui` for npm installs; git checkouts keep using the project dir when it already contains `config.json` or `vendor/renderer` |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.12.3` / `x64` | Version/architecture for `fetch-renderer` |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | Version/architecture for `fetch-renderer` |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | Reap detached background hosts after this long when idle; `0` = keep forever |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | Reap precondition: no host→browser frames within this window |
+| `ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS` | — | `600000` | Keep hosts alive while the official CLI DB (message/part/session_entry) was written within this window |
+| `ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS` | — | `7200000` | An unmatched `model.request.started` in the CLI log counts as in-flight for at most this long |
+| `ZCODE_WEBUI_REAP_INTERVAL_MS` | — | `60000` | Idle-reaper scan interval |
+| `ZCODE_WEBUI_DEFERRED_RELAY_CLOSE_IDLE_MS` | — | `300000` | On pagehide `/bridge/close`, keep an active HTTP relay until it has been idle this long |
 | `ZCODE_WEBUI_RUNNING_TASK_STALE_MS` | — | `7200000` | Global reap guard: nothing is reaped while the task index has a recent "running" task |
 | `ZCODE_WEBUI_DEBUG_RPC` | — | off | Set `1` to log protocol message previews (debugging) |
 
@@ -230,7 +234,7 @@ Note: `upgrade` updates the official components only; upgrade zcode-webui itself
 > "database startup" channel (`zcode:database-startup-state`, phase=ready, startupId matching the port),
 > otherwise the UI stops at "未能收到启动状态 / startup-channel-unavailable". `web/bootstrap.js` now picks
 > the right handshake per deployed renderer version (bare string for <=3.11, object + startup state for
-> >=3.12) and `SHIM_MAX_SUPPORTED` is 3.12.3.
+> >=3.12) and `SHIM_MAX_SUPPORTED` is 3.15.3.
 >
 > 3.12's `zcode.cjs` also needs `<runtime>/agents/glm/provider/zcode-builtin.json` (the desktop app
 > ships it, the server runtime does not) — without it both login and agent spawns fail; the server
@@ -240,13 +244,17 @@ Note: `upgrade` updates the official components only; upgrade zcode-webui itself
 > active plan (`billing/balance` returns `plans: []`) the UI shows "当前没有可用模型" — add your API key via
 > 管理模型 → 添加自定义模型, or `./zcode-update.sh --rollback` to return to 3.11.x (which trusts the local
 > CLI config key instead).
+>
+> **3.15.3 verified** (2026-10-19): `./zcode-update.sh -v 3.15.3 --yes` completed the renderer/runtime
+> upgrade; smoke, headless UI boot and the guard self-check all passed. The previous 3.14.3 build is kept
+> in `vendor/renderer.bak-3.14.3-*` and `~/.zcode/server.bak-3.14.3-*` for rollback.
 
 ### One-command update (git checkout / local deployment)
 
 ```bash
 ./zcode-update.sh              # detect → download → unpack → atomic swap → restart → verify (auto-rollback)
 ./zcode-update.sh --check      # show current / website / CDN versions only
-./zcode-update.sh -v 3.12.3    # pin a version
+./zcode-update.sh -v 3.15.3    # pin a version
 ./zcode-update.sh --rollback   # restore the most recent pre-update backups
 ```
 

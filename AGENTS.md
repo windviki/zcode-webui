@@ -66,7 +66,7 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 ```bash
 ./zcode-update.sh              # 探测最新版本并更新，装完自动重启 + 校验
 ./zcode-update.sh --check      # 只看版本（当前 / 官网 / CDN）
-./zcode-update.sh -v 3.12.3    # 指定版本（显式指定会绕过「shim 支持上限」的判断）
+./zcode-update.sh -v 3.15.3    # 指定版本（显式指定会绕过「shim 支持上限」的判断）
 ./zcode-update.sh --stable     # 只跟官网公布版本，不采用 CDN 上更新的构建
 ./zcode-update.sh --rollback   # 回滚到最近一次更新前的备份
 ```
@@ -82,8 +82,11 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 4. **强制校验**：版本对齐 → `/api/health` → `scripts/smoke-test.mjs`（WS/HTTP 协议桥）→
    `scripts/ui-boot-check.mjs`（headless Chromium 真跑官方渲染层）。任一失败，**默认自动回滚**并再校验一次
    （`--no-auto-rollback` 可关）。
-5. **shim 支持上限**：`SHIM_MAX_SUPPORTED`（脚本与 `src/upgrade.mjs` 各一份）为 **3.12.3**，
+5. **shim 支持上限**：`SHIM_MAX_SUPPORTED`（脚本与 `src/upgrade.mjs` 各一份）为 **3.15.3**，
    超过它的版本不自动升，只提示（显式 `-v` 可试装，装完照样校验界面）。
+   2026-10-19 已用 `./zcode-update.sh -v 3.15.3 --yes` 完成整链升级：渲染层/运行时 3.15.3，
+   smoke、headless UI、守卫自检全部通过（旧版 3.14.3 的备份在 `~/.zcode/server.bak-3.14.3-*` 与
+   `vendor/renderer.bak-3.14.3-*`）。
 
 ### 3.12.x 适配（2026-09-17 完成）
 
@@ -134,9 +137,9 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 
 ### 版本钉位
 
-- 本机部署：**3.12.3**（`zcode-update.sh` 的 `PINNED_VERSION`、`scripts/fetch-renderer.sh` 的
+- 本机部署：**3.15.3**（`zcode-update.sh` 的 `PINNED_VERSION`、`scripts/fetch-renderer.sh` 的
   `ZCODE_VERSION` 默认值、`src/upgrade.mjs` 的 `DEFAULT_VERSION`、README 里的默认值，四处一起改）。
-- shim 支持上限：**3.12.3**（`SHIM_MAX_SUPPORTED`，两处：`zcode-update.sh` 与 `src/upgrade.mjs`）。
+- shim 支持上限：**3.15.3**（`SHIM_MAX_SUPPORTED`，两处：`zcode-update.sh` 与 `src/upgrade.mjs`）。
   超过上限的版本默认不升，只提示；显式 `-v` 仍可试装，装完照常校验、起不来自动回滚。
 
 ### 会话置顶（pin）禁用（2026-09-18）
@@ -270,9 +273,10 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
    呼叫响应全部被丢——「不刷新就看不到最新会话」的直接原因。现在每个**渲染层时代（era）**在
    停靠期间把发给它的下行帧缓冲（默认 2048 帧 / 16MB，`ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES`/
    `_MB`），resume=1 热重连时按序重放（本地 id 已还原）；缓冲溢出则下次 resume 直接 close 4000
-   走整页刷新（比静默漏帧诚实）。停靠超时（默认 10min，`ZCODE_WEBUI_RESUME_PARK_MS`，0=关闭缓冲）
-   会 `disposeViewEvents` + 清缓冲 + 删 eraByTab 条目——**顺带修掉了标签页永不回来时宿主侧
-   ghost 事件订阅无限堆积的存量泄漏**。
+   走整页刷新（比静默漏帧诚实）。停靠期间**不再按 RESUME_PARK_MS 直接 dispose 宿主订阅**
+   （2026-10-19 修正：那会在第 10 分钟抹掉 reaper 唯一的帧活跃信号，把长回合误杀）。现在只在
+   宿主已静默且没有 model/DB 活动时退休 era（`PARKED_ERA_MAX=16` 上限），宿主回收由 reaper
+   负责，ghost 订阅随宿主进程一起消失。
 3. **上行帧静默丢弃**：socket 断开期间渲染层发的服务调用（文件树展开、列表刷新等）直接蒸发，
    对应 UI promise 永远挂起。bootstrap 现在把断线期间的上行帧排队（256 帧 / 4MB），传输恢复
    （ws verify 或 http open 成功）时冲刷。测试钩子 `window.__zwebui_send(data)` 等价于渲染层发帧。
@@ -389,7 +393,39 @@ running<2h / error 新近<10min）。注意挂着页面没事闲聊不会误报�
 自检：`resume-replay-test` 扩到 19 项（丢失调用合成 202、resume 后新调用不被合成、
 /api/active 三态：附着空闲 false / 脱离有帧 true / index 不可读 fail-safe）。
 
+## 长回合被空闲回收误杀 / subagent 报错后会话中断（2026-10-19，v0.8.3）
 
+**现象**：10-18 的会话频繁在 ~30 分钟后中断，用户常发「继续」。`sess_1b0b7ab7`
+两次被 kill（14:08 起 63 分钟；23:01 起 41 分钟），随后 UI 出现
+`Agent was cancelled before the subagent returned findings or background launch completed`
+这类 subagent 报错；`sess_cbd72239` 在 05:07 / 07:01 / 14:03 / 14:07 多次「继续」。
+DB `turn_usage` 里 7 条 cancelled 全是 `TURN_CANCELLED` + cause
+`Protocol runtime stopping`，时间点与日志里的 `reaping idle detached host`、
+`[bridge] reaping idle http relay`、pagehide 触发的 `/bridge/close` 一一对应。
+
+**根因（两层）**：
+1. v0.8.0 的 parked-era 到期（`RESUME_PARK_MS`，10min）会 `disposeViewEvents`。宿主其实
+   还在跑长回合，但 shim 从第 10 分钟起再也收不到下行帧，`session.lastFrameAt` 变旧；
+   30 分钟 detached TTL 到点，reaper 把仍在 model request / subagent 里的 host 杀掉。
+2. HTTP fallback 的 relay reaper 只看 `entry.lastSeen`，pagehide 的 `/bridge/close` 直接
+   kill host。一个慢 model request 可以 27 分钟无帧、无 DB 写入，两个旧判据都会误杀。
+
+**修复**（`src/server.mjs`）：
+- 停靠 era **不再按时间 dispose 宿主侧订阅**；只在宿主已静默 `FRAME_QUIET_MS` 且没有
+  model/DB 活动时退休，另有 `PARKED_ERA_MAX=16` 上限（保留 hot resume，避免 ghost 泄漏）。
+- 全局 busy-guard 扩为五路，任一命中都不回收：
+  ① tasks-index 的 running 行；② CLI DB（`message`/`part`/`session_entry`）最新
+  `time_updated`；③ CLI 日志里未配对的 `model.request.started`（按 `queryId` 配对
+  `model.request.completed`/`failed`/`turn.failed`，2h 上限）；④ 宿主进程树短时 CPU 探针
+  （含 90s 内新 spawn 的 subagent/tool 子进程）；⑤ 帧静默窗口。`/api/active` 新增
+  `cliDbWriteAgeSec` / `modelRequestActive`。
+- HTTP relay reaper 走同一 busy-guard；`/bridge/close` 在活跃时只标记
+  `entry.closeRequestedAt`，等 idle 后由 reaper 关闭；`HTTP_RELAY_MAX` 也不再驱逐活跃 relay。
+- 新 env：`ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS`（默认 10min）、
+  `ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS`（默认 2h）、`ZCODE_WEBUI_REAP_INTERVAL_MS`
+  （默认 60s）、`ZCODE_WEBUI_DEFERRED_RELAY_CLOSE_IDLE_MS`（默认 5min）。
+- 自检：`node scripts/dev/reaper-guard-test.mjs`（A 帧保活 / B DB 保活 / C 模型请求保活 /
+  D pagehide 延迟关闭）；`resume-replay-test` 19 项复跑。
 
 
 ## 「完全访问」模式的官方语义（2026-09-18 排查结论）
