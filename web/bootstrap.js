@@ -629,6 +629,109 @@
   // (goes through the uplink buffer when the transport is down)
   window.__zwebui_send = function (data) { sendToBridge(data); };
 
+  // ---- sidebar interaction audit ------------------------------------------------
+  // Diagnoses "after refresh the FIRST-clicked workspace directory collapses
+  // fine but can never be expanded again, while other directories keep
+  // toggling". Every click on a sidebar toggle ([aria-expanded]: workspace
+  // group rows AND file-tree folders) is recorded; 2.5s later the same row is
+  // re-inspected — if its state did not flip, a "wedge" line goes to the
+  // server log together with document.elementFromPoint at the click position
+  // (catches invisible overlays: stuck tooltips/drag ghosts/popovers) and the
+  // renderer's own recent decision logs. All client-side: takes effect on the
+  // next page refresh, no server restart involved.
+  (function () {
+    var AUDIT_MAX = 60, audited = 0;
+    var recentInfo = [];                       // renderer decision lines worth attaching
+    try {
+      var origInfo = console.info;
+      console.info = function () {
+        try {
+          var t = Array.prototype.map.call(arguments, function (a) { return typeof a === 'string' ? a : ''; }).join(' ');
+          if (/\[Root\]|\[useTabPersistence\]|\[WorkspaceSidebar|\[workspace-file-tree\]|\[WorkspaceFileTree\]/.test(t)) {
+            recentInfo.push(t.slice(0, 200));
+            if (recentInfo.length > 12) recentInfo.shift();
+          }
+        } catch (e) { /* ignore */ }
+        return origInfo.apply(console, arguments);
+      };
+    } catch (e) { /* ignore */ }
+    function auditLog(message) {
+      try {
+        fetch('api/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ href: window.location.href, kind: 'sidebar-audit', message: message }),
+        }).catch(function () { /* ignore */ });
+      } catch (e) { /* ignore */ }
+    }
+    function describe(el) {
+      if (!el) return 'gone';
+      var ae = el.getAttribute('aria-expanded');
+      return 'ae=' + (ae === null ? 'n/a' : ae) + ' tag=' + el.tagName +
+        ' label=' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+    }
+    // React re-renders replace the DOM node, so the after-state must RE-QUERY:
+    // prefer the element now sitting at the row's original center (the row keeps
+    // its position through expand/collapse), then fall back to a label match.
+    function findLive(el) {
+      try {
+        var r = el.getBoundingClientRect();
+        if (r.width > 0) {
+          var hit = document.elementFromPoint(r.left + Math.min(r.width / 2, 20), r.top + r.height / 2);
+          var row = hit && hit.closest ? hit.closest('[aria-expanded]') : null;
+          if (row) return row;
+        }
+      } catch (e) { /* detached */ }
+      var label = String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+      var nodes = document.querySelectorAll('[aria-expanded]');
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n === el) return n;
+        if (n.tagName === el.tagName &&
+          String(n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24) === label) return n;
+      }
+      return null;
+    }
+    document.addEventListener('click', function (ev) {
+      if (audited >= AUDIT_MAX || ev.clientX > 420) return;   // sidebar region only
+      if (ev.clientX === 0 && ev.clientY === 0) return;       // synthetic el.click() noise
+      var el = ev.target && ev.target.closest ? ev.target.closest('[aria-expanded]') : null;
+      if (!el) return;
+      var at = { x: Math.round(ev.clientX), y: Math.round(ev.clientY) };
+      var before = describe(el);
+      var seq = ++audited;
+      el.__zwebuiAuditSeq = seq;                       // a later click on the same row supersedes us
+      setTimeout(function () {
+        var live = findLive(el);
+        var after = describe(live);
+        var flipped = before.slice(0, 8) !== after.slice(0, 8);   // compare the ae= part
+        var superseded = live && live.__zwebuiAuditSeq !== undefined && live.__zwebuiAuditSeq > seq;
+        var msg = 'click@' + at.x + ',' + at.y + ' ' + before + ' → ' + (after === 'gone' ? 'ROW-GONE' : after) +
+          ' flipped=' + flipped + (superseded ? ' (superseded by later click)' : '');
+        if (!flipped && !superseded) {
+          var top = null;
+          try { top = document.elementFromPoint(at.x, at.y); } catch (e) { /* ignore */ }
+          msg = 'WEDGE? ' + msg + ' topNow=' + (top && top.tagName ? (top.tagName + '.' + String(top.className).split(' ')[0]) : '?') +
+            ' | recent: ' + (recentInfo.slice(-4).join(' ⏎ ') || 'none');
+        }
+        auditLog(msg);
+      }, 2500);
+    }, true);
+    // expansion-map trail: the tabStore persists every toggle here
+    try {
+      var EXP_KEY = 'zcode-workspace-expansion';
+      var lastMap = null;
+      setInterval(function () {
+        var cur = null;
+        try { cur = localStorage.getItem(EXP_KEY); } catch (e) { return; }
+        if (cur !== lastMap) {
+          if (lastMap !== null) auditLog('expansion-map: ' + (cur || '(empty)'));
+          lastMap = cur;
+        }
+      }, 1000);
+    } catch (e) { /* ignore */ }
+  })();
+
   // debug/transport override: ?transport=http forces the HTTP polling bridge
   // (useful behind proxies that never forward WebSocket upgrades)
   var forceHttp = false;

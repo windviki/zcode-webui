@@ -2492,20 +2492,34 @@ if (RESUME_PARK_MS > 0) {
 
 // Stale-call sweeper: a mux pending entry whose host never answered would
 // otherwise live forever (tiny leak, but it also pins the view's `sent` set).
+// The renderer's promise for that call must not wait forever too — silent
+// deletion wedges consumers that gate retries on completion (the file tree's
+// `loading` dedup: "folder collapses fine but never opens again until
+// refresh"). Answer LIVE views with a synthesized 202 PromiseError — same shape
+// as the resume-time synthesis — and just drop entries whose owner is a parked
+// era (a late resume of a retired era reloads the page anyway).
 const PENDING_CALL_TTL_MS = 10 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const s of [...sessions.values()]) {
-    if (!s.mux) continue;
-    let reaped = 0;
+    if (!s.mux || s.closed || !s.child || s.child.exitCode !== null) continue;
+    let reaped = 0, answered = 0;
     for (const [gid, e] of s.mux.pending) {
       if (!e.at || now - e.at <= PENDING_CALL_TTL_MS) continue;
+      if (e.injected) { s.mux.pending.delete(gid); continue; }
       s.mux.pending.delete(gid);
       if (e.view && e.view.sent) e.view.sent.delete(gid);
       s.mux.dropped++;
       reaped++;
+      if (e.view && e.view.ws && e.view.ws.readyState === 1 && s.views.get(e.view.tabId) === e.view) {
+        try {
+          sendToView(s, e, { id: gid }, errorAckFor(gid, 'zcode-webui: no response within ' + Math.round(PENDING_CALL_TTL_MS / 1000) + 's (synthesized timeout)'));
+          answered++;
+        } catch (_e) { /* view may be closing */ }
+      }
     }
-    if (reaped > 0) console.error('[mux] reaped ' + reaped + ' pending call(s) with no response in ' + Math.round(PENDING_CALL_TTL_MS / 1000) + 's (host pid ' + (s.child && s.child.pid) + ')');
+    if (reaped > 0) console.error('[mux] reaped ' + reaped + ' pending call(s) with no response in ' + Math.round(PENDING_CALL_TTL_MS / 1000) + 's' +
+      ' (' + answered + ' answered with synthesized timeout; host pid ' + (s.child && s.child.pid) + ')');
   }
 }, 60000).unref();
 
