@@ -719,6 +719,31 @@
       }
       return null;
     }
+    // touch swipe/scroll trail: the user reports the wedge follows 上划/下划 —
+    // record swipes that start on a sidebar row (dnd-kit PointerSensor
+    // activates at 8px; a swipe that crosses it can start a drag)
+    var swipe = null, swipes = 0;
+    document.addEventListener('pointerdown', function (ev) {
+      if (ev.pointerType !== 'touch' || swipes >= 30) return;
+      var el = ev.target && ev.target.closest ? ev.target.closest('[aria-expanded],[role="treeitem"]') : null;
+      swipe = el ? { x: ev.clientX, y: ev.clientY, label: rowLabel(el), ae: el.getAttribute('aria-expanded') } : null;
+    }, true);
+    document.addEventListener('pointerup', function (ev) {
+      if (!swipe) return;
+      var dx = ev.clientX - swipe.x, dy = ev.clientY - swipe.y;
+      if (dx * dx + dy * dy >= 64) {   // ≥8px: crossed dnd's activation distance
+        swipes++;
+        auditLog('swipe ' + swipe.label.slice(0, 20) + ' ae=' + swipe.ae + ' Δ=' + Math.round(dx) + ',' + Math.round(dy) + (ev.type === 'pointercancel' ? ' CANCELLED' : ''));
+      }
+      swipe = null;
+    }, true);
+    document.addEventListener('pointercancel', function (ev) {
+      if (!swipe) return;
+      swipes++;
+      auditLog('swipe ' + swipe.label.slice(0, 20) + ' ae=' + swipe.ae + ' CANCELLED mid-gesture (browser took over)');
+      swipe = null;
+    }, true);
+
     document.addEventListener('click', function (ev) {
       if (audited >= AUDIT_MAX || ev.clientX > 420) return;   // sidebar region only
       if (ev.clientX === 0 && ev.clientY === 0) return;       // synthetic el.click() noise
