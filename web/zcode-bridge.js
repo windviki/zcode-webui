@@ -354,6 +354,33 @@
   }
   installPinKillSwitch();
 
+  // ---- touch drag-to-reorder kill switch (sidebar rows) ----
+  // The official sidebar sorts workspace groups / task groups with dnd-kit
+  // PointerSensor({distance: 8}): every group row doubles as a drag handle. On
+  // touch screens a scroll swipe that starts on a row crosses the 8px
+  // threshold before the browser claims the gesture (pointercancel) — the
+  // half-activated drag then collapses/expands the group (official drag
+  // behavior) and the sensor's click suppression swallows subsequent taps on
+  // that row for a while: "swipe up closes the directory, taps can no longer
+  // expand it, swipe down expands it again, refresh fixes it". Verified live
+  // via the sidebar audit (swipe CANCELLED → wedge → twins: exactly one real
+  // row, no ghost layer). Reordering stays a desktop/mouse feature; on touch,
+  // sidebar swipes must only scroll. Swallow the touch pointerdown before
+  // dnd's listeners see it — native scrolling and tap→click are default
+  // actions, unaffected by stopPropagation. Strictly scoped to the sidebar
+  // panel (workspace group rows live ~14 levels deep inside it); the file tree
+  // is left out on purpose (drag-a-file-into-the-composer is a legit gesture).
+  document.addEventListener('pointerdown', function (ev) {
+    if (ev.pointerType !== 'touch') return;
+    var el = ev.target;
+    if (!el || !el.closest) return;
+    var panel = el.closest('[data-workspace-sidebar-panel]');
+    if (!panel) return;
+    var row = el.closest('[aria-expanded],[data-task-row-actions],li[class*="group/task-item"]');
+    if (!row) return;
+    try { ev.stopImmediatePropagation(); } catch (e) { /* ignore */ }
+  }, true);
+
   function noop() {}
   function ok() { return Promise.resolve(undefined); }
   function unsub() { return function () {}; }
