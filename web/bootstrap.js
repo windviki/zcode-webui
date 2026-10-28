@@ -670,6 +670,34 @@
       return 'ae=' + (ae === null ? 'n/a' : ae) + ' tag=' + el.tagName +
         ' label=' + String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
     }
+    function rowLabel(el) {
+      return String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+    }
+    function ancestors(el) {
+      var out = [];
+      var a = el;
+      for (var i = 0; i < 3 && a; i++) {
+        a = a.parentElement;
+        if (!a) break;
+        out.push(String(a.className).split(' ').slice(0, 2).join('.').slice(0, 60) || a.tagName);
+      }
+      return out.join(' < ');
+    }
+    // every [aria-expanded] row with the same label — duplicates expose stale
+    // layers (closing drawer animations, swapped views) whose handlers still run
+    // but whose rendering no longer follows the store
+    function twins(label) {
+      var out = [];
+      var nodes = document.querySelectorAll('[aria-expanded]');
+      for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (rowLabel(n) === label) {
+          var r = n.getBoundingClientRect();
+          out.push({ ae: n.getAttribute('aria-expanded'), connected: n.isConnected, y: Math.round(r.top), w: Math.round(r.width), anc: ancestors(n).slice(0, 60) });
+        }
+      }
+      return out;
+    }
     // React re-renders replace the DOM node, so the after-state must RE-QUERY:
     // prefer the element now sitting at the row's original center (the row keeps
     // its position through expand/collapse), then fall back to a label match.
@@ -682,13 +710,12 @@
           if (row) return row;
         }
       } catch (e) { /* detached */ }
-      var label = String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+      var label = rowLabel(el);
       var nodes = document.querySelectorAll('[aria-expanded]');
       for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
         if (n === el) return n;
-        if (n.tagName === el.tagName &&
-          String(n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 24) === label) return n;
+        if (n.tagName === el.tagName && rowLabel(n) === label) return n;
       }
       return null;
     }
@@ -699,6 +726,7 @@
       if (!el) return;
       var at = { x: Math.round(ev.clientX), y: Math.round(ev.clientY) };
       var before = describe(el);
+      var label = rowLabel(el);
       var seq = ++audited;
       el.__zwebuiAuditSeq = seq;                       // a later click on the same row supersedes us
       setTimeout(function () {
@@ -712,6 +740,8 @@
           var top = null;
           try { top = document.elementFromPoint(at.x, at.y); } catch (e) { /* ignore */ }
           msg = 'WEDGE? ' + msg + ' topNow=' + (top && top.tagName ? (top.tagName + '.' + String(top.className).split(' ')[0]) : '?') +
+            ' vw=' + window.innerWidth +
+            ' | twins: ' + JSON.stringify(twins(label).slice(0, 4)) +
             ' | recent: ' + (recentInfo.slice(-4).join(' ⏎ ') || 'none');
         }
         auditLog(msg);
