@@ -562,6 +562,13 @@
   var lastInboundAt = 0;
   var PING_EVERY_MS = 10000;
   var STALE_VISIBLE_MS = 45000;
+  // A server from before this change does not answer pings. Without this guard a
+  // page that fetched the new bootstrap against the old backend would keep
+  // declaring the (healthy) socket dead once a minute. After three unanswered
+  // probes with no pong ever seen, the heartbeat turns itself off for the page.
+  var pongSeen = false;
+  var pingsSent = 0;
+  var hbDisabled = false;
   // >= 3.16: the host migrates the database itself and streams
   // zcode:database-startup-state; the page must NOT synthesize "ready" then.
   // The server announces which mode and which startupId to use in its ready line.
@@ -605,7 +612,7 @@
           if (ctrl && ctrl.kind === 'zcode-webui-background') { watchBackground(ctrl); return; }
           if (ctrl && ctrl.kind === 'zcode-webui-background-cleared') { dismissBackground(); return; }
           if (ctrl && ctrl.kind === 'zcode-webui-startup') { postRealStartupState(ctrl.state); return; }
-          if (ctrl && ctrl.kind === 'zcode-webui-pong') { return; }   // liveness only
+          if (ctrl && ctrl.kind === 'zcode-webui-pong') { pongSeen = true; return; }   // liveness only
           if (ctrl && ctrl.kind === 'zcode-webui-gap') {
             // the offline gap overflowed the server's replay buffer: the page was
             // deliberately kept alive instead of reloaded, so say what was lost
@@ -698,9 +705,11 @@
   // not arrive within 3 s the socket is declared dead right away instead of
   // waiting for the 45 s interval.
   function probeNow(strict) {
-    if (mode !== 'ws' || !ws || ws.readyState !== 1) return;
+    if (hbDisabled || mode !== 'ws' || !ws || ws.readyState !== 1) return;
     try { ws.send('{"kind":"zcode-webui-ping"}'); } catch (e) { /* ignore */ }
-    if (!strict) return;
+    pingsSent++;
+    // only enforce the deadline once we know this backend answers probes
+    if (!strict || !(pongSeen || pingsSent > 3)) return;
     var before = lastInboundAt;
     if (probeTimer) clearTimeout(probeTimer);
     probeTimer = setTimeout(function () {
@@ -713,8 +722,14 @@
   // a socket that reported OPEN but has delivered nothing for a long time while
   // the page is visible is dead: closing it drives the normal hot-reconnect path
   setInterval(function () {
+    if (hbDisabled) return;
     if (mode !== 'ws' || !ws || ws.readyState !== 1) return;
     if (isHidden()) return;                       // background tabs throttle timers
+    if (!pongSeen && pingsSent >= 3) {
+      hbDisabled = true;                          // backend predates the pong: stop probing
+      return;
+    }
+    if (!pongSeen) { probeNow(false); return; }   // still waiting for the first pong
     var idle = Date.now() - lastInboundAt;
     if (idle > STALE_VISIBLE_MS) {
       try { ws.close(); } catch (e) { /* ignore */ }   // onclose → hot reconnect
