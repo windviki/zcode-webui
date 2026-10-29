@@ -229,6 +229,39 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 > smoke、headless 界面启动、守卫自检全部通过；旧版 3.14.3 保留在 `vendor/renderer.bak-3.14.3-*`
 > 与 `~/.zcode/server.bak-3.14.3-*`，可随时回滚。
 
+### ZCode 3.16+（新运行时布局）
+
+3.16 起官方不再发布分平台组件清单，host 被打进桌面安装包（`resources/app.asar/out/host/*.js`），
+所以 `zcode-update.sh` 的组件升级路径走不通。垫片本身两代都支持，按**运行时目录的布局**自动识别：
+
+| 运行时目录里的特征 | 传输方式 |
+|---|---|
+| `zcode-server.cjs`（≤ 3.15） | 子进程 stdio + 13 字节帧（沿用原路径） |
+| `app/out/host/index.js`（≥ 3.16） | `child_process.fork` + `process.parentPort` 控制面 + 转交的 MessagePort 承载协议 payload（`src/port-shim.mjs`） |
+
+从官方整包安装 3.16 到**独立目录**（不动现有运行时）：
+
+```bash
+./scripts/install-316.sh ~/Downloads/ZCode-3.16.3-linux-x64.deb --renderer
+# 运行时落在 ~/.zcode/server-3.16，旧渲染层保留为 vendor/renderer.bak-<版本>-<时间>
+
+# 试跑（只影响这一次服务进程）：
+ZCODE_SERVER_RUNTIME_ROOT=~/.zcode/server-3.16 ./zcode-service.sh restart
+# 回滚：unset 该变量再 restart
+```
+
+确认稳定后再切成默认（保留旧目录随时可切回）：
+
+```bash
+mv ~/.zcode/server ~/.zcode/server-3.15
+ln -s ~/.zcode/server-3.16 ~/.zcode/server
+./zcode-service.sh restart
+```
+
+注意：3.16 首次启动会对 `~/.zcode/v2`（tasks-index 等）执行数据库迁移，并把旧会话镜像进
+`v2/sessions`；**回滚到 3.15 前请确认旧版本能读新 schema**，升级前先备份 `~/.zcode`。
+`/api/health` 的 `runtimeKind` 会显示当前实际使用的传输（`legacy` / `host16`）。
+
 ### 仓库内一键更新（git 部署 / 本机）
 
 ```bash
