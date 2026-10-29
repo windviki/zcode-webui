@@ -24,6 +24,16 @@
 // connection speaks raw protocol payloads on a port (the 13-byte frame header
 // belongs to stream transports only, see frame.mjs).
 import { EventEmitter } from 'node:events';
+import { appendFileSync } from 'node:fs';
+
+// Diagnostic trace (ZCODE_WEBUI_SHIM_TRACE=<path>): every control/port message
+// between the host and this agent, with a monotonic timestamp. Used to locate
+// stalls that show no logs on either side (eg. a 30 s admission wait).
+const TRACE = process.env.ZCODE_WEBUI_SHIM_TRACE || '';
+const tr = (dir, what, len) => {
+  if (!TRACE) return;
+  try { appendFileSync(TRACE, `${Date.now()} ${dir} ${what} ${len}\n`); } catch (_e) { /* ignore */ }
+};
 
 const ports = new Map();
 
@@ -37,6 +47,7 @@ class RelayPort extends EventEmitter {
 
   postMessage(data) {
     if (this._closed) return;
+    tr('out', 'port' + this.id, (data && data.length) || (data && data.byteLength) || 0);
     try { process.send({ __z: 'port', id: this.id, d: data }); } catch (_e) { /* channel gone */ }
   }
 
@@ -59,6 +70,7 @@ class RelayPort extends EventEmitter {
 
   _deliver(data) {
     if (this._closed) return;
+    tr('in', 'port' + this.id, (data && data.length) || (data && data.byteLength) || 0);
     this.emit('message', { data });
   }
 }
@@ -69,6 +81,7 @@ class ParentPort extends EventEmitter {
     if (Array.isArray(transfer)) {
       for (const p of transfer) if (p instanceof RelayPort) ids.push(p.id);
     }
+    tr('out', 'parentPort', ids.length);
     try { process.send({ __z: 'pp', msg, ports: ids }); } catch (_e) { /* channel gone */ }
   }
 
@@ -92,6 +105,7 @@ process.on('message', (raw) => {
         incoming.push(port);
       }
     }
+    tr('in', 'parentPort', incoming.length);
     parentPort.emit('message', { data: raw.msg, ports: incoming });
     return;
   }
