@@ -71,6 +71,9 @@ PINNED_VERSION="3.15.3"
 # shim 能驱动的最高官方版本（与 src/upgrade.mjs 的 SHIM_MAX_SUPPORTED 保持一致）。
 # 超过它的版本默认不升，只提示（显式 -v 可绕过，装完照样校验界面、起不来自动回滚）。
 # 3.15.3 已在本机通过完整升级校验（渲染层 + 运行时 + smoke + headless 界面启动 + 守卫自检）。
+# 2026-10-29：3.16.x 无法用本脚本升级 —— 官方不再发布分平台组件清单（3.16.0~3.16.3 的
+# manifest-linux-x64.json 全部 404，只剩 electron-updater 的 latest.yml + 整包安装器），
+# 因为 3.16 把 host 打进桌面端（resources/app.asar/out/host/*.js，无独立 zcode-server.cjs）。
 SHIM_MAX_SUPPORTED="3.15.3"
 
 DATA_HOME="${ZCODE_WEBUI_HOME:-$SCRIPT_DIR}"

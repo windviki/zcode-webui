@@ -48,6 +48,15 @@ export const DEFAULT_VERSION = '3.15.3';
 // smoke, headless UI boot, guard self-check). cmdUpgrade refuses to cross this line
 // unless --force is given; ./zcode-update.sh instead verifies the UI after installing
 // and rolls back on failure.
+//
+// 2026-10-29: 3.16.x CANNOT be installed by this upgrade path — the official release
+// stopped publishing per-platform component manifests (manifest-linux-x64.json is 404
+// for 3.16.0/1/2/3; only electron-updater feeds `latest.yml` + full installers exist)
+// because the desktop app now BUNDLES the host: the 3.16.3 .deb carries
+// resources/app.asar/out/host/*.js instead of a standalone zcode-server.cjs, plus
+// resources/glm + resources/tools. Porting to 3.16 therefore means spawning
+// `node out/host/index.js` from a new layout AND migrating the live ~/.zcode data DB
+// (3.16 upgrades it) — a migration project, not an upgrade flag.
 // NOTE for >= 3.12: model availability is resolved server-side against the account
 // entitlement, so an account without an active plan shows "当前没有可用模型" even though
 // everything else works (configure a provider/API key via 管理模型 in that case).
