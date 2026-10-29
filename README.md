@@ -136,6 +136,19 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 **C · 服务器上本来就登录过官方 CLI / 桌面端**
 `~/.zcode` 已就绪，直接使用。
 
+## 3.16 运行时的三个补丁（装机后需重打）
+
+3.16 的 host/agent 都是整包发布物，以下三处是我们对官方运行时的**有界化补丁**
+（每个脚本幂等、写前备份、可 `--revert`，默认目标 `$ZCODE_HOME/server`）：
+
+| 脚本 | 修什么 | 实测效果 |
+|---|---|---|
+| `scripts/patch-316-browser-ctx.mjs` | `sendConversationCommandV4`/`sendPrompt` 在发消息前 `await XA(browserControlExecutor, …)` 抓"浏览器环境上下文"；没有 in-app browser 时后端调用会挂满 ~30 s（两边零日志） | **首次消息 30.0 s → 3.6 s**（回车→开始推理） |
+| `scripts/patch-316-refresh.mjs` | 每条 sendText 前 `await providerRefreshRegistry` 的 30 s 超时 | 已有会话的消息 30 s → 毫秒级 |
+| `scripts/patch-316-balance-cache.mjs` | `billing/balance` 去重窗口只有 1 s，一次发送串行 4 次 ×10 s | 重复查询 10 s → 0 ms |
+
+重新安装 3.16 运行时（`scripts/install-316.sh`）后，三个脚本都要重跑一遍。
+
 ## 页面断线恢复
 
 - **应用层心跳**：页面每 10s 发一次 `{"kind":"zcode-webui-ping"}`，服务端回 `pong`。浏览器
