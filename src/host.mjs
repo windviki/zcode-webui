@@ -272,6 +272,7 @@ export function handshake(child) {
 //     apps/zcode-cli/packages/cli/dist/zcode.cjs, so the install layout provides
 //     that path (see installHost16) and the host runs with cwd = runtime root.
 const HOST16_PORT_ID = 'renderer-1';
+const HOST_VERBOSE = process.env.ZCODE_WEBUI_HOST_VERBOSE === '1';
 const PORT_SHIM = path.join(path.dirname(fileURLToPath(import.meta.url)), 'port-shim.mjs');
 
 function createHost16LogSink(log) {
@@ -379,8 +380,12 @@ export function createHost16({
         return;
       }
       if (msg.type === 'log') {
-        // structured host logs: errors/warnings only, the info stream is huge
-        if (msg.level && msg.level !== 'info') sink('log', '[' + msg.level + '] ' + String(msg.message || ''));
+        // structured host logs: errors/warnings only, the info stream is huge —
+        // unless ZCODE_WEBUI_HOST_VERBOSE=1 (used to trace a slow command: the
+        // host's own info lines show what it waits on between two RPCs)
+        if (msg.level && (msg.level !== 'info' || HOST_VERBOSE)) {
+          sink('log', '[' + msg.level + '] ' + String(msg.message || ''));
+        }
         return;
       }
       if (pipe.onControl) { try { pipe.onControl(msg); } catch (_e) { /* ignore */ } }
