@@ -693,9 +693,22 @@
       connect();
     }, delay);
   }
-  function probeNow() {
+  var probeTimer = 0;
+  // strict: used when the page comes back to the foreground — if the pong does
+  // not arrive within 3 s the socket is declared dead right away instead of
+  // waiting for the 45 s interval.
+  function probeNow(strict) {
     if (mode !== 'ws' || !ws || ws.readyState !== 1) return;
     try { ws.send('{"kind":"zcode-webui-ping"}'); } catch (e) { /* ignore */ }
+    if (!strict) return;
+    var before = lastInboundAt;
+    if (probeTimer) clearTimeout(probeTimer);
+    probeTimer = setTimeout(function () {
+      probeTimer = 0;
+      if (lastInboundAt === before && ws && ws.readyState === 1) {
+        try { ws.close(); } catch (e) { /* ignore */ }   // -> hot reconnect
+      }
+    }, 3000);
   }
   // a socket that reported OPEN but has delivered nothing for a long time while
   // the page is visible is dead: closing it drives the normal hot-reconnect path
@@ -712,13 +725,13 @@
   window.addEventListener('focus', function () {
     if (mode !== 'ws') return;
     if (!ws || ws.readyState > 1) { hotAttempts = 0; connect(); return; }
-    probeNow();
+    probeNow(true);
   });
   window.addEventListener('online', function () {
     if (mode !== 'ws') return;
     hotAttempts = 0; reloadAttempts = 0; wsOpenFails = 0;
     if (!ws || ws.readyState > 1) connect();
-    else probeNow();
+    else probeNow(true);
   });
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible') return;
@@ -728,7 +741,7 @@
     wsOpenFails = 0;
     if (pendingHostReboot) { pendingHostReboot = false; flash('正在恢复会话…'); window.location.reload(); return; }
     if (mode === 'ws') {
-      if (!ws || ws.readyState > 1) connect(); else probeNow();
+      if (!ws || ws.readyState > 1) connect(); else probeNow(true);
     } else if (mode === 'http' && !httpSessionId) {
       // parked in http mode with a dead relay (bridge/open failed while the tab
       // was hidden): prefer the ws hot-resume path now that we are visible
