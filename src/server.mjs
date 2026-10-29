@@ -1556,12 +1556,20 @@ if (DETACHED_TTL_MS > 0) {
 }
 
 // HTTP fallback relays are NOT protected by the sessions reaper above; without
-// this every abandoned long-poll page would keep a full zcode-server host alive
-// forever. Close relays whose client has not polled/sent recently — but only
-// after the same global busy-guard, because a relay can be actively running a
-// turn while its page is backgrounded and not polling. A close requested by
-// pagehide gets a shorter idle grace (DEFERRED_RELAY_CLOSE_IDLE_MS) once the
-// host is idle, instead of killing an in-flight turn on reload.
+// this every abandoned long-poll page would keep a full host alive forever.
+// Close relays whose client has not polled/sent recently, but skip the ones that
+// are demonstrably mid-stream (their own frames arrived within ACTIVE_FRAME_MS).
+//
+// This used to consult the GLOBAL busy-guard instead ("a turn is still running
+// somewhere"), which was safe with the 80 MB <= 3.15 hosts but leaks badly with
+// the >= 3.16 ones (inline host bundle + per-workspace agent, ~500 MB per relay):
+// while the user works continuously in one tab, every abandoned relay host
+// survives forever — three such hosts (1.4 GB) were found alive 1-2 h after
+// their pages were gone. A per-relay check keeps the original protection (never
+// kill a relay that is streaming) without holding every other relay hostage.
+// A close requested by pagehide gets a shorter idle grace
+// (DEFERRED_RELAY_CLOSE_IDLE_MS) once that relay's host is quiet, instead of
+// killing an in-flight turn on reload.
 if (HTTP_RELAY_TTL_MS > 0) {
   setInterval(async () => {
     const now = Date.now();
@@ -1574,15 +1582,15 @@ if (HTTP_RELAY_TTL_MS > 0) {
       if (age > HTTP_RELAY_TTL_MS || deferred) idle.push([id, entry, age, deferred]);
     }
     if (idle.length === 0) return;
-    if (await agentWorkActive()) return;   // a turn is still running somewhere
     for (const [id, entry, age, deferred] of idle) {
       if (!httpRelays.has(id) || entry.pipe.closed) continue;
-      // re-check after the await: host frames may have arrived meanwhile
       const ageNow = Date.now() - entry.lastSeen;
       if (!deferred && ageNow <= HTTP_RELAY_TTL_MS) continue;
       // A deferred pagehide close waits for the turn to settle, not for a
       // permanently silent poller: idle event frames must not keep it alive.
       if (deferred && Date.now() - entry.closeRequestedAt <= DEFERRED_RELAY_CLOSE_IDLE_MS) continue;
+      // this relay's OWN host is streaming: it is running a turn, keep it
+      if (entry.lastFrameAt && Date.now() - entry.lastFrameAt <= ACTIVE_FRAME_MS) continue;
       console.error('[bridge] reaping idle http relay id=' + id +
         ' (idle ' + Math.round(ageNow / 1000) + 's' + (deferred ? ', deferred pagehide close' : '') + ')');
       try { entry.pipe.close(); } catch (_e) { /* ignore */ }
