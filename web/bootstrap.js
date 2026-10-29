@@ -281,6 +281,47 @@
     setTimeout(send, 500);
   }
 
+  // >= 3.16: forward the host's real startup states (migration progress), with
+  // the same duplicate-race treatment as the synthesized one.
+  function postRealStartupState(state) {
+    if (!state || typeof state !== 'object') return;
+    var msg = { type: 'zcode:database-startup-state', state: state };
+    var send = function () { try { window.postMessage(msg, '*'); } catch (e) { /* ignore */ } };
+    var prev = lastStartupStateMsg && lastStartupStateMsg.state;
+    // same startupId + sequence never goes backwards (renderer ignores replays)
+    if (prev && prev.startupId === state.startupId && typeof prev.sequence === 'number' &&
+        typeof state.sequence === 'number' && state.sequence < prev.sequence) return;
+    lastStartupStateMsg = msg;
+    send();
+    setTimeout(send, 300);
+  }
+
+  // HTTP fallback has no control line: poll the relay's startup state until the
+  // host reports ready (a migration can take minutes; the renderer shows it).
+  var startupPollTimer = 0;
+  function pollStartupState() {
+    if (startupPollTimer || !httpSessionId) return;
+    var tick = function () {
+      startupPollTimer = 0;
+      if (mode !== 'http' || !httpSessionId) return;
+      fetch('bridge/state?id=' + encodeURIComponent(httpSessionId))
+        .then(function (r) { return r.json(); })
+        .then(function (o) {
+          if (o && o.state) postRealStartupState(o.state);
+          var ready = o && o.state && o.state.phase === 'ready';
+          if (!ready) startupPollTimer = setTimeout(tick, 1000);
+        })
+        .catch(function () { startupPollTimer = setTimeout(tick, 2000); });
+    };
+    startupPollTimer = setTimeout(tick, 700);
+  }
+
+  function requestStartupSnapshot() {
+    try {
+      if (mode === 'ws' && ws && ws.readyState === 1) ws.send('{"kind":"zcode-webui-startup-snapshot"}');
+    } catch (e) { /* ignore */ }
+  }
+
   // The renderer can also ASK for a state replay: at module end it posts
   // {type:'zcode:database-startup-control', control:{action:'snapshot'}} (the
   // desktop preload forwards that to the main process, whose relay re-sends the
@@ -292,8 +333,11 @@
   window.addEventListener('message', function (ev) {
     if (ev.source !== window || !ev.data || ev.data.type !== 'zcode:database-startup-control') return;
     var c = ev.data.control || {};
-    if (c.action === 'snapshot' && lastStartupStateMsg) {
-      try { window.postMessage(lastStartupStateMsg, '*'); } catch (e) { /* ignore */ }
+    if (c.action === 'snapshot') {
+      if (serverStartup.mode === 'runtime') { requestStartupSnapshot(); return; }
+      if (lastStartupStateMsg) {
+        try { window.postMessage(lastStartupStateMsg, '*'); } catch (e) { /* ignore */ }
+      }
     }
   });
 
@@ -323,9 +367,13 @@
         }
         portQueue = [];
         if (rendererAtLeast(3, 12)) {
-          var startupId = 'zcode-webui-' + ((cfg && cfg.deviceId) || 'local') + '-' + Date.now().toString(36);
+          var startupId = serverStartup.startupId || ('zcode-webui-' + ((cfg && cfg.deviceId) || 'local') + '-' + Date.now().toString(36));
           window.postMessage({ type: 'zcode:service-port', databaseStartupId: startupId }, '*', [channel.port1]);
-          postDatabaseStartupState(startupId);
+          // >= 3.16 hosts own the database and stream real states; only the
+          // legacy host (which is up by the time the handshake returns) gets the
+          // synthesized ready state.
+          if (serverStartup.mode !== 'runtime') postDatabaseStartupState(startupId);
+          else requestStartupSnapshot();
         } else {
           window.postMessage('zcode:service-port', '*', [channel.port1]);
         }
@@ -439,10 +487,14 @@
       .then(function (o) {
         if (!o.ok) throw new Error(o.error || 'open failed');
         httpSessionId = o.id;
+        if (o.startupMode === 'runtime' && o.startupId) {
+          serverStartup = { mode: 'runtime', startupId: String(o.startupId) };
+        }
         httpRetryDelay = 2000;
         reloadAttempts = 0;
         wsOpenFails = 0;
         deliverPort();
+        if (serverStartup.mode === 'runtime') pollStartupState();
         pollLoop();
         flushUplink();
       })
@@ -501,6 +553,10 @@
   }
   var wsVerified = false;
   var WS_READY = '{"kind":"zcode-webui-ready"}';
+  // >= 3.16: the host migrates the database itself and streams
+  // zcode:database-startup-state; the page must NOT synthesize "ready" then.
+  // The server announces which mode and which startupId to use in its ready line.
+  var serverStartup = { mode: 'synthetic', startupId: '' };
 
   function connect() {
     wsVerified = false;                          // re-arm per connection (hot reconnects)
@@ -513,7 +569,15 @@
       // server (e.g. code-server's own /ws when the URL lacked a trailing slash)
       // would send its own frames here — reject it and fall back to http polling.
       if (!wsVerified) {
-        if (typeof ev.data === 'string' && ev.data === WS_READY) {
+        var ready = null;
+        if (typeof ev.data === 'string') {
+          if (ev.data === WS_READY) ready = { kind: 'zcode-webui-ready' };
+          else { try { ready = JSON.parse(ev.data); } catch (e) { ready = null; } }
+        }
+        if (ready && ready.kind === 'zcode-webui-ready') {
+          if (ready.startupMode === 'runtime' && ready.startupId) {
+            serverStartup = { mode: 'runtime', startupId: String(ready.startupId) };
+          }
           wsVerified = true;
           deliverPort();
           flushUplink();                         // frames the renderer sent while offline
@@ -530,6 +594,7 @@
           var ctrl = JSON.parse(ev.data);
           if (ctrl && ctrl.kind === 'zcode-webui-background') { watchBackground(ctrl); return; }
           if (ctrl && ctrl.kind === 'zcode-webui-background-cleared') { dismissBackground(); return; }
+          if (ctrl && ctrl.kind === 'zcode-webui-startup') { postRealStartupState(ctrl.state); return; }
         } catch (e) { /* not a control message */ }
         console.debug('[zcode-webui]', ev.data);
         return;

@@ -14,11 +14,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
-import { encodeFrame, FrameParser } from './frame.mjs';
 import { rpcLogLine, decodeRpcHeader, rewriteRpcId, encodeRpcHeader } from './rpclog.mjs';
 import { interceptPinRpc, pinAckFor, errorAckFor } from './pin.mjs';
 import { buildSetModeCall, normalizeBoostMode, scanCommandSessionId, scanTopicSessionId, INJECTED_ID_BASE } from './mode-boost.mjs';
-import { spawnHost, handshake, resolveServerRoot, ensureCliProviderConfig } from './host.mjs';
+import { createHostPipe, detectRuntimeLayout, resolveServerRoot, ensureCliProviderConfig } from './host.mjs';
 import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
@@ -655,6 +654,7 @@ function readRendererIndex() {
     workspace: WORKSPACE,
     deviceId,
     serverRoot: serverRoot || null,
+    runtimeKind: (() => { try { return detectRuntimeLayout(serverRoot).kind; } catch (_e) { return null; } })(),
     // The deployed official renderer version. web/bootstrap.js needs it to pick the
     // right service-port handshake: >= 3.12 switches to an object message plus the
     // 'zcode:database-startup-state' startup channel, 3.11 and older take the bare
@@ -990,51 +990,69 @@ function hostExtraEnv() {
     ? { ZCODE_HTTP_PROXY: HOST_PROXY, ZCODE_NO_PROXY: 'localhost,127.0.0.1' }
     : {};
 }
-async function openHostPipe() {
+function newStartupId() {
+  return 'zcode-webui-' + randomUUID();
+}
+
+// Spawn one host (either generation) and wrap it in the pipe interface the rest
+// of this file speaks: push(payload) / onFrame / onExit / close. The transport
+// underneath is chosen by the installed runtime layout — see createHostPipe().
+async function spawnPipe() {
   await ensureWorkspaceDirs();
-  const extraEnv = hostExtraEnv();
-  const host = spawnHost({ serverRoot, log: (l) => console.error(l), extraEnv });
-  const { child } = host;
-  return handshake(child).then(({ hello, rest }) => {
-    const state = {
-      child, hello, closed: false, framesIn: 0, framesOut: 0,
-      onFrame: null, onExit: null,
-    };
-    const rpcDebug = process.env.ZCODE_WEBUI_DEBUG_RPC === '1';
-    const parser = new FrameParser((payload) => {
-      state.framesOut++;
-      if (rpcDebug) { const l = rpcLogLine('RPC-out', payload); if (l) console.error('[rpc] ' + l); }
-      if (state.onFrame && !state.closed) {
-        try { state.onFrame(Buffer.from(payload)); } catch (_e) { /* ignore */ }
-      }
-    });
-    parser.push(rest);
-    child.stdout.on('data', (d) => parser.push(d));
-    child.on('exit', (code, signal) => {
-      state.closed = true;
-      if (state.onExit) { try { state.onExit(code, signal); } catch (_e) { /* ignore */ } }
-    });
-    state.push = (payload) => {
-      if (state.closed) return false;
-      state.framesIn++;
-      // protect the host: only forward payloads that look like serialized channel
-      // messages (first byte is an RPC preset 0..6); drop flow-control JSON etc.
-      if (!payload || payload.length === 0 || payload[0] > 6) {
-        console.error('[bridge] dropped non-protocol inbound payload ' + payload.length + 'B first=' + (payload[0] ?? 'nil'));
-        return true;
-      }
-      if (rpcDebug) { const l = rpcLogLine('RPC-in ', payload); if (l) console.error('[rpc] ' + l); }
-      try { child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
-    };
-    state.close = () => {
-      state.closed = true;
-      if (child.exitCode === null) {
-        child.kill('SIGTERM');
-        setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
-      }
-    };
-    return state;
+  const startupId = newStartupId();
+  const transport = await createHostPipe({
+    serverRoot,
+    log: (l) => console.error(l),
+    extraEnv: hostExtraEnv(),
+    startupId,
+    deviceId,
+    locale: LOCALE,
+    workspace: WORKSPACE,
   });
+  const rpcDebug = process.env.ZCODE_WEBUI_DEBUG_RPC === '1';
+  const state = {
+    kind: transport.kind,
+    child: transport.child,
+    hello: transport.hello,
+    startupId: transport.startupId,
+    lastStartupState: null,
+    closed: false, framesIn: 0, framesOut: 0,
+    onFrame: null, onExit: null, onStartupState: null,
+    transport,
+  };
+  transport.onFrame = (payload) => {
+    state.framesOut++;
+    if (rpcDebug) { const l = rpcLogLine('RPC-out', payload); if (l) console.error('[rpc] ' + l); }
+    if (state.onFrame && !state.closed) {
+      try { state.onFrame(Buffer.from(payload)); } catch (_e) { /* ignore */ }
+    }
+  };
+  transport.onStartupState = (st) => {
+    state.lastStartupState = st;
+    if (state.onStartupState) { try { state.onStartupState(st); } catch (_e) { /* ignore */ } }
+  };
+  transport.onExit = (code, signal) => {
+    state.closed = true;
+    if (state.onExit) { try { state.onExit(code, signal); } catch (_e) { /* ignore */ } }
+  };
+  state.push = (payload) => {
+    if (state.closed) return false;
+    // protect the host: only forward payloads that look like serialized channel
+    // messages (first byte is an RPC preset 0..6); drop flow-control JSON etc.
+    if (!payload || payload.length === 0 || payload[0] > 6) {
+      console.error('[bridge] dropped non-protocol inbound payload ' + (payload ? payload.length : 0) + 'B first=' + (payload && payload[0] !== undefined ? payload[0] : 'nil'));
+      return true;
+    }
+    if (rpcDebug) { const l = rpcLogLine('RPC-in ', payload); if (l) console.error('[rpc] ' + l); }
+    state.framesIn++;
+    return transport.push(payload);
+  };
+  state.close = () => { state.closed = true; transport.close(); };
+  return state;
+}
+
+async function openHostPipe() {
+  return spawnPipe();
 }
 
 // ---------- host sessions (multi-device live view) ----------
@@ -1197,7 +1215,7 @@ function writeToHost(session, view, payload) {
       payload = rewritten;
     }
   }
-  try { session.child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
+  try { return session.pipe.push(payload); } catch (_e) { return false; }
 }
 
 function removeSession(session) {
@@ -1214,7 +1232,7 @@ function injectModeBoost(session, taskId, mode) {
   const gid = INJECTED_ID_BASE + (++session.injectedNext);
   session.mux.pending.set(gid, { view: null, origId: gid, at: Date.now(), injected: true });
   try {
-    session.child.stdin.write(encodeFrame(buildSetModeCall(gid, taskId, mode)));
+    session.pipe.push(buildSetModeCall(gid, taskId, mode));
   } catch (_e) {
     session.mux.pending.delete(gid);
     return null;
@@ -1372,7 +1390,7 @@ function disposeViewEvents(session, view) {
     // EventDispose frame = header [103, gid] + undefined body (preset 0 byte),
     // exactly what the renderer's sendCancelOrDispose emits
     const frame = Buffer.concat([encodeRpcHeader([103, gid]), Buffer.from([0])]);
-    try { session.child.stdin.write(encodeFrame(frame)); } catch (_e) { /* host gone */ }
+    try { session.pipe.push(frame); } catch (_e) { /* host gone */ }
   }
 }
 
@@ -1389,17 +1407,45 @@ function releaseHold(view) {
   }
 }
 
+// ---- >= 3.16 startup channel -------------------------------------------------
+// The desktop's main process reports real database migration progress to the
+// renderer ('zcode:database-startup-state'). A 3.15-and-earlier host has no such
+// channel (it owns the database and is up when the handshake returns), so the
+// page keeps synthesizing "ready" there; for 3.16 we forward the host's states.
+function startupLine(state) {
+  return JSON.stringify({ kind: 'zcode-webui-startup', state });
+}
+
+function readyLine(session) {
+  if (session && session.pipe && session.pipe.kind === 'host16' && session.pipe.startupId) {
+    return JSON.stringify({ kind: 'zcode-webui-ready', startupMode: 'runtime', startupId: session.pipe.startupId });
+  }
+  return WS_READY;
+}
+
+function broadcastStartupState(session, state) {
+  if (!state) return;
+  const line = startupLine(state);
+  for (const [, v] of session.views) {
+    const ws = v.ws;
+    if (ws && ws.readyState === 1) { try { ws.send(line); } catch (_e) { /* ignore */ } }
+  }
+}
+
 async function createSession(userKey, tabId) {
   await ensureWorkspaceDirs();
-  let child;
+  let pipe;
   try {
-    const host = spawnHost({ serverRoot, log: (l) => console.error(l), extraEnv: hostExtraEnv() });
-    child = host.child;
+    pipe = await spawnPipe();
   } catch (err) {
     throw new Error('failed to spawn host: ' + err.message);
   }
+  const child = pipe.child;
   const session = {
-    userKey, primaryTab: tabId, child, hello: null,
+    userKey, primaryTab: tabId, child, pipe,
+    hello: pipe.hello,
+    startupId: pipe.startupId,
+    lastStartupState: pipe.lastStartupState,
     views: new Map(),                       // tabId -> view (currently connected)
     eraByTab: new Map(),                    // tabId -> last view object, even after its ws closed (resume/rebind needs it)
     detachedAt: 0, lastFrameAt: 0,
@@ -1412,7 +1458,9 @@ async function createSession(userKey, tabId) {
     lastTopicSession: '',                   // mode-boost: sessionId from the latest conversation topic frame
     injectedNext: 0,                        // mode-boost: counter for server-injected host calls
   };
-  console.error('[zcode-webui] host spawned pid=' + child.pid + ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
+  console.error('[zcode-webui] host spawned pid=' + child.pid + ' layout=' + pipe.kind +
+    (pipe.kind === 'host16' ? ' version=' + (pipe.hello.version || '?') : '') +
+    ' user=' + shortUserKey(userKey) + '/' + (tabId || '').slice(0, 8));
   sessions.set(userKey, session);
 
   // stdout must be drained forever — even with no view attached — so the pipe
@@ -1420,7 +1468,7 @@ async function createSession(userKey, tabId) {
   // frameTimes keeps a bounded timestamp ring of outbound frames so /api/active
   // can tell "a turn is streaming" (dozens of frames per minute) apart from the
   // trickle an idle open page produces.
-  const parser = new FrameParser((payload) => {
+  pipe.onFrame = (payload) => {
     session.framesOut++;
     session.lastFrameAt = Date.now();
     (session.frameTimes || (session.frameTimes = [])).push(session.lastFrameAt);
@@ -1440,9 +1488,8 @@ async function createSession(userKey, tabId) {
       for (const e of session.pendingInbound.splice(0)) writeToHost(session, e.view, e.payload);
     }
     routeDownstream(session, payload);
-  });
-  session.parser = parser;
-  child.on('exit', (code, signal) => {
+  };
+  pipe.onExit = (code, signal) => {
     session.closed = true;
     for (const [, v] of session.views) {
       try { v.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ }
@@ -1457,26 +1504,29 @@ async function createSession(userKey, tabId) {
     } else {
       console.error('[zcode-webui] stale host exit ignored pid=' + child.pid + ' (session already replaced)');
     }
-  });
+  };
 
-  handshake(child)
-    .then(({ hello, rest }) => {
-      if (session.closed) return;
-      session.hello = hello;
-      console.error('[zcode-webui] handshake ok pid=' + child.pid + ' host=' + hello.version);
-      // 3.12+ agent CLI needs the builtin provider catalog next to it; the host has just
-      // materialized its own copy, so hand it over before the first agent spawn
-      // (otherwise `zcode.cjs app-server` dies with "无法定位 CLI ZCode Built-in Provider Config")
-      ensureCliProviderConfig(serverRoot, { log: (l) => console.error(l) });
-      // attach the stdout drain only after the handshake consumed the hello line —
-      // otherwise the hello JSON would contaminate the frame parser's buffer
-      parser.push(rest);
-      child.stdout.on('data', (d) => parser.push(d));
-    })
-    .catch((err) => {
-      console.error('[zcode-webui] handshake failed pid=' + child.pid + ': ' + err.message);
-      terminateSession(session, 'handshake failed');
-    });
+  if (pipe.kind === 'host16') {
+    // the 3.16 host reports real migration progress; forward every state to the
+    // attached views instead of the synthesized "ready" the legacy path uses
+    pipe.onStartupState = (st) => {
+      session.lastStartupState = st;
+      broadcastStartupState(session, st);
+      if (st && st.phase === 'ready') {
+        console.error('[zcode-webui] host16 database ready pid=' + child.pid + ' startup=' + (st.startupId || '?'));
+      } else if (st && st.phase === 'failed') {
+        console.error('[zcode-webui] host16 database startup FAILED pid=' + child.pid +
+          ' phase=' + (st.failedPhase || '?') + ' code=' + (st.errorCode || '?'));
+      }
+    };
+    if (pipe.lastStartupState) broadcastStartupState(session, pipe.lastStartupState);
+  } else {
+    console.error('[zcode-webui] handshake ok pid=' + child.pid + ' host=' + (pipe.hello.version || '?'));
+    // 3.12+ agent CLI needs the builtin provider catalog next to it; the host has just
+    // materialized its own copy, so hand it over before the first agent spawn
+    // (otherwise `zcode.cjs app-server` dies with "无法定位 CLI ZCode Built-in Provider Config")
+    ensureCliProviderConfig(serverRoot, { log: (l) => console.error(l) });
+  }
 
   return session;
 }
@@ -1636,7 +1686,9 @@ function handleRequest(req, res) {
       ok: true, name: 'zcode-webui', version: pkgVersion, base,
       dataHome: PATHS.dataHome,
       rendererLoaded: existsSync(path.join(RENDERER_DIR, 'index.html')),
-      serverRoot: serverRoot || null, workspace: WORKSPACE,
+      serverRoot: serverRoot || null,
+      runtimeKind: (() => { try { return detectRuntimeLayout(serverRoot).kind; } catch (_e) { return null; } })(),
+      workspace: WORKSPACE,
       login: loginState(),
       hostVersion: withHello ? (withHello.hello.version || null) : null,
       nodeVersion: process.version,
@@ -1701,6 +1753,7 @@ function handleRequest(req, res) {
           if (entry.queue.length > 256) entry.queue.shift();
         }
       };
+      pipe.onStartupState = (state) => { entry.startupState = state; };
       pipe.onExit = () => {
         if (entry.waiter) {
           const w = entry.waiter;
@@ -1737,10 +1790,25 @@ function handleRequest(req, res) {
       }
       httpRelays.set(id, entry);
       console.error('[bridge] http session opened id=' + id + ' host=' + pipe.hello.version);
-      sendJson(res, 200, { ok: true, id, hostVersion: pipe.hello.version });
+      sendJson(res, 200, {
+        ok: true, id, hostVersion: pipe.hello.version,
+        startupMode: pipe.kind === 'host16' ? 'runtime' : 'synthetic',
+        startupId: pipe.kind === 'host16' ? pipe.startupId : null,
+      });
     }).catch((err) => {
       console.error('[bridge] open failed: ' + err.message);
       sendJson(res, 500, { ok: false, error: err.message });
+    });
+  }
+  if (urlPath === '/bridge/state' && req.method === 'GET') {
+    const id = new URL(req.url, 'http://x').searchParams.get('id');
+    const entry = httpRelays.get(id);
+    if (!entry) return sendJson(res, 404, { ok: false, error: 'session gone' });
+    return sendJson(res, 200, {
+      ok: true,
+      startupMode: entry.pipe.kind === 'host16' ? 'runtime' : 'synthetic',
+      startupId: entry.pipe.kind === 'host16' ? entry.pipe.startupId : null,
+      state: entry.startupState || null,
     });
   }
   if (urlPath === '/bridge/send' && req.method === 'POST') {
@@ -2369,7 +2437,22 @@ wss.on('connection', (ws, req, session, meta) => {
   ws.on('message', (data, isBinary) => {
     if (session.closed) return;
     if (!isBinary) {
-      if (String(data) === '{"kind":"zcode-webui-port-ready"}') releaseHold(view);
+      const ctrl = String(data);
+      if (ctrl === '{"kind":"zcode-webui-port-ready"}') {
+        releaseHold(view);
+        // replay the latest database state to a freshly wired renderer (a page
+        // that reloads mid-migration must still see where startup stands)
+        if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
+          try { ws.send(startupLine(session.lastStartupState)); } catch (_e) { /* ignore */ }
+        }
+        return;
+      }
+      if (ctrl === '{"kind":"zcode-webui-startup-snapshot"}') {
+        if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
+          try { ws.send(startupLine(session.lastStartupState)); } catch (_e) { /* ignore */ }
+        }
+        return;
+      }
       return;
     }
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
@@ -2402,7 +2485,14 @@ wss.on('connection', (ws, req, session, meta) => {
   view.missed = 0;
   view.parkedAt = 0;
 
-  try { ws.send(WS_READY); } catch (_e) { /* ignore */ }
+  try {
+    ws.send(readyLine(session));
+    // host16: the page cannot synthesize "ready" (the host is still migrating),
+    // so hand it the current state right behind the ready line
+    if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
+      ws.send(startupLine(session.lastStartupState));
+    }
+  } catch (_e) { /* ignore */ }
   const announce = (line) => {
     try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
   };

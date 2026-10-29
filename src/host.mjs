@@ -3,13 +3,14 @@
 // {"type":"zcode-hello-ack",...} on stdin, then the stdio pipe carries ZCode Protocol
 // channel frames (see frame.mjs).
 
-import { spawn } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_VERSION } from './upgrade.mjs';
+import { encodeFrame, FrameParser } from './frame.mjs';
 import { resolveDataHome } from './dirs.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -59,10 +60,39 @@ export function resolveServerRoot(override) {
     ? path.join(process.env.ZCODE_HOME, 'server')
     : path.join(os.homedir(), '.zcode', 'server');
   const root = (override || process.env.ZCODE_SERVER_RUNTIME_ROOT || fallback).trim();
-  if (!existsSync(path.join(root, 'zcode-server.cjs'))) {
-    throw new Error('zcode-server.cjs not found under ' + root + ' (run zcode-webui setup to install it, or set ZCODE_SERVER_RUNTIME_ROOT)');
+  const legacy = existsSync(path.join(root, 'zcode-server.cjs'));
+  const host16 = existsSync(path.join(root, 'app', 'out', 'host', 'index.js'));
+  if (!legacy && !host16) {
+    throw new Error('no zcode host runtime found under ' + root +
+      ' (expected zcode-server.cjs for <= 3.15 or app/out/host/index.js for >= 3.16;' +
+      ' run zcode-webui setup, or set ZCODE_SERVER_RUNTIME_ROOT)');
   }
   return root;
+}
+
+// Which host generation lives in this runtime directory. The two generations
+// speak different transports, so the LAYOUT — not a version string — decides:
+//   <= 3.15  standalone zcode-server.cjs, driven over 13-byte stdio frames
+//   >= 3.16  the desktop's own host bundle (app/out/host/index.js), which expects
+//            an Electron-style parentPort plus a transferred MessagePort
+export function detectRuntimeLayout(serverRoot) {
+  const root = resolveServerRoot(serverRoot);
+  const host16Entry = path.join(root, 'app', 'out', 'host', 'index.js');
+  if (existsSync(host16Entry)) {
+    return { kind: 'host16', root, entry: host16Entry, version: readBuildMetaVersion(root) };
+  }
+  return { kind: 'legacy', root, entry: path.join(root, 'zcode-server.cjs'), version: '' };
+}
+
+// app/out/metadata/build-meta.json is the only version stamp a 3.16 install
+// carries (there is no `zcode-server.cjs --version` to ask any more).
+export function readBuildMetaVersion(serverRoot) {
+  try {
+    const meta = JSON.parse(readFileSync(path.join(serverRoot, 'app', 'out', 'metadata', 'build-meta.json'), 'utf8'));
+    return String(meta.appVersion || '');
+  } catch (_e) {
+    return '';
+  }
 }
 
 // Environment for the host service. NOTE: we deliberately do NOT set
@@ -223,4 +253,257 @@ export function handshake(child) {
     };
     child.stdout.on('data', onData);
   });
+}
+
+// ---------------------------------------------------------------------------
+// ZCode >= 3.16 host transport
+// ---------------------------------------------------------------------------
+// The 3.16 desktop forked `out/host/index.js` as an Electron utilityProcess and
+// drove it through `process.parentPort` (structured messages) with a MessagePort
+// transferred for the renderer channel. src/port-shim.mjs recreates that contract
+// under plain Node; this module owns the parent end of it.
+//
+// Differences from the <= 3.15 path that matter:
+//   * control traffic (database-startup-state, structured logs, telemetry) is NOT
+//     part of the frame stream any more — it travels as separate objects;
+//   * the renderer channel carries RAW payloads (one message per payload); the
+//     13-byte frame header is only for stream transports;
+//   * the host resolves its agent runtime by walking up from cwd looking for
+//     apps/zcode-cli/packages/cli/dist/zcode.cjs, so the install layout provides
+//     that path (see installHost16) and the host runs with cwd = runtime root.
+const HOST16_PORT_ID = 'renderer-1';
+const PORT_SHIM = path.join(path.dirname(fileURLToPath(import.meta.url)), 'port-shim.mjs');
+
+function createHost16LogSink(log) {
+  // The 3.16 host is chatty on stdout/stderr; keep first occurrences and count
+  // exact repeats inside a minute (same idea as the legacy stderr relay).
+  const seen = new Map();
+  const CLIP = 600;
+  return (channel, text) => {
+    const line = String(text).replace(/\s+$/, '');
+    if (!line) return;
+    const key = channel + '|' + line.slice(0, 160);
+    const now = Date.now();
+    const entry = seen.get(key);
+    if (entry && now < entry.until) { entry.n++; return; }
+    if (entry && entry.n > 0) log('[host16:' + channel + '] … ' + entry.n + ' repeat(s) of: ' + entry.key);
+    seen.set(key, { n: 0, until: now + 60000, key: line.slice(0, 120) });
+    if (seen.size > 200) {
+      for (const k of seen.keys()) { seen.delete(k); if (seen.size <= 100) break; }
+    }
+    log('[host16:' + channel + '] ' + (line.length > CLIP ? line.slice(0, CLIP) + ' …[clipped]' : line));
+  };
+}
+
+export function buildHost16Env(serverRoot, extra = {}) {
+  const env = {
+    ...process.env,
+    ZCODE_SERVER_RUNTIME_ROOT: serverRoot,
+    ZCODE_ENV: 'production',
+    ZCODE_BASE_URL: process.env.ZCODE_BASE_URL || 'https://zcode.z.ai',
+    ZAI_OAUTH_ORIGIN: process.env.ZAI_OAUTH_ORIGIN || 'https://chat.z.ai',
+    ZAI_BUSINESS_BASE_URL: process.env.ZAI_BUSINESS_BASE_URL || 'https://api.z.ai',
+    ZAI_OAUTH_CLIENT_ID: process.env.ZAI_OAUTH_CLIENT_ID || 'client_P8X5CMWmlaRO9gyO-KSqtg',
+    ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED: '0',
+    ZCODE_APP_VERSION: process.env.ZCODE_APP_VERSION || readBuildMetaVersion(serverRoot) || rendererVersion(DEFAULT_VERSION),
+    ZCODE_WEBUI_GUARD_STATS_DIR: path.join(resolveDataHome(PROJECT_ROOT), 'data', 'guard-stats'),
+    ...extra,
+  };
+  // 3.15-era overrides point at the OLD agent binary and, worse, put the host on
+  // its "external command" branch which drops supportsStorageStartup — the local
+  // startup then dies with preparing_session_storage: unsupported_runtime. The
+  // 3.16 host resolves its own agent runtime, so these must not leak in.
+  for (const k of ['ZCODE_AGENT_SERVER_COMMAND', 'ZCODE_AGENT_SERVER_ARGS_JSON',
+                   'ZCODE_AGENT_SERVER_CWD', 'GLM_BINARY_PATH', 'ZCODE_DESKTOP_AGENT_BYTECODE']) {
+    delete env[k];
+  }
+  // Same guard preloads as the legacy path (they also reach every child the host
+  // spawns through the inherited NODE_OPTIONS).
+  const preload = (file) => {
+    const guard = path.join(PROJECT_ROOT, 'src', file);
+    if (existsSync(guard) && !String(env.NODE_OPTIONS || '').includes(guard)) {
+      env.NODE_OPTIONS = [env.NODE_OPTIONS, '--require=' + guard].filter(Boolean).join(' ');
+    }
+  };
+  if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') preload('repo-snapshot-guard.cjs');
+  preload('api-cache-guard.cjs');
+  preload('quota-reset-guard.cjs');
+  return env;
+}
+
+// Fork the 3.16 host and wire the control channel + relay port. Resolves once the
+// preload is installed (the host itself boots asynchronously and reports progress
+// through database-startup-state).
+export function createHost16({
+  serverRoot, layout, log = console.error.bind(console), extraEnv = {},
+  startupId, deviceId = '', locale = 'zh-CN', workspace = '',
+}) {
+  const root = layout.root;
+  const child = fork(layout.entry, [], {
+    cwd: root,
+    execArgv: ['--import', PORT_SHIM, '--no-warnings'],
+    serialization: 'advanced',
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    env: buildHost16Env(root, extraEnv),
+  });
+
+  const pipe = {
+    kind: 'host16',
+    child,
+    root,
+    startupId,
+    hello: { type: 'zcode-hello', version: layout.version || '' },
+    onFrame: null,
+    onStartupState: null,
+    onControl: null,
+    closed: false,
+    framesIn: 0,
+    framesOut: 0,
+    lastStartupState: null,
+  };
+
+  const sink = createHost16LogSink(log);
+  child.stdout.on('data', (d) => sink('stdout', d.toString()));
+  child.stderr.on('data', (d) => sink('stderr', d.toString()));
+
+  child.on('message', (m) => {
+    if (!m || typeof m !== 'object') return;
+    if (m.__z === 'ready') { pipe.preloadReady = true; return; }
+    if (m.__z === 'pp') {
+      const msg = m.msg || {};
+      // observed on the wire as both 'database-startup-state' (3.16.x host) and
+      // the namespaced form used by the renderer-side channel
+      if (msg.type === 'database-startup-state' || msg.type === 'zcode:database-startup-state') {
+        pipe.lastStartupState = msg.state || null;
+        if (pipe.onStartupState) { try { pipe.onStartupState(pipe.lastStartupState); } catch (_e) { /* ignore */ } }
+        return;
+      }
+      if (msg.type === 'log') {
+        // structured host logs: errors/warnings only, the info stream is huge
+        if (msg.level && msg.level !== 'info') sink('log', '[' + msg.level + '] ' + String(msg.message || ''));
+        return;
+      }
+      if (pipe.onControl) { try { pipe.onControl(msg); } catch (_e) { /* ignore */ } }
+      return;
+    }
+    if (m.__z === 'port') {
+      pipe.framesOut++;
+      const buf = Buffer.isBuffer(m.d) ? m.d : Buffer.from(m.d);
+      if (pipe.onFrame && !pipe.closed) { try { pipe.onFrame(buf); } catch (_e) { /* ignore */ } }
+      return;
+    }
+    if (m.__z === 'port-close') {
+      log('[host16] renderer channel closed by host pid=' + child.pid);
+    }
+  });
+
+  child.on('exit', (code, signal) => {
+    pipe.closed = true;
+    if (pipe.onExit) { try { pipe.onExit(code, signal); } catch (_e) { /* ignore */ } }
+  });
+  child.on('error', (err) => log('[host16] spawn error: ' + err.message));
+
+  pipe.push = (payload) => {
+    if (pipe.closed || !child.connected) return false;
+    pipe.framesIn++;
+    try { child.send({ __z: 'port-in', id: HOST16_PORT_ID, d: payload }); return true; } catch (_e) { return false; }
+  };
+  pipe.close = () => {
+    pipe.closed = true;
+    if (child.exitCode === null) {
+      child.kill('SIGTERM');
+      setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+    }
+  };
+
+  // The preload must be listening before init-local is posted; both sides race
+  // the spawn, so wait for its 'ready' ping (2 s is plenty — the module is tiny).
+  pipe.ready = new Promise((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (pipe.preloadReady) { clearInterval(timer); resolve(true); return; }
+      if (pipe.closed || Date.now() - started > 2000) { clearInterval(timer); resolve(pipe.preloadReady === true); }
+    }, 20);
+    timer.unref?.();
+  }).then((ok) => {
+    if (!ok || pipe.closed) {
+      log('[host16] preload did not report ready, sending init-local anyway');
+    }
+    const builtin = path.join(root, 'config', 'provider', 'zcode-builtin.json');
+    const initMsg = {
+      type: 'init-local',
+      databaseStartupId: startupId,
+      deviceMid: deviceId || undefined,
+      workspacePath: workspace || undefined,
+      agentWarmupTargets: workspace ? [{ workspacePath: workspace }] : undefined,
+      agentSpawnFallbackCwd: workspace || process.cwd(),
+      locale: locale || undefined,
+      runtimeProcessEnvPatch: {},
+      ...(existsSync(builtin) ? { zcodeBuiltinProviderConfigFilePath: builtin } : {}),
+    };
+    try {
+      child.send({ __z: 'pp', msg: initMsg, ports: [HOST16_PORT_ID] });
+    } catch (err) {
+      log('[host16] failed to send init-local: ' + err.message);
+    }
+    return pipe;
+  });
+
+  return pipe;
+}
+
+// One entry point for both generations: returns a pipe with a uniform interface
+// (child, hello, push, close, onFrame, onStartupState, startupId) so the bridge
+// code in server.mjs never has to care which runtime it is talking to.
+export async function createHostPipe({
+  serverRoot, log = console.error.bind(console), extraEnv = {},
+  startupId, deviceId = '', locale = 'zh-CN', workspace = '',
+}) {
+  const layout = detectRuntimeLayout(serverRoot);
+  if (layout.kind === 'host16') {
+    const pipe = createHost16({ serverRoot, layout, log, extraEnv, startupId, deviceId, locale, workspace });
+    await pipe.ready;
+    return pipe;
+  }
+
+  const host = spawnHost({ serverRoot: layout.root, log, extraEnv });
+  const { child } = host;
+  const { hello, rest } = await handshake(child);
+  const parser = new FrameParser((payload) => {
+    pipe.framesOut++;
+    if (pipe.onFrame && !pipe.closed) { try { pipe.onFrame(Buffer.from(payload)); } catch (_e) { /* ignore */ } }
+  });
+  const pipe = {
+    kind: 'legacy',
+    child,
+    root: layout.root,
+    hello,
+    startupId: null,
+    onFrame: null,
+    onStartupState: null,
+    onControl: null,
+    closed: false,
+    framesIn: 0,
+    framesOut: 0,
+    lastStartupState: null,
+    push: (payload) => {
+      if (pipe.closed) return false;
+      pipe.framesIn++;
+      try { child.stdin.write(encodeFrame(payload)); return true; } catch (_e) { return false; }
+    },
+    close: () => {
+      pipe.closed = true;
+      if (child.exitCode === null) {
+        child.kill('SIGTERM');
+        setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 3000).unref();
+      }
+    },
+  };
+  parser.push(rest);
+  child.stdout.on('data', (d) => parser.push(d));
+  child.on('exit', (code, signal) => {
+    pipe.closed = true;
+    if (pipe.onExit) { try { pipe.onExit(code, signal); } catch (_e) { /* ignore */ } }
+  });
+  return pipe;
 }
