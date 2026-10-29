@@ -787,6 +787,126 @@
     } catch (e) { /* ignore */ }
   })();
 
+  // ---- accidental-stop guard (Esc) -------------------------------------------
+  // The official renderer binds Escape to "stop the current turn" (its own
+  // tooltip even advertises "Esc" as the shortcut) through a window-level
+  // keydown handler that only skips events already prevented or targeted inside
+  // a dialog. Pressing Esc to dismiss an IME candidate list, to clear a search
+  // box, or just a stray keypress therefore kills a running turn — and a killed
+  // turn cancels every in-flight subagent with it (2026-10-29: a 3.5h
+  // orchestration turn plus four scene-drafting subagents died 12 minutes after
+  // dispatch; the only trace was `v4.stop.foreground_execution_inspected`).
+  //
+  // Guard: while a turn is stoppable, the FIRST Escape is swallowed and a hint
+  // appears; a second Escape within CONFIRM_MS is replayed through to the
+  // renderer, so stopping still goes through the app's own path. Scopes that own
+  // Escape (dialog / popper menu / listbox) are never touched.
+  //
+  // Both decisions and stop-button clicks are logged as kind=stop-guard, so the
+  // next stop can be attributed (button vs Esc) from the server log instead of
+  // the renderer's console.
+  (function () {
+    var CONFIRM_MS = 2500;
+    // the composer swaps its send button for this one while a turn can be stopped
+    var STOP_LABEL = /停止生成|停止|stop\s*generating|^stop$/i;
+    var OWNED = '[role="dialog"],[data-slot="dialog-content"],[role="menu"],[role="listbox"],' +
+      '[data-radix-popper-content-wrapper],[aria-modal="true"]';
+    var armed = 0;
+    var hintEl = null;
+    var hintTimer = 0;
+
+    function log(message) {
+      try {
+        fetch('api/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ href: window.location.href, kind: 'stop-guard', message: message }),
+          keepalive: true,
+        }).catch(function () { /* ignore */ });
+      } catch (e) { /* ignore */ }
+    }
+
+    // only DOM-level truth available to us: an enabled, visible stop button
+    function stoppable() {
+      var nodes = document.querySelectorAll('button[aria-label]');
+      for (var i = 0; i < nodes.length; i++) {
+        var b = nodes[i];
+        if (b.disabled) continue;
+        var label = String(b.getAttribute('aria-label') || '');
+        if (!STOP_LABEL.test(label)) continue;
+        var r = b.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return label;
+      }
+      return '';
+    }
+
+    function dropHint() {
+      if (hintTimer) { clearTimeout(hintTimer); hintTimer = 0; }
+      if (hintEl && hintEl.parentNode) hintEl.parentNode.removeChild(hintEl);
+      hintEl = null;
+    }
+
+    function showHint() {
+      dropHint();
+      hintEl = document.createElement('div');
+      hintEl.setAttribute('data-zwebui-stop-guard', 'hint');
+      hintEl.textContent = '再按一次 Esc 停止生成';
+      hintEl.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);' +
+        'z-index:2147483646;background:#1f2937;color:#f9fafb;font:13px/1.4 system-ui,sans-serif;' +
+        'padding:6px 12px;border-radius:999px;box-shadow:0 4px 12px rgba(0,0,0,.25);' +
+        'pointer-events:none;opacity:.96;';
+      try { document.body.appendChild(hintEl); } catch (e) { /* ignore */ }
+      hintTimer = setTimeout(function () { hintTimer = 0; armed = 0; dropHint(); }, CONFIRM_MS);
+    }
+
+    function replayEscape() {
+      var target = document.activeElement;
+      if (!target || typeof target.dispatchEvent !== 'function') target = document.body;
+      var ev = new KeyboardEvent('keydown', {
+        key: 'Escape', code: 'Escape', keyCode: 27, which: 27,
+        bubbles: true, cancelable: true,
+      });
+      ev.__zwebuiEscPass = true;          // our own capture handler lets this one through
+      try { target.dispatchEvent(ev); } catch (e) { /* ignore */ }
+    }
+
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Escape' || ev.__zwebuiEscPass) return;
+      if (ev.defaultPrevented) return;    // someone already owns this Escape
+      var path = ev.composedPath ? ev.composedPath() : [];
+      for (var i = 0; i < path.length; i++) {
+        var n = path[i];
+        if (n && n.nodeType === 1 && n.matches && n.matches(OWNED)) return;
+      }
+      var label = stoppable();
+      if (!label) return;
+      ev.preventDefault();                // and keep it away from the window handler
+      ev.stopPropagation();
+      var now = Date.now();
+      if (armed && now - armed <= CONFIRM_MS) {
+        armed = 0;
+        dropHint();
+        log('esc confirmed -> stop replayed (aria-label=' + label + ')');
+        replayEscape();
+        return;
+      }
+      armed = now;
+      showHint();
+      log('esc swallowed (turn stoppable via "' + label + '"; Esc again within ' + CONFIRM_MS + 'ms to stop)');
+    }, true);
+
+    // attribution: record deliberate clicks so a stop can be traced to its source
+    document.addEventListener('click', function (ev) {
+      var path = ev.composedPath ? ev.composedPath() : [];
+      for (var i = 0; i < path.length; i++) {
+        var n = path[i];
+        if (!n || n.nodeType !== 1 || !n.getAttribute) continue;
+        var label = String(n.getAttribute('aria-label') || '');
+        if (label && STOP_LABEL.test(label)) { log('stop button clicked (aria-label=' + label + ')'); return; }
+      }
+    }, true);
+  })();
+
   // debug/transport override: ?transport=http forces the HTTP polling bridge
   // (useful behind proxies that never forward WebSocket upgrades)
   var forceHttp = false;
