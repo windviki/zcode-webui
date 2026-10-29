@@ -2361,10 +2361,17 @@ wss.on('connection', (ws, req, session, meta) => {
   // the renderer would see a hole in its event stream and quietly go stale. Send
   // it down the established recovery path instead (close 4000 → page reload).
   // Checked BEFORE any state mutation so the half-attached view leaves no trace.
+  let gapDeclared = false;
   if (resume && prevView && prevView.resumeOverflow) {
-    console.error('[ws] resume rejected tab=' + tabId.slice(0, 8) + ' — offline gap overflowed the replay buffer, forcing reload');
-    try { ws.close(4000, 'gap overflow'); } catch (_e) { /* ignore */ }
-    return;
+    // The offline gap cannot be bridged, but a reload is a heavy answer: keep
+    // the renderer alive, drop the (already truncated) replay buffer and tell
+    // the page that some events were lost — it shows a "重新同步" action.
+    console.error('[ws] resume after offline gap overflow tab=' + tabId.slice(0, 8) +
+      ' — continuing in-page and declaring the gap (' + prevView.resumeBuf.length + ' frame(s) dropped)');
+    prevView.resumeOverflow = false;
+    prevView.resumeBuf.length = 0;
+    prevView.resumeBytes = 0;
+    gapDeclared = true;
   }
   if (adopted && !resume) {
     // fresh renderer bootstrapping against a mid-stream host: gate downstream
@@ -2455,6 +2462,13 @@ wss.on('connection', (ws, req, session, meta) => {
         }
         return;
       }
+      // application-level liveness probe from the page (browsers cannot open
+      // their own WS pings, and a half-open TCP socket otherwise looks OPEN for
+      // minutes after the peer is gone)
+      if (ctrl === '{"kind":"zcode-webui-ping"}') {
+        try { ws.send('{"kind":"zcode-webui-pong"}'); } catch (_e) { /* ignore */ }
+        return;
+      }
       if (ctrl === '{"kind":"zcode-webui-startup-snapshot"}') {
         if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
           try { ws.send(startupLine(session.lastStartupState)); } catch (_e) { /* ignore */ }
@@ -2500,6 +2514,7 @@ wss.on('connection', (ws, req, session, meta) => {
     if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
       ws.send(startupLine(session.lastStartupState));
     }
+    if (gapDeclared) ws.send('{"kind":"zcode-webui-gap"}');
   } catch (_e) { /* ignore */ }
   const announce = (line) => {
     try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }

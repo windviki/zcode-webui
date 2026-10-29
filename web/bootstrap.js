@@ -553,6 +553,15 @@
   }
   var wsVerified = false;
   var WS_READY = '{"kind":"zcode-webui-ready"}';
+  // Liveness: browsers cannot send WebSocket protocol pings, and a half-open
+  // TCP socket (phone sleep, NAT timeout, proxy drop) keeps readyState === OPEN
+  // for minutes after the peer is gone — the page then looks connected but is
+  // frozen until a manual reload. We send an app-level ping on a timer and treat
+  // "no inbound at all for 45 s while visible" as dead (pongs arrive every 10 s
+  // on an idle-but-healthy socket, so this only fires when the path is broken).
+  var lastInboundAt = 0;
+  var PING_EVERY_MS = 10000;
+  var STALE_VISIBLE_MS = 45000;
   // >= 3.16: the host migrates the database itself and streams
   // zcode:database-startup-state; the page must NOT synthesize "ready" then.
   // The server announces which mode and which startupId to use in its ready line.
@@ -565,6 +574,7 @@
     ws.binaryType = 'arraybuffer';
     ws.onopen = function () { wsOpened = true; reloadAttempts = 0; hotAttempts = 0; wsOpenFails = 0; };
     ws.onmessage = function (ev) {
+      lastInboundAt = Date.now();
       // the very first message MUST be our ready signal; a foreign websocket
       // server (e.g. code-server's own /ws when the URL lacked a trailing slash)
       // would send its own frames here — reject it and fall back to http polling.
@@ -595,6 +605,14 @@
           if (ctrl && ctrl.kind === 'zcode-webui-background') { watchBackground(ctrl); return; }
           if (ctrl && ctrl.kind === 'zcode-webui-background-cleared') { dismissBackground(); return; }
           if (ctrl && ctrl.kind === 'zcode-webui-startup') { postRealStartupState(ctrl.state); return; }
+          if (ctrl && ctrl.kind === 'zcode-webui-pong') { return; }   // liveness only
+          if (ctrl && ctrl.kind === 'zcode-webui-gap') {
+            // the offline gap overflowed the server's replay buffer: the page was
+            // deliberately kept alive instead of reloaded, so say what was lost
+            showNotice('连接已恢复，但离线期间的部分事件未能送达。若界面显示异常，点此重新同步。',
+              '重新同步', function () { window.location.reload(); });
+            return;
+          }
         } catch (e) { /* not a control message */ }
         console.debug('[zcode-webui]', ev.data);
         return;
@@ -630,6 +648,7 @@
         // page is hidden (defer it; churn-free backgrounding)
         if (isHidden()) { pendingHostReboot = true; return; }
         reloadAttempts++;
+        flash('会话进程已重启，正在恢复会话…');
         if (reloadAttempts > 2) {
           showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); });
           reloadAttempts = 0;
@@ -654,6 +673,18 @@
   var hotAttempts = 0;
   var pendingHostReboot = false;
   function isHidden() { return document.visibilityState === 'hidden'; }
+  // one-line, pointer-transparent toast; used before the (unavoidable) reload
+  // that a host restart requires, so the refresh does not look like a crash
+  function flash(text) {
+    try {
+      var el = document.createElement('div');
+      el.textContent = text;
+      el.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:2147483646;' +
+        'background:#1f2937;color:#f9fafb;font:13px/1.4 system-ui,sans-serif;padding:8px 14px;border-radius:999px;' +
+        'box-shadow:0 4px 12px rgba(0,0,0,.3);pointer-events:none;';
+      (document.body || document.documentElement).appendChild(el);
+    } catch (e) { /* ignore */ }
+  }
   function scheduleHotReconnect() {
     var delay = Math.min(1000 * Math.pow(2, Math.min(hotAttempts, 4)), 10000);
     hotAttempts++;
@@ -662,15 +693,42 @@
       connect();
     }, delay);
   }
+  function probeNow() {
+    if (mode !== 'ws' || !ws || ws.readyState !== 1) return;
+    try { ws.send('{"kind":"zcode-webui-ping"}'); } catch (e) { /* ignore */ }
+  }
+  // a socket that reported OPEN but has delivered nothing for a long time while
+  // the page is visible is dead: closing it drives the normal hot-reconnect path
+  setInterval(function () {
+    if (mode !== 'ws' || !ws || ws.readyState !== 1) return;
+    if (isHidden()) return;                       // background tabs throttle timers
+    var idle = Date.now() - lastInboundAt;
+    if (idle > STALE_VISIBLE_MS) {
+      try { ws.close(); } catch (e) { /* ignore */ }   // onclose → hot reconnect
+      return;
+    }
+    probeNow();
+  }, PING_EVERY_MS);
+  window.addEventListener('focus', function () {
+    if (mode !== 'ws') return;
+    if (!ws || ws.readyState > 1) { hotAttempts = 0; connect(); return; }
+    probeNow();
+  });
+  window.addEventListener('online', function () {
+    if (mode !== 'ws') return;
+    hotAttempts = 0; reloadAttempts = 0; wsOpenFails = 0;
+    if (!ws || ws.readyState > 1) connect();
+    else probeNow();
+  });
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible') return;
     // back in the foreground: fresh recovery budget + immediate action
     hotAttempts = 0;
     reloadAttempts = 0;
     wsOpenFails = 0;
-    if (pendingHostReboot) { pendingHostReboot = false; window.location.reload(); return; }
+    if (pendingHostReboot) { pendingHostReboot = false; flash('正在恢复会话…'); window.location.reload(); return; }
     if (mode === 'ws') {
-      if (!ws || ws.readyState > 1) connect();
+      if (!ws || ws.readyState > 1) connect(); else probeNow();
     } else if (mode === 'http' && !httpSessionId) {
       // parked in http mode with a dead relay (bridge/open failed while the tab
       // was hidden): prefer the ws hot-resume path now that we are visible
