@@ -994,6 +994,31 @@ function newStartupId() {
   return 'zcode-webui-' + randomUUID();
 }
 
+// Which workspace the host should pre-warm. The 3.16 host starts one agent per
+// workspace, and the first command queued behind a cold agent can sit there for
+// ~30 s (2026-10-29: a send handed to a freshly spawned agent took 30,083 ms
+// while the agent itself had been up for seconds). The desktop warms the
+// workspace it is about to show; here the useful guess is "the one the user last
+// worked in" — NOT the configured base workspace, which nobody opens
+// (it used to warm /home/coder while every conversation lived under
+// /home/coder/writing/recabyss or /home/coder/rev).
+async function pickWarmWorkspace() {
+  try {
+    const dbPath = path.join(process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode'), 'cli', 'db', 'db.sqlite');
+    if (existsSync(dbPath)) {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        const row = db.prepare(
+          "SELECT directory FROM session WHERE directory IS NOT NULL AND directory <> '' ORDER BY time_updated DESC LIMIT 1"
+        ).get();
+        if (row && row.directory && existsSync(row.directory)) return String(row.directory);
+      } finally { db.close(); }
+    }
+  } catch (_e) { /* fall through to the configured workspace */ }
+  return WORKSPACE;
+}
+
 // Spawn one host (either generation) and wrap it in the pipe interface the rest
 // of this file speaks: push(payload) / onFrame / onExit / close. The transport
 // underneath is chosen by the installed runtime layout — see createHostPipe().
@@ -1007,7 +1032,7 @@ async function spawnPipe() {
     startupId,
     deviceId,
     locale: LOCALE,
-    workspace: WORKSPACE,
+    workspace: await pickWarmWorkspace(),
   });
   const rpcDebug = process.env.ZCODE_WEBUI_DEBUG_RPC === '1';
   const state = {
