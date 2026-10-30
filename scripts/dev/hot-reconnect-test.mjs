@@ -27,7 +27,20 @@ if (process.argv[2] || process.env.ZCODE_WEBUI_TEST_URL) {
     JSON.stringify({ 'oauth:bigmodel:access_token': 't', 'oauth:bigmodel:user_info': '{"id":"hotrec"}' }));
   const port = 3196 + Math.floor(Math.random() * 300);
   server = spawn(process.execPath, [path.join(ROOT, 'src/server.mjs'), '--port', String(port)], {
-    env: { ...process.env, ZCODE_WEBUI_HOME: path.join(sandbox, 'data'), ZCODE_HOME: path.join(sandbox, 'zcode'), HOME: path.join(sandbox, 'home') },
+    env: {
+      ...process.env,
+      ZCODE_WEBUI_HOME: path.join(sandbox, 'data'),
+      ZCODE_HOME: path.join(sandbox, 'zcode'),
+      HOME: path.join(sandbox, 'home'),
+      // Short reaper timings: if the presence lease does not keep the detached
+      // host/era alive, this test's 2 s socket drop would reap it and force a
+      // page reload — exactly the regression this configuration exposes.
+      ZCODE_WEBUI_DETACHED_TTL_MS: '1200',
+      ZCODE_WEBUI_REAP_INTERVAL_MS: '250',
+      ZCODE_WEBUI_FRAME_QUIET_MS: '150',
+      ZCODE_WEBUI_RESUME_PARK_MS: '1200',
+      ZCODE_WEBUI_PRESENCE_LEASE_MS: '30000',
+    },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   server.logLines = [];
@@ -64,6 +77,36 @@ try {
   await page.keyboard.press('Escape').catch(() => {});
 
   await page.evaluate(() => { window.__zwebui_marker = 'LIVE'; });
+
+  // presence lease: the open page must have registered a lease server-side even
+  // before any socket trouble (it is renewed over plain HTTP, independent of WS)
+  const healthBoot = await (await fetch(BASE + 'api/health')).json();
+  check('presence lease registered for the open page', healthBoot.sessions.presence >= 1,
+    JSON.stringify(healthBoot.sessions));
+
+  // the offline-gap / reconnect notice must be dismissible WITHOUT triggering
+  // its action (the old banner only offered "重新同步", i.e. a reload)
+  await page.evaluate(() => {
+    window.__noticeAction = false;
+    window.__zwebui_notice('连接已恢复，但离线期间的部分事件未能送达。界面无异常时可关闭此提示继续使用；若显示异常，请重新同步。',
+      '重新同步', function () { window.__noticeAction = true; }, true);
+  });
+  await page.waitForTimeout(150);
+  const notice = await page.evaluate(() => {
+    const el = document.getElementById('zcode-webui-error');
+    return el ? { text: el.textContent, buttons: Array.from(el.querySelectorAll('button')).map((b) => b.textContent) } : null;
+  });
+  check('gap notice offers 重新同步 + 关闭', !!notice && notice.buttons.indexOf('重新同步') >= 0 && notice.buttons.indexOf('关闭') >= 0,
+    JSON.stringify(notice && notice.buttons));
+  await page.locator('#zcode-webui-error button', { hasText: '关闭' }).click();
+  await page.waitForTimeout(150);
+  const afterClose = await page.evaluate(() => ({
+    banner: !!document.getElementById('zcode-webui-error'),
+    action: !!window.__noticeAction,
+    marker: window.__zwebui_marker,
+  }));
+  check('close button dismisses the notice without reloading or firing the action',
+    !afterClose.banner && !afterClose.action && afterClose.marker === 'LIVE', JSON.stringify(afterClose));
 
   // simulate the background drop (Android suspends the tab's network): close
   // the socket without a reload — the client must schedule a HOT reconnect

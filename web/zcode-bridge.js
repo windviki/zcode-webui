@@ -55,7 +55,12 @@
   function ensureOverlayStyle() {
     if (overlayStyleEl) return;
     var css = ''
-      + '.zwebui-ovl{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);}'
+      // pointer-events:auto is load-bearing: the official dialogs are Radix
+      // modals, and react-remove-scroll sets `body{pointer-events:none}` while
+      // one is open. Our overlay (a body child) would then be visible but
+      // completely unclickable — the folder picker opened from the project
+      // dialog showed up and swallowed every click on 2026-10-30.
+      + '.zwebui-ovl{position:fixed;inset:0;z-index:2147483000;pointer-events:auto;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);}'
       + '.zwebui-ovl-panel{display:flex;flex-direction:column;overflow:hidden;border-radius:14px;background:var(--color-menu,#1d2127);border:1px solid var(--color-popover-border,#2c3138);box-shadow:0 24px 64px rgba(0,0,0,.5);}'
       + '.zwebui-ovl-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:0 0 44px;padding:0 8px 0 16px;background:var(--color-header,#16191d);border-bottom:1px solid var(--color-border,#2c3138);color:var(--color-foreground,#e8eaed);font:600 13px/1 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;}'
       + '.zwebui-ovl-x{flex:0 0 auto;display:flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:8px;background:transparent;color:var(--color-foreground-subtle,#9aa3ad);font:400 15px/1 system-ui,sans-serif;cursor:pointer;}'
@@ -88,6 +93,9 @@
     ensureOverlayStyle();
     var ovl = document.createElement('div');
     ovl.className = 'zwebui-ovl';
+    // a modal dialog locks body pointer events; re-enable them for our overlay so
+    // it stays interactive even when opened from inside an official dialog
+    ovl.style.pointerEvents = 'auto';
     var panel = document.createElement('div');
     panel.className = 'zwebui-ovl-panel';
     panel.style.width = 'min(' + (opts.width || 720) + 'px,92vw)';
@@ -751,6 +759,36 @@
   }
   installModeBoost();
 
+  // Folder picker for the web build (the desktop app opens a native dialog). One
+  // in-page overlay, no popup blocker; picker.html postMessages the result back
+  // (see web/picker.html). Resolves a path, or null when the user cancels.
+  function openDirectoryPicker() {
+    return new Promise(function (resolve) {
+      var settled = false;
+      var ov = null;
+      function finish(v) {
+        if (settled) return;
+        settled = true;
+        try { window.removeEventListener('message', onMsg); } catch (e) { /* ignore */ }
+        if (ov) ov.close();
+        resolve(v || null);
+      }
+      function onMsg(ev) {
+        if (!ev.data || typeof ev.data !== 'object') return;
+        if (ev.data.type === 'zcode-dir-picked') finish(String(ev.data.path || ''));
+        else if (ev.data.type === 'zcode-dir-cancelled') finish(null);
+      }
+      window.addEventListener('message', onMsg);
+      ov = openOverlay({
+        title: isEn() ? 'Select Folder' : '选择文件夹',
+        url: pageUrl('picker.html'),
+        key: 'dir-picker',
+        width: 620, height: 600,
+        onClose: function () { finish(null); }
+      });
+    });
+  }
+
   var api = {
     // identity / lifecycle
     getDeviceId: val(DEVICE_ID),
@@ -829,32 +867,20 @@
     // native dialogs / fs
     selectDirectory: function () {
       // Desktop opens a native folder dialog; we show our web picker as an
-      // in-page overlay (no popup blockers). picker.html postMessages the
-      // result back — see web/picker.html.
-      return new Promise(function (resolve, reject) {
-        var settled = false;
-        var ov = null;
-        function finish(fn, v) {
-          if (settled) return;
-          settled = true;
-          window.removeEventListener('message', onMsg);
-          if (ov) ov.close();
-          fn(v);
-        }
-        function onMsg(ev) {
-          if (!ev.data || typeof ev.data !== 'object') return;
-          if (ev.data.type === 'zcode-dir-picked') finish(resolve, ev.data.path);
-          else if (ev.data.type === 'zcode-dir-cancelled') finish(reject, new Error('cancelled'));
-        }
-        window.addEventListener('message', onMsg);
-        ov = openOverlay({
-          title: isEn() ? 'Select Folder' : '选择文件夹',
-          url: pageUrl('picker.html'),
-          key: 'dir-picker',
-          width: 620, height: 600,
-          onClose: function () { finish(reject, new Error('cancelled')); }
-        });
+      // in-page overlay (no popup blockers). Rejects on cancel, like the
+      // desktop contract the renderer expects here.
+      return openDirectoryPicker().then(function (p) {
+        if (!p) throw new Error('cancelled');
+        return p;
       });
+    },
+    // 3.16's project editor calls platform.selectDirectories() — for the
+    // "新建项目 → 选择文件夹" flow — and reads `.length` on the result. The generic
+    // Proxy fallback used to answer this call with undefined, which crashed the
+    // dialog with "Cannot read properties of undefined (reading 'length')".
+    // A native multi-select dialog resolves [] when the user cancels.
+    selectDirectories: function () {
+      return openDirectoryPicker().then(function (p) { return p ? [p] : []; }, function () { return []; });
     },
     selectFile: unsupported,
     selectFiles: unsupported,
@@ -932,7 +958,31 @@
     },
     loadMcpFromUserDirectory: val({ items: [] }),
     saveMcpToUserDirectory: ok,
-    migrateLegacyCommonMcp: ok
+    migrateLegacyCommonMcp: ok,
+    // ---- 3.16 API surface that dereferences its result -----------------------
+    // The generic Proxy fallback answers an unknown method with ok() (resolves
+    // undefined). That is fine for fire-and-forget calls, but these results are
+    // READ by the renderer (`.length`, `[origin]`, `.localPath`), and the web
+    // build has no embedded browser or artifact materialization to back them:
+    // return the shape its own "bridge unavailable" fallbacks use instead
+    // (3.15's getCloseToTrayCapability crash was exactly this class of bug).
+    getEmbeddedBrowserSitePermissions: function () { return Promise.resolve({}); },
+    setEmbeddedBrowserSitePermission: function () { return Promise.resolve({}); },
+    clearEmbeddedBrowserSitePermissions: function () { return Promise.resolve({}); },
+    resetEmbeddedBrowserSitePermission: function () { return Promise.resolve({}); },
+    resolveEmbeddedBrowserPermissionPrompt: ok,
+    syncActiveTaskSession: noop,
+    setShortcutRecordingActive: noop,
+    openExternalFile: val(false),
+    getApplicationIcon: val(null),
+    reportLocalTtftBatch: noop,
+    reportRendererHeapSample: noop,
+    materializeWorkflowArtifactFile: function () {
+      return Promise.reject(new Error('workflow artifact files are not supported in zcode-webui'));
+    },
+    requestSourceSettingsAttachment: function () {
+      return Promise.reject(new Error('Source settings attachment bridge unavailable'));
+    }
   };
 
   // Every "onXxx" channel becomes a subscribe helper returning an unsubscribe fn.

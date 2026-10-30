@@ -159,10 +159,31 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
   probe 或在必要时直接重连，不再依赖被浏览器节流的定时器。
 - **热重连不刷新页面**：同一页面重连时带 `resume=1`，服务端把离线期间的帧按序回放
   （同标签页 era 复用），端口不用重建。
-- **回放缺口不再强刷**：离线期间积压超过回放缓冲（默认 16MB / 2048 帧）时，以前会直接
-  断线让页面刷新；现在保留页面、丢弃陈旧回放，并给出「重新同步」提示，由用户决定何时刷新。
+- **页面 presence 租约**：页面开着（含切到后台）就每 45s 通过普通 HTTP 续租一次；被浏览器冻结/进入 bfcache 时
+  再发一次 12 小时的长租约（`freeze` / `pagehide persisted`）。服务端据此
+  保留该标签页的宿主和 parked era，**不再因为后台时间长而回收**。关闭标签页会发 closing 信标，
+  没送到也会在租约（默认 30 分钟）过期后恢复原有回收策略。这是「隔很久回到同一标签页」
+  能直接热重连、而不是整页重载的关键。
+- **回放缺口不再强刷**：离线期间积压超过回放缓冲（默认 32MB / 4096 帧）时，保留页面、丢弃陈旧
+  回放，并给出「重新同步 / 关闭」两个按钮——界面正常时可以直接关掉提示继续用，不必为了清提示
+  而整页刷新。单个超大**响应帧**（文件内容、截图等）不会再把整段回放拖垮：只跳过该响应，重连后
+  给对应调用合成一个可重试错误。
 - **只有宿主进程真的重启才需要刷新**：那时会先显示「会话进程已重启，正在恢复会话…」再刷新，
   不会看起来像崩溃。
+
+### 与 dsh / kimi 的重连差异（源码对照）
+
+- **dsh**（`dsh-client-connection` + `dsh-api-session-controller`）：连接按 generation 管理，
+  指数退避（默认 500ms ×2，上限 10s），`online/offline` 会暂停/恢复重试；重连成功后
+  `handleConnected()` 清空投影缓存、重新拉会话列表，已打开的会话各自 `resync()` 重开历史窗口。
+  没有整页刷新。
+- **Kimi Code Web**：WebSocket 帧带 `seq/epoch`，订阅恢复时带 `sinceSeq`；服务端要么补发，
+  要么回 `resync_required`，客户端收到后重新 `GET session` 并重置投影。窗口重新可见时若 socket
+  被判 stale 会主动重连。也没有整页刷新。
+- **本垫片**：官方渲染层的 service port 是一次性握手，没有对外的「重新初始化 / 重新订阅」协议，
+  垫片无法命令它从快照重建整个 React 状态树。因此这里的策略是**别让会话丢**：presence 租约保住
+  宿主与 era，断线期间按序补帧；只有宿主进程本身消失（重启/崩溃/被回收）时，整页刷新才是唯一
+  可靠的恢复路径。这是与 dsh/kimi 的根本架构差异，不是退避参数或心跳策略的差异。
 
 ## 任务生命周期（重要，30 秒读完）
 
@@ -202,6 +223,12 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
 | `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
+| `ZCODE_WEBUI_PRESENCE_LEASE_MS` | — | `1800000` | 页面 presence 租约有效期：页面开着（含后台）每 45s 续租，租约新鲜时保留宿主与 parked era；`0` = 关闭该保护 |
+| `ZCODE_WEBUI_PRESENCE_MAX_TABS` | — | `32` | 每个宿主最多记住多少个标签页的 presence |
+| `ZCODE_WEBUI_PRESENCE_FROZEN_MAX_MS` | — | `43200000` | 冻结/bfcache 页面单次长租约的上限（默认 12h），防止丢失 closing 信标后永久占用宿主 |
+| `ZCODE_WEBUI_RESUME_BUF_MAX_MB` | — | `32` | 每标签页离线补帧缓冲的字节上限；单个超大响应会跳过而不是丢弃整段 |
+| `ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES` | — | `4096` | 每标签页离线补帧缓冲的帧数上限 |
+| `ZCODE_WEBUI_RESUME_PARK_MS` | — | `600000` | 无 presence 租约时，parked era 在宿主空闲多久后退休；`0` = 不退休 |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | 回收条件之一：最近该时长内无 host→浏览器帧 |
 | `ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS` | — | `600000` | CLI 数据库（message/part/session_entry）最近写入在该窗口内时不回收（长回合的静默模型调用） |
 | `ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS` | — | `7200000` | CLI 日志里未配对的 `model.request.started` 视为在途请求，超过该时长才忽略 |
@@ -377,7 +404,8 @@ cp cli-config.example.json ~/.zcode/cli/config.json && chmod 600 ~/.zcode/cli/co
 **Q：切到其他 App 再回来，页面重连/要求手动重连？**
 这是手机浏览器在后台冻结页面并回收网络连接所致（并非服务端超时）。新版对此透明：后台掉线**不再刷新
 页面**，恢复时通过热重连直接接管同一个运行中的宿主——离线期间任务产生的输出会在恢复瞬间补投，
-全程无感、无需任何点击。页面回前台即自动恢复；仅当宿主进程本身退出（如服务重启）才需要一次自动
+全程无感、无需任何点击。页面开着（含后台）会持续 presence 续租，宿主和补帧窗口不会被后台时长回收；
+页面回前台即自动恢复。只有标签页关闭后租约过期，或宿主进程本身退出（如服务重启）才需要一次自动
 刷新。服务端另加了 30 秒 ping/pong 保活，僵死连接会被及时清理、宿主干净转入后台。
 
 **Q：服务器休眠/断网后，进行中的任务停了？**

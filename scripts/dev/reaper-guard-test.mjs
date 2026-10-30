@@ -286,15 +286,26 @@ try {
     const id = await identity(base);
     const opened = await (await fetch(base + 'bridge/open', { method: 'POST', headers: { cookie: id.cookie } })).json();
     check('D: HTTP relay opened', opened.ok === true && !!opened.id);
+    let health = await (await fetch(base + 'api/health')).json();
+    check('D: relay attached as a view of the account host', health.sessions.total === 1 && health.sessions.views === 1,
+      JSON.stringify(health.sessions));
     await sleep(350);
+    // pagehide / reload: the relay VIEW goes away, the host (mid-turn) does not.
+    // This used to be "defer the close while the agent is busy"; now the close
+    // can never touch the host at all, so the turn keeps running either way.
     await fetch(base + 'bridge/close?id=' + encodeURIComponent(opened.id), { method: 'POST', headers: { cookie: id.cookie } });
     await sleep(500);
-    let health = await (await fetch(base + 'api/health')).json();
-    check('D: close during an active relay is deferred, not killed', health.httpRelays === 1, 'httpRelays=' + health.httpRelays);
-    check('D: deferral is logged', srv.log.some((l) => l.includes('close deferred')));
+    health = await (await fetch(base + 'api/health')).json();
+    check('D: close drops the relay view', health.httpRelays === 0, 'httpRelays=' + health.httpRelays);
+    check('D: close keeps the host (an active turn is not killed)', health.sessions.total === 1, JSON.stringify(health.sessions));
+    check('D: close is logged as "host kept"', srv.log.some((l) => l.includes('host kept')));
     await sleep(4000);
     health = await (await fetch(base + 'api/health')).json();
-    check('D: relay is closed once it goes idle', health.httpRelays === 0, 'httpRelays=' + health.httpRelays);
+    // the sandbox TTL is short: the IDLE REAPER (not the page close) is what
+    // eventually reclaims it
+    check('D: the host is reclaimed later by the idle reaper, not by the page close',
+      health.sessions.total === 0 && srv.log.some((l) => l.includes('reaping idle detached host')),
+      JSON.stringify(health.sessions));
   }
 } catch (e) {
   console.log('FAIL  ' + (e && e.stack ? e.stack : e));

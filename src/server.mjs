@@ -203,6 +203,13 @@ function shortUserKey(userKey) {
 // has only a few hosts, and a missed reap is far cheaper than killing a turn.
 // 2026-10-18 postmortem: a plain "sleep longer" change cannot cover a model
 // request that stayed silent for 27 minutes, so the reaper needs these signals.
+//
+// Presence lease: a live page renews a per-tab lease over plain HTTP (see
+// /api/presence), independent of the websocket. A detached host with a fresh
+// lease is NOT reaped and its parked renderer era is NOT retired: the user is
+// still sitting on that tab and may come back hours later. That is what makes a
+// long background return a hot resume instead of a page reload. A closed page
+// stops renewing; the normal TTL/era cleanup then applies.
 const DETACHED_TTL_MS = process.env.ZCODE_WEBUI_DETACHED_TTL_MS === undefined
   ? 30 * 60 * 1000
   : Number(process.env.ZCODE_WEBUI_DETACHED_TTL_MS) || 0;
@@ -211,8 +218,15 @@ const RUNNING_TASK_STALE_MS = Number(process.env.ZCODE_WEBUI_RUNNING_TASK_STALE_
 const AGENT_WRITE_ACTIVE_MS = Math.max(1000, Number(process.env.ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS) || 10 * 60 * 1000);
 const MODEL_REQUEST_ACTIVE_MS = Math.max(60 * 1000, Number(process.env.ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS) || 2 * 60 * 60 * 1000);
 const REAP_INTERVAL_MS = Math.max(1000, Number(process.env.ZCODE_WEBUI_REAP_INTERVAL_MS) || 60 * 1000);
-const DEFERRED_RELAY_CLOSE_IDLE_MS = Math.max(1000, Number(process.env.ZCODE_WEBUI_DEFERRED_CLOSE_IDLE_MS) || 5 * 60 * 1000);
-const RELAY_CLOSE_RECENT_FRAME_MS = 5000;   // a pagehide after this much silence is not "mid-stream"
+const PRESENCE_LEASE_MS = process.env.ZCODE_WEBUI_PRESENCE_LEASE_MS === undefined
+  ? 30 * 60 * 1000
+  : Math.max(0, Number(process.env.ZCODE_WEBUI_PRESENCE_LEASE_MS) || 0);
+const PRESENCE_MAX_TABS = Math.max(1, Number(process.env.ZCODE_WEBUI_PRESENCE_MAX_TABS) || 32);
+// A frozen/bfcache page cannot send its 45 s heartbeat. The freeze/pagehide
+// beacon may carry a longer ttl so a mobile tab that is frozen for hours still
+// resumes hot instead of reloading; it is capped so a lost beacon cannot pin a
+// host forever.
+const PRESENCE_FROZEN_MAX_MS = Math.max(PRESENCE_LEASE_MS, Number(process.env.ZCODE_WEBUI_PRESENCE_FROZEN_MAX_MS) || 12 * 60 * 60 * 1000);
 // "a sibling host is actively driving turns" heuristic: protocol frames flowing
 // this recently mean the agent is mid-execution (streaming, tool calls, thinking)
 const ACTIVE_FRAME_MS = Math.max(Number(process.env.ZCODE_WEBUI_ACTIVE_FRAME_MS) || 120000, 15000);
@@ -245,11 +259,16 @@ const WS_PING_MAX_MISS = Math.max(1, Number(process.env.ZCODE_WEBUI_WS_PING_MAX_
 // reaper's only frame-liveness signal: a long turn looked idle from minute 10
 // and the 30-minute detached reaper killed it mid-turn (2026-10-18 postmortem).
 // The host reaper now owns cleanup; the replay buffer stays bounded.
+//
+// Sizing: 4096 frames / 32 MiB. The old 2048 / 16 MiB pair was hit regularly
+// by streamed turns; a single oversized RESPONSE frame is now skipped (and
+// answered with a synthesized retryable error on resume) instead of nuking the
+// whole gap, because losing one call is far cheaper than a full reload.
 const RESUME_PARK_MS = Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) === 0
   ? 0
   : Math.max(1000, Number(process.env.ZCODE_WEBUI_RESUME_PARK_MS) || 10 * 60 * 1000);
-const RESUME_BUF_MAX_BYTES = Math.max(64 * 1024, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_MB) || 16) * 1024 * 1024;
-const RESUME_BUF_MAX_FRAMES = Math.max(16, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES) || 2048);
+const RESUME_BUF_MAX_BYTES = Math.max(1, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_MB) || 32) * 1024 * 1024;
+const RESUME_BUF_MAX_FRAMES = Math.max(16, Number(process.env.ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES) || 4096);
 
 function zcodeHome() {
   return process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
@@ -486,7 +505,7 @@ function agentWorkActive(opts) {
     if (opts && opts.probe === false) return false;
     const pids = [];
     for (const s of sessions.values()) if (!s.closed && s.child) pids.push(s.child.pid);
-    for (const e of httpRelays.values()) if (!e.pipe.closed && e.pipe.child) pids.push(e.pipe.child.pid);
+    for (const e of httpRelays.values()) if (e.session && e.session.child) pids.push(e.session.child.pid);
     return hostTreeBusy(pids, 1000);
   })();
   return agentWorkActiveCache.promise;
@@ -1076,10 +1095,6 @@ async function spawnPipe() {
   return state;
 }
 
-async function openHostPipe() {
-  return spawnPipe();
-}
-
 // ---------- host sessions (multi-device live view) ----------
 // ONE host process per ACCOUNT (userKey). Every browser tab/device attaches as
 // a VIEW of that session:
@@ -1095,11 +1110,13 @@ const pendingSpawns = new Map();  // userKey -> Promise<session>: concurrent fir
                                   // coalesce onto ONE host instead of racing to spawn two
                                   // (the loser used to be overwritten in `sessions` and
                                   // became a host the reaper could never see again)
-const httpRelays = new Map();     // id -> {pipe, queue, waiter, waiterTimer, lastSeen} (HTTP long-poll fallback)
+const httpRelays = new Map();     // id -> relay view entry (HTTP long-poll fallback): {session, view, queue, waiter, ...}
 
 // hand one server-synthesised payload to the next /bridge/poll of a relay,
 // mirroring what pipe.onFrame does for host frames
 function queueRelayFrame(entry, payload) {
+  if (!entry || entry.closed) return;
+  entry.lastFrameAt = Date.now();
   if (entry.waiter) {
     const w = entry.waiter;
     entry.waiter = null;
@@ -1111,31 +1128,72 @@ function queueRelayFrame(entry, payload) {
   }
 }
 
-// pagehide used to close the HTTP relay immediately, killing whatever turn was
-// running on that host. Reloading a page while the agent is mid-turn therefore
-// looked exactly like a random interruption. Keep the host alive while the
-// agent is demonstrably busy; the relay reaper closes it once idle.
-async function requestRelayClose(id, entry, reason) {
-  if (!entry || !httpRelays.has(id) || entry.pipe.closed) return;
-  const now = Date.now();
-  const recentFrame = !!(entry.lastFrameAt && now - entry.lastFrameAt <= RELAY_CLOSE_RECENT_FRAME_MS);
-  let busy = recentFrame;
-  if (!busy) {
-    try { busy = await agentWorkActive({ fresh: true }); }
-    catch (_e) { busy = true; }   // fail-safe: never kill on an inconclusive check
-  }
-  if (busy) {
-    if (!entry.closeRequestedAt) {
-      entry.closeRequestedAt = now;
-      entry.closeReason = reason || 'client';
-      console.error('[bridge] close deferred id=' + id + ' (' + entry.closeReason +
-        ' while agent is active; relay kept until idle)');
-    }
-    return;
-  }
-  try { entry.pipe.close(); } catch (_e) { /* ignore */ }
-  httpRelays.delete(id);
-  console.error('[bridge] http session closed id=' + id + ' (' + (reason || 'client') + ')');
+// ---- view transports --------------------------------------------------------
+// One renderer page is one VIEW of the account's single host. Its transport is
+// either the page's websocket, or — when a proxy refuses or kills ws upgrades —
+// the HTTP long-poll relay (/bridge/open + /bridge/send + /bridge/poll).
+// BOTH must be views of the SAME host. A relay used to spawn a host of its own,
+// so a page that fell back mid-session kept talking to a host that had never
+// received its conversation handshake: every zcode-agent.* call then failed
+// with `fault.connection.handshakeRequired` ("handshake is required"), which is
+// why the composer's send button silently did nothing until a reload put the
+// page back on the original host.
+function wsTransport(ws) {
+  return {
+    kind: 'ws',
+    isOpen() { return !!ws && ws.readyState === 1; },
+    send(payload) { try { ws.send(payload, { binary: true }); return true; } catch (_e) { return false; } },
+    sendLine(line) { try { ws.send(String(line)); return true; } catch (_e) { return false; } },
+    close(code, reason) { try { ws.close(code, reason); } catch (_e) { /* ignore */ } },
+  };
+}
+// Relay control lines travel as ordinary length-prefixed payloads whose first
+// byte is '{' (renderer frames always start with an RPC preset byte 0..6), and
+// bootstrap.js routes those to the same handler as ws text messages.
+function relayTransport(entry) {
+  return {
+    kind: 'relay',
+    isOpen() { return !!entry && !entry.closed; },
+    send(payload) {
+      if (!entry || entry.closed) return false;
+      queueRelayFrame(entry, payload);
+      return true;
+    },
+    sendLine(line) {
+      if (!entry || entry.closed) return false;
+      queueRelayFrame(entry, Buffer.from(String(line)));
+      return true;
+    },
+    close() {
+      if (!entry) return;
+      entry.closed = true;
+      finishRelayWaiter(entry);
+    },
+  };
+}
+// release a pending long-poll immediately (the view is gone; an empty body makes
+// the page re-poll, which then fails over to the ws hot-resume path)
+function finishRelayWaiter(entry) {
+  if (!entry || !entry.waiter) return;
+  const w = entry.waiter;
+  entry.waiter = null;
+  clearTimeout(entry.waiterTimer);
+  w(null);
+}
+function viewIsOpen(view) {
+  return !!(view && view.transport && view.transport.isOpen());
+}
+function viewSend(view, payload) {
+  if (!viewIsOpen(view)) return false;
+  return view.transport.send(payload);
+}
+function viewSendLine(view, line) {
+  if (!viewIsOpen(view)) return false;
+  return view.transport.sendLine(line);
+}
+function viewDetach(view, code, reason) {
+  if (!view || !view.transport) return;
+  try { view.transport.close(code, reason); } catch (_e) { /* ignore */ }
 }
 
 function rpcLogOut(payload) {
@@ -1188,11 +1246,9 @@ function writeToHost(session, view, payload) {
     if (pinnedCall) {
       const ackId = session.mux ? ++session.mux.next : pinnedCall.id;
       const ack = pinAckFor(pinnedCall, ackId);
-      console.error('[bridge] pin no-op (ws) id=' + pinnedCall.id + ' — acked without forwarding');
+      console.error('[bridge] pin no-op id=' + pinnedCall.id + ' (' + (view.transport ? view.transport.kind : 'ws') + ') — acked without forwarding');
       if (session.mux) sendToView(session, { view, origId: pinnedCall.id }, { id: ackId }, ack);
-      else if (view.ws && view.ws.readyState === 1) {
-        try { view.ws.send(ack, { binary: true }); } catch (_e) { /* ignore */ }
-      }
+      else viewSend(view, ack);
       return true;
     }
   }
@@ -1281,9 +1337,7 @@ function viewsSnapshot(session, exceptTab) {
 function terminateSession(session, reason) {
   if (!session || session.closed) return;
   session.closed = true;
-  for (const [, v] of session.views) {
-    try { v.ws.close(1011, 'host terminated'); } catch (_e) { /* ignore */ }
-  }
+  for (const [, v] of session.views) viewDetach(v, 1011, 'host terminated');
   session.views.clear();
   const child = session.child;
   if (child && child.exitCode === null) {
@@ -1351,23 +1405,44 @@ function routeDownstream(session, payload) {
       if (v.holdBuf.length < 512) v.holdBuf.push(Buffer.from(payload));
       continue;
     }
-    const ws = v.ws;
-    if (ws && ws.readyState === 1) {
-      try { ws.send(payload, { binary: true }); } catch (_e) { /* ignore */ }
-    }
+    viewSend(v, payload);
   }
 }
 
 // Queue one downstream frame into a parked era's replay buffer (see
 // RESUME_PARK_MS above). Returns false when buffering is disabled or the gap
 // already overflowed — the frame is then simply lost, as it always was.
-function bufferForResume(view, out) {
+//
+// One pathological frame must not cost the whole gap: a call response can be
+// arbitrarily large (file contents, screenshots, diffs). If it alone would
+// overflow the byte cap we skip just that response and remember it, then answer
+// the renderer's call with a retryable error on resume. Events still overflow
+// the gap as before (dropping an event would silently corrupt state).
+function bufferForResume(view, out, hdr, entry) {
   if (!view.parkedAt || RESUME_PARK_MS <= 0 || view.resumeOverflow) return false;
-  if (view.resumeBuf.length >= RESUME_BUF_MAX_FRAMES || view.resumeBytes + out.length > RESUME_BUF_MAX_BYTES) {
+  const countFull = view.resumeBuf.length >= RESUME_BUF_MAX_FRAMES;
+  const bytesFull = view.resumeBytes + out.length > RESUME_BUF_MAX_BYTES;
+  if (countFull || bytesFull) {
+    const isResponse = !!(hdr && (hdr.type === 201 || hdr.type === 202 || hdr.type === 203));
+    if (bytesFull && !countFull && isResponse && entry && typeof entry.origId === 'number') {
+      if (!view.resumeLostResponses) view.resumeLostResponses = [];
+      if (view.resumeLostResponses.length >= 256) view.resumeLostResponses.shift();
+      view.resumeLostResponses.push({ origId: entry.origId, bytes: out.length, type: hdr.type, at: Date.now() });
+      console.error('[ws] offline gap: skipped oversized response tab=' + view.tabId.slice(0, 8) +
+        ' bytes=' + out.length + ' type=' + hdr.type + ' origId=' + entry.origId +
+        ' (kept ' + view.resumeBuf.length + ' frame(s)/' + view.resumeBytes + 'B; will synthesize a retryable error on resume)');
+      return true;
+    }
+    const droppedFrames = view.resumeBuf.length;
+    const droppedBytes = view.resumeBytes;
     view.resumeOverflow = true;
     view.resumeBuf.length = 0;
     view.resumeBytes = 0;
+    if (view.resumeLostResponses) view.resumeLostResponses.length = 0;
     console.error('[ws] resume gap buffer overflowed tab=' + view.tabId.slice(0, 8) +
+      ' — frames=' + droppedFrames + ' bytes=' + droppedBytes +
+      ' incoming=' + out.length + 'B' +
+      (hdr ? ' type=' + hdr.type : '') +
       ' — the next resume of this tab will be forced to reload');
     return false;
   }
@@ -1393,14 +1468,11 @@ function sendToView(session, entry, hdr, payload) {
     return;
   }
   if (session.views.get(view.tabId) === view) {
-    const ws = view.ws;
-    if (ws && ws.readyState === 1) {
-      try { ws.send(out, { binary: true }); return; } catch (_e) { /* socket died mid-send — buffer below */ }
-    }
-    bufferForResume(view, out);                    // closed socket, close event not fired yet
+    if (viewIsOpen(view) && viewSend(view, out)) return;
+    bufferForResume(view, out, hdr, entry);        // transport died mid-send / close event not fired yet
     return;
   }
-  if (view.parkedAt) bufferForResume(view, out);
+  if (view.parkedAt) bufferForResume(view, out, hdr, entry);
 }
 
 // Tear down a view's host-side event subscriptions by sending EventDispose
@@ -1422,10 +1494,9 @@ function disposeViewEvents(session, view) {
 function releaseHold(view) {
   if (!view || !view.holdFrames) return;
   view.holdFrames = false;
-  const ws = view.ws;
-  if (ws && ws.readyState === 1) {
+  if (viewIsOpen(view)) {
     for (const p of view.holdBuf.splice(0)) {
-      try { ws.send(p, { binary: true }); } catch (_e) { break; }
+      if (!viewSend(view, p)) break;
     }
   } else {
     view.holdBuf.length = 0;
@@ -1451,10 +1522,7 @@ function readyLine(session) {
 function broadcastStartupState(session, state) {
   if (!state) return;
   const line = startupLine(state);
-  for (const [, v] of session.views) {
-    const ws = v.ws;
-    if (ws && ws.readyState === 1) { try { ws.send(line); } catch (_e) { /* ignore */ } }
-  }
+  for (const [, v] of session.views) viewSendLine(v, line);
 }
 
 async function createSession(userKey, tabId) {
@@ -1482,6 +1550,8 @@ async function createSession(userKey, tabId) {
     activeConvSession: '',                  // mode-boost: sessionId from the latest renderer conversation command
     lastTopicSession: '',                   // mode-boost: sessionId from the latest conversation topic frame
     injectedNext: 0,                        // mode-boost: counter for server-injected host calls
+    presenceTabs: new Map(),                // tabId -> {at,state}: live page leases (see /api/presence)
+    presenceAt: 0,                          // last lease renewal of any tab
   };
   console.error('[zcode-webui] host spawned pid=' + child.pid + ' layout=' + pipe.kind +
     (pipe.kind === 'host16' ? ' version=' + (pipe.hello.version || '?') : '') +
@@ -1516,9 +1586,7 @@ async function createSession(userKey, tabId) {
   };
   pipe.onExit = (code, signal) => {
     session.closed = true;
-    for (const [, v] of session.views) {
-      try { v.ws.close(1011, 'host exited'); } catch (_e) { /* ignore */ }
-    }
+    for (const [, v] of session.views) viewDetach(v, 1011, 'host exited');
     session.views.clear();
     console.error('[zcode-webui] host exited pid=' + child.pid + ' code=' + code + ' signal=' + signal);
     // Only remove the CURRENT session for this userKey. A slow-to-die host from
@@ -1560,6 +1628,49 @@ function rebindView(session, tabId) {
   session.primaryTab = tabId;
 }
 
+// Presence lease bookkeeping (see /api/presence and the reaper below). Entries
+// are tiny and capped; a closing beacon removes the tab immediately, a lost
+// beacon simply ages out of the lease window.
+function notePresence(session, tabId, state, closing, renewOnly, ttlMs) {
+  if (!session || session.closed || !tabId) return;
+  const now = Date.now();
+  if (!session.presenceTabs) session.presenceTabs = new Map();
+  if (closing) {
+    session.presenceTabs.delete(tabId);
+    session.presenceAt = now;
+    return;
+  }
+  // A raw websocket is not a page lease: only the page's HTTP heartbeat creates
+  // one. WS traffic merely keeps an existing lease fresh (a socket-only client
+  // that vanishes without a closing beacon must not pin the host for 30 min).
+  const requestedTtl = Math.max(0, Number(ttlMs) || 0);
+  const until = now + (requestedTtl > 0 ? Math.min(requestedTtl, PRESENCE_FROZEN_MAX_MS) : PRESENCE_LEASE_MS);
+  const prev = session.presenceTabs.get(tabId);
+  if (renewOnly && !prev) return;
+  // High-rate binary frames also renew the lease; don't rewrite the entry for
+  // every one of them (the 45 s HTTP heartbeat is the normal renewal path).
+  // A freeze/bfcache beacon (requestedTtl > 0) must always win, even if a frame
+  // renewed the entry a second earlier.
+  if (prev && now - prev.at < 5000 && requestedTtl <= 0) return;
+  if (!session.presenceTabs.has(tabId) && session.presenceTabs.size >= PRESENCE_MAX_TABS) {
+    let oldestId = null, oldestAt = Infinity;
+    for (const [id, p] of session.presenceTabs) {
+      if (p.at < oldestAt) { oldestAt = p.at; oldestId = id; }
+    }
+    if (oldestId !== null) session.presenceTabs.delete(oldestId);
+  }
+  session.presenceTabs.set(tabId, { at: now, until, state: String(state || '') });
+  session.presenceAt = now;
+}
+function hasFreshPresence(session, now) {
+  if (PRESENCE_LEASE_MS <= 0 || !session || !session.presenceTabs) return false;
+  for (const [, p] of session.presenceTabs) {
+    const until = p.until || (p.at + PRESENCE_LEASE_MS);
+    if (until > now) return true;
+  }
+  return false;
+}
+
 // Idle-session reaper: a session whose views have ALL gone away parks detached;
 // after the TTL it is reaped unless it is verifiably still working. The busy
 // check is global and covers frames, tasks-index, CLI DB writes, an in-flight
@@ -1570,6 +1681,11 @@ if (DETACHED_TTL_MS > 0) {
     if (await agentWorkActive()) return;   // global busy-guard
     for (const s of [...sessions.values()]) {
       if (s.closed || s.views.size > 0 || !s.detachedAt) continue;
+      // A live page keeps its host even with no socket: the tab may be in the
+      // background for hours and still come back to a hot resume. Only when the
+      // lease stops being renewed (page closed / browser killed) does the
+      // normal TTL apply.
+      if (hasFreshPresence(s, now)) continue;
       if (now - s.detachedAt <= DETACHED_TTL_MS) continue;
       if (s.lastFrameAt && now - s.lastFrameAt <= FRAME_QUIET_MS) continue;
       console.error('[zcode-webui] reaping idle detached host pid=' + s.child.pid +
@@ -1580,46 +1696,27 @@ if (DETACHED_TTL_MS > 0) {
   }, REAP_INTERVAL_MS).unref();
 }
 
-// HTTP fallback relays are NOT protected by the sessions reaper above; without
-// this every abandoned long-poll page would keep a full host alive forever.
-// Close relays whose client has not polled/sent recently, but skip the ones that
-// are demonstrably mid-stream (their own frames arrived within ACTIVE_FRAME_MS).
-//
-// This used to consult the GLOBAL busy-guard instead ("a turn is still running
-// somewhere"), which was safe with the 80 MB <= 3.15 hosts but leaks badly with
-// the >= 3.16 ones (inline host bundle + per-workspace agent, ~500 MB per relay):
-// while the user works continuously in one tab, every abandoned relay host
-// survives forever — three such hosts (1.4 GB) were found alive 1-2 h after
-// their pages were gone. A per-relay check keeps the original protection (never
-// kill a relay that is streaming) without holding every other relay hostage.
-// A close requested by pagehide gets a shorter idle grace
-// (DEFERRED_RELAY_CLOSE_IDLE_MS) once that relay's host is quiet, instead of
-// killing an in-flight turn on reload.
+// A relay is a VIEW now, not a host of its own (see attachView): an abandoned
+// long-poll page must lose its VIEW, never the account's host — the host may be
+// running a turn for the user's other tab. Detaching here also parks the era, so
+// a page that comes back after the TTL still gets its frames replayed while the
+// session reaper above (frames / tasks-index / CLI DB / model request / CPU
+// probe) remains the only place allowed to kill a host.
 if (HTTP_RELAY_TTL_MS > 0) {
-  setInterval(async () => {
+  setInterval(() => {
     const now = Date.now();
-    const idle = [];
     for (const [id, entry] of httpRelays) {
-      if (entry.pipe.closed) { httpRelays.delete(id); continue; }
-      const age = now - entry.lastSeen;
-      const closeAge = entry.closeRequestedAt ? now - entry.closeRequestedAt : 0;
-      const deferred = !!(entry.closeRequestedAt && closeAge > DEFERRED_RELAY_CLOSE_IDLE_MS);
-      if (age > HTTP_RELAY_TTL_MS || deferred) idle.push([id, entry, age, deferred]);
-    }
-    if (idle.length === 0) return;
-    for (const [id, entry, age, deferred] of idle) {
-      if (!httpRelays.has(id) || entry.pipe.closed) continue;
-      const ageNow = Date.now() - entry.lastSeen;
-      if (!deferred && ageNow <= HTTP_RELAY_TTL_MS) continue;
-      // A deferred pagehide close waits for the turn to settle, not for a
-      // permanently silent poller: idle event frames must not keep it alive.
-      if (deferred && Date.now() - entry.closeRequestedAt <= DEFERRED_RELAY_CLOSE_IDLE_MS) continue;
-      // this relay's OWN host is streaming: it is running a turn, keep it
-      if (entry.lastFrameAt && Date.now() - entry.lastFrameAt <= ACTIVE_FRAME_MS) continue;
-      console.error('[bridge] reaping idle http relay id=' + id +
-        ' (idle ' + Math.round(ageNow / 1000) + 's' + (deferred ? ', deferred pagehide close' : '') + ')');
-      try { entry.pipe.close(); } catch (_e) { /* ignore */ }
+      if (entry.closed) { httpRelays.delete(id); continue; }
+      if (now - entry.lastSeen <= HTTP_RELAY_TTL_MS) continue;
+      // this relay's host frames are still flowing: the page may be gone but its
+      // turn is streaming — keep the view (and its buffered replay) alive
+      if (entry.lastFrameAt && now - entry.lastFrameAt <= ACTIVE_FRAME_MS) continue;
+      console.error('[bridge] detaching idle http relay id=' + id +
+        ' (idle ' + Math.round((now - entry.lastSeen) / 1000) + 's)');
+      entry.closed = true;
+      finishRelayWaiter(entry);
       httpRelays.delete(id);
+      if (entry.view && entry.session) detachView(entry.session, entry.view, 'relay-idle');
     }
   }, REAP_INTERVAL_MS).unref();
 }
@@ -1645,7 +1742,8 @@ const HTTP_LOG_SKIP = new Set(['/api/background', '/api/process-metrics', '/brid
 function handleRequest(req, res) {
   // request logging (diagnostics)
   const logPathOnly = (req.url || '').split('?')[0];
-  const skipHttpLog = req.method === 'GET' && HTTP_LOG_SKIP.has(logPathOnly);
+  const skipHttpLog = (req.method === 'GET' && HTTP_LOG_SKIP.has(logPathOnly)) ||
+    (req.method === 'POST' && logPathOnly === '/api/presence');
   if (!skipHttpLog && !req.url.startsWith('/assets/') && !req.url.startsWith('/material-icons/') && !req.url.startsWith('/pdfjs/')) {
     console.error('[http] ' + new Date().toISOString() + ' ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' ' + req.method + ' ' + req.url + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
   }
@@ -1731,6 +1829,7 @@ function handleRequest(req, res) {
         total: all.filter((s) => !s.closed).length,
         views: all.reduce((n, s) => n + (s.closed ? 0 : s.views.size), 0),
         detached: all.filter((s) => !s.closed && s.views.size === 0).length,
+        presence: all.reduce((n, s) => n + (!s.closed && s.presenceTabs ? s.presenceTabs.size : 0), 0),
       },
       reaper: { enabled: DETACHED_TTL_MS > 0, ttlMs: DETACHED_TTL_MS, intervalMs: REAP_INTERVAL_MS },
       httpRelays: httpRelays.size,
@@ -1765,66 +1864,63 @@ function handleRequest(req, res) {
   }
 
   // ---- HTTP fallback bridge (long-polling, works through any reverse proxy) ----
+  // HTTP fallback transport. It does NOT get a host of its own: a page that
+  // falls back mid-session (proxy killed the ws upgrade) must keep talking to
+  // the host that already has its conversation handshake, or every
+  // zcode-agent.* call fails with fault.connection.handshakeRequired. The relay
+  // is therefore just another VIEW of the account's session (see attachView).
   if (urlPath === '/bridge/open' && req.method === 'POST') {
-    return openHostPipe().then((pipe) => {
-      const id = randomUUID();
-      const entry = {
-        pipe, queue: [], waiter: null, waiterTimer: null,
-        lastSeen: Date.now(), lastFrameAt: 0, closeRequestedAt: 0, closeReason: '',
-      };
-      pipe.onFrame = (payload) => {
-        const now = Date.now();
-        entry.lastSeen = now;
-        entry.lastFrameAt = now;
-        if (entry.waiter) {
-          const w = entry.waiter;
-          entry.waiter = null;
-          clearTimeout(entry.waiterTimer);
-          w(payload);
-        } else {
-          entry.queue.push(payload);
-          if (entry.queue.length > 256) entry.queue.shift();
-        }
-      };
-      pipe.onStartupState = (state) => { entry.startupState = state; };
-      pipe.onExit = () => {
-        if (entry.waiter) {
-          const w = entry.waiter;
-          entry.waiter = null;
-          clearTimeout(entry.waiterTimer);
-          w(null);
-        }
-        httpRelays.delete(id);
-      };
-      if (HTTP_RELAY_MAX > 0) {
+    const q2 = new URL(req.url, 'http://x').searchParams;
+    const tabId = (q2.get('tab') || ('relay-' + randomUUID().slice(0, 8))).slice(0, 128);
+    const resume = q2.get('resume') === '1';
+    const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+    const userKey = resolveUserKey(clientKey);
+    return ensureSession(userKey, tabId).then(({ session, adopted }) => {
+      if (session.closed || !session.child || session.child.exitCode !== null) {
+        return sendJson(res, 503, { ok: false, error: 'host unavailable' });
+      }
+      // Bound concurrent relays by detaching the oldest idle VIEW — never by
+      // killing a host: with one host per account a relay can no longer be
+      // "closed" on its own, and an active relay's frames are never interrupted.
+      if (HTTP_RELAY_MAX > 0 && httpRelays.size >= HTTP_RELAY_MAX) {
         const now = Date.now();
         let oldest = null;
         for (const [rid, e] of httpRelays) {
-          // Never evict a relay that is demonstrably mid-turn or already waiting
-          // for an idle close; killing one here is exactly the interruption this
-          // reaper fix is about.
-          if (e.closeRequestedAt) continue;
-          if (e.lastFrameAt && now - e.lastFrameAt < ACTIVE_FRAME_MS) continue;
+          if (e.lastFrameAt && now - e.lastFrameAt < ACTIVE_FRAME_MS) continue;   // demonstrably live
           if (!oldest || e.lastSeen < oldest.entry.lastSeen) oldest = { id: rid, entry: e };
         }
-        const hardMax = HTTP_RELAY_MAX * 2;
-        if (httpRelays.size >= HTTP_RELAY_MAX && !oldest && httpRelays.size >= hardMax) {
-          for (const [rid, e] of httpRelays) {
-            if (!oldest || e.lastSeen < oldest.entry.lastSeen) oldest = { id: rid, entry: e };
-          }
-        }
-        if (oldest && httpRelays.size >= HTTP_RELAY_MAX) {
-          console.error('[bridge] closing oldest http relay id=' + oldest.id + ' (max ' + HTTP_RELAY_MAX + ' reached)');
-          try { oldest.entry.pipe.close(); } catch (_e) { /* ignore */ }
+        if (oldest) {
+          console.error('[bridge] detaching oldest idle http relay id=' + oldest.id + ' (max ' + HTTP_RELAY_MAX + ' reached)');
+          oldest.entry.closed = true;
+          finishRelayWaiter(oldest.entry);
           httpRelays.delete(oldest.id);
-        } else if (httpRelays.size >= HTTP_RELAY_MAX) {
+          if (oldest.entry.view) detachView(oldest.entry.session, oldest.entry.view, 'relay-evicted');
+        } else {
           console.error('[bridge] all ' + httpRelays.size + ' http relays look active; allowing one extra (' + HTTP_RELAY_MAX + ' soft cap)');
         }
       }
+      const id = randomUUID();
+      const entry = {
+        id, session, view: null, queue: [], waiter: null, waiterTimer: null, closed: false,
+        lastSeen: Date.now(), lastFrameAt: 0,
+      };
+      const attached = attachView(session, tabId, relayTransport(entry), { adopted, resume });
+      if (attached.staleEra) {
+        // the page booted before and this host no longer holds its era: its event
+        // subscriptions can never be restored, so force the clean path (reload)
+        console.error('[bridge] stale-era relay resume rejected tab=' + tabId.slice(0, 8) + ' — forcing page reload');
+        return sendJson(res, 200, { ok: false, staleEra: true, error: 'era gone' });
+      }
+      entry.view = attached.view;
       httpRelays.set(id, entry);
-      console.error('[bridge] http session opened id=' + id + ' host=' + pipe.hello.version);
+      const pipe = session.pipe;
+      console.error('[bridge] http session opened id=' + id + ' host=' + (pipe.hello.version || '?') +
+        ' pid=' + session.child.pid + (adopted ? ' (adopted)' : ' (spawned)'));
+      viewSendLine(attached.view, readyLine(session));
+      if (pipe.kind === 'host16' && session.lastStartupState) viewSendLine(attached.view, startupLine(session.lastStartupState));
+      if (attached.gapDeclared) viewSendLine(attached.view, '{"kind":"zcode-webui-gap"}');
       sendJson(res, 200, {
-        ok: true, id, hostVersion: pipe.hello.version,
+        ok: true, id, hostVersion: pipe.hello.version || null, pid: session.child.pid,
         startupMode: pipe.kind === 'host16' ? 'runtime' : 'synthetic',
         startupId: pipe.kind === 'host16' ? pipe.startupId : null,
       });
@@ -1836,18 +1932,20 @@ function handleRequest(req, res) {
   if (urlPath === '/bridge/state' && req.method === 'GET') {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
     const entry = httpRelays.get(id);
-    if (!entry) return sendJson(res, 404, { ok: false, error: 'session gone' });
+    if (!entry || entry.closed) return sendJson(res, 404, { ok: false, error: 'session gone' });
+    const s = entry.session;
+    const pipe = s && s.pipe;
     return sendJson(res, 200, {
       ok: true,
-      startupMode: entry.pipe.kind === 'host16' ? 'runtime' : 'synthetic',
-      startupId: entry.pipe.kind === 'host16' ? entry.pipe.startupId : null,
-      state: entry.startupState || null,
+      startupMode: pipe && pipe.kind === 'host16' ? 'runtime' : 'synthetic',
+      startupId: pipe && pipe.kind === 'host16' ? pipe.startupId : null,
+      state: (s && s.lastStartupState) || null,
     });
   }
   if (urlPath === '/bridge/send' && req.method === 'POST') {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
     const entry = httpRelays.get(id);
-    if (!entry || entry.pipe.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
+    if (!entry || entry.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
     entry.lastSeen = Date.now();
     const chunks = [];
     let bodyBytes = 0;
@@ -1865,16 +1963,15 @@ function handleRequest(req, res) {
     req.on('end', () => {
       if (overflowed) return;
       const payload = Buffer.concat(chunks);
-      // same pin no-op as the WS path: this relay pushes straight into its own
-      // host pipe, so without this check a page on the HTTP fallback could still
-      // pin a task (and lose it from the list)
-      const pinnedCall = interceptPinRpc(payload);
-      if (pinnedCall) {
-        console.error('[bridge] pin no-op (http relay) id=' + pinnedCall.id + ' — acked without forwarding');
-        queueRelayFrame(entry, pinAckFor(pinnedCall, pinnedCall.id));
-        return sendJson(res, 200, { ok: true });
+      notePresence(entry.session, entry.view.tabId, 'relay', false, true);
+      // transport control lines ('{' …) are not host frames: same handling as the
+      // ws text messages (port-ready releases the Initialize hold, ping → pong)
+      if (payload.length > 0 && payload[0] === 0x7b) {
+        if (handleViewControl(entry.session, entry.view, payload.toString('utf8'))) {
+          return sendJson(res, 200, { ok: true });
+        }
       }
-      const ok = entry.pipe.push(payload);
+      const ok = !entry.session.closed && writeToHost(entry.session, entry.view, payload);
       sendJson(res, ok ? 200 : 410, { ok });
     });
     return;
@@ -1882,8 +1979,9 @@ function handleRequest(req, res) {
   if (urlPath === '/bridge/poll' && req.method === 'GET') {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
     const entry = httpRelays.get(id);
-    if (!entry || entry.pipe.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
+    if (!entry || entry.closed) return sendJson(res, 410, { ok: false, error: 'session gone' });
     entry.lastSeen = Date.now();
+    notePresence(entry.session, entry.view.tabId, 'relay', false, true);
     const hdrs = { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' };
     const frames = entry.queue.splice(0, entry.queue.length);
     if (frames.length > 0) {
@@ -1924,11 +2022,14 @@ function handleRequest(req, res) {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
     const entry = httpRelays.get(id);
     if (entry) {
-      // Async: an active turn defers the close to the relay reaper instead of
-      // killing the host on pagehide/reload. The response is immediate either way.
-      requestRelayClose(id, entry, 'client close').catch((e) => {
-        console.error('[bridge] close check failed id=' + id + ': ' + ((e && e.message) || e));
-      });
+      // pagehide / reload: drop this page's VIEW only. The host keeps running
+      // (a turn started from this page must not die on reload), and detaching
+      // parks the era so a returning page resumes hot instead of reloading.
+      entry.closed = true;
+      finishRelayWaiter(entry);
+      httpRelays.delete(id);
+      if (entry.view && entry.session) detachView(entry.session, entry.view, 'relay-close');
+      console.error('[bridge] http relay closed id=' + id + ' (page gone; host kept)');
     }
     return sendJson(res, 200, { ok: true });
   }
@@ -1949,12 +2050,34 @@ function handleRequest(req, res) {
     }
     for (const s of targets) terminateSession(s, scopeUser ? 'user terminate' : 'api terminate');
     if (!scopeUser) {
-      for (const [, entry] of httpRelays) {
-        try { entry.pipe.close(); } catch (_e) { /* ignore */ }
-      }
+      // relays are views now — their hosts were terminated above; just release
+      // the long-polls so those pages learn the session is gone
+      for (const [, entry] of httpRelays) { entry.closed = true; finishRelayWaiter(entry); }
       httpRelays.clear();
     }
     return sendJson(res, 200, { ok: true, terminated: targets.length });
+  }
+
+  // Presence lease from a live page (bootstrap.js heartbeat). This is the one
+  // signal that survives a dead websocket: it tells the reaper "the tab is
+  // still open, keep the host and its parked era for a hot resume". Without it
+  // a long-backgrounded tab was reaped and forced a full page reload on return.
+  // Deliberately tiny + best-effort; an unknown/expired session just says so.
+  if (urlPath === '/api/presence' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    req.on('end', () => {
+      let j = {};
+      try { j = JSON.parse(body || '{}') || {}; } catch (_e) { /* malformed body */ }
+      const clientKey = parseCookies(req.headers.cookie)[CLIENT_COOKIE] || '';
+      const userKey = resolveUserKey(clientKey);
+      const sess = sessions.get(userKey);
+      const tab = String(j.tab || '').slice(0, 128);
+      const alive = !!(sess && !sess.closed);
+      if (alive && tab) notePresence(sess, tab, j.state, !!j.closing, false, j.ttlMs);
+      return sendJson(res, 200, { ok: true, session: alive, tab: tab.slice(0, 8) });
+    });
+    return;
   }
 
   // background-execution visibility for the current account: lets a freshly
@@ -2267,6 +2390,234 @@ server.on('upgrade', (req, socket, head) => {
   })();
 });
 
+// ---- attach one page as a VIEW of the session host --------------------------
+// Transport-agnostic: the websocket handler and the HTTP relay both come through
+// here, so a page that swaps transports keeps talking to the SAME host — its
+// conversation handshake, mux ids and event subscriptions survive the swap.
+// Returns { view, staleEra, gapDeclared }. staleEra means "this page booted
+// before and the server no longer holds its era" → the caller must send the page
+// back through a full reload (ws: close 4000; relay: staleEra in the open reply).
+function attachView(session, tabId, transport, opts) {
+  const adopted = !!(opts && opts.adopted);
+  const resume = !!(opts && opts.resume);
+  // resume=1 means the page instance already bootstrapped once, so its event
+  // subscriptions are "live" from its point of view and it will NEVER re-send
+  // EventListen. If this session holds no era of this tab (server restart, host
+  // reaped and re-spawned by another page), those subscriptions can never be
+  // restored — events would silently stop. Force the clean path instead.
+  if (resume && !session.eraByTab.get(tabId)) return { view: null, staleEra: true, gapDeclared: false };
+
+  // ---- build this page's view ----
+  const view = {
+    tabId, transport,
+    ws: transport.kind === 'ws' ? ((opts && opts.ws) || null) : null,
+    sent: new Set(),                       // globalIds this renderer is awaiting
+    holdFrames: false, holdBuf: [], holdSkipOnce: false, replayInitOnCapture: false,
+    lastFrameAt: 0,
+    missed: 0,                             // consecutive unanswered keepalive pings
+    parkedAt: 0,                           // transport gone, era parked in eraByTab (resume replay active)
+    resumeBuf: [], resumeBytes: 0, resumeOverflow: false,
+    resumeLostResponses: [],               // oversized response frames skipped while parked (synthesized as retryable errors on resume)
+  };
+  // prevView is the previous renderer era of this tab — looked up in eraByTab
+  // because the close handler may already have removed it from views (the close
+  // of a hot-reconnecting socket always races the reconnect)
+  const prevView = session.eraByTab.get(tabId) || null;
+  // A resume whose offline gap overflowed the replay buffer cannot be bridged:
+  // the renderer would see a hole in its event stream and quietly go stale. Send
+  // it down the established recovery path instead (page reload).
+  // Checked BEFORE any state mutation so the half-attached view leaves no trace.
+  let gapDeclared = false;
+  if (resume && prevView && prevView.resumeOverflow) {
+    // The offline gap cannot be bridged, but a reload is a heavy answer: keep
+    // the renderer alive, drop the (already truncated) replay buffer and tell
+    // the page that some events were lost — it shows a "重新同步" action.
+    console.error('[view] resume after offline gap overflow tab=' + tabId.slice(0, 8) +
+      ' — continuing in-page and declaring the gap (' + prevView.resumeBuf.length + ' frame(s) dropped)');
+    prevView.resumeOverflow = false;
+    prevView.resumeBuf.length = 0;
+    prevView.resumeBytes = 0;
+    gapDeclared = true;
+  }
+  if (adopted && !resume) {
+    // fresh renderer bootstrapping against a mid-stream host: gate downstream
+    // until its port-ready ack (or failsafe) so it sees Initialize first
+    view.holdFrames = true;
+    view.holdBuf = [];
+    if (session.firstDownstream) view.holdBuf.push(Buffer.from(session.firstDownstream));
+    else view.replayInitOnCapture = true;
+    setTimeout(() => releaseHold(view), 8000).unref();
+  }
+  if (session.mux && prevView && prevView !== view) {
+    if (resume) {
+      // hot reconnect of the SAME live renderer: its era continues — re-point
+      // the ownership records at the new transport or responses/fires for its
+      // in-flight calls and subscriptions would be dropped forever
+      for (const [, e] of session.mux.pending) if (e.view === prevView) e.view = view;
+      for (const [, e] of session.mux.events) if (e.view === prevView) e.view = view;
+    } else {
+      // fresh renderer era of this tab: the old renderer is gone without the
+      // host ever noticing, so explicitly unsubscribe its events (calls just
+      // expire — their stale responses are dropped by the mux)
+      disposeViewEvents(session, prevView);
+      for (const [gid, e] of session.mux.pending) if (e.view === prevView) {
+        session.mux.pending.delete(gid);
+        prevView.sent.delete(gid);
+      }
+      prevView.sent.clear();
+      prevView.holdBuf.length = 0;           // eraByTab keeps the object alive — drop its buffers
+      prevView.resumeBuf.length = 0;         // a fresh era replays nothing from the old one
+      prevView.resumeBytes = 0;
+      if (prevView.resumeLostResponses) prevView.resumeLostResponses.length = 0;
+    }
+  }
+  session.views.set(tabId, view);
+  session.eraByTab.set(tabId, view);
+  session.detachedAt = 0;
+  notePresence(session, tabId, transport.kind, false, true);
+  // resume replay: flush the frames buffered while this tab's transport was gone
+  // BEFORE any new downstream frame can be sent — transport send ordering then
+  // preserves the era's original sequence. (prevView parked buffers only; the
+  // new view starts with an empty one.)
+  if (resume && prevView && prevView !== view) {
+    const gap = prevView.resumeBuf.splice(0);
+    const gapBytes = prevView.resumeBytes;
+    prevView.resumeBytes = 0;
+    if (gap.length > 0) {
+      console.error('[view] resume replay tab=' + tabId.slice(0, 8) + ': ' + gap.length +
+        ' buffered frame(s), ' + gapBytes + 'B, covering the offline gap');
+      for (const p of gap) { if (!viewSend(view, p)) break; }
+    }
+    // Calls this tab had in flight when its transport dropped, whose responses
+    // never made it out (emitted into the dying transport) would hang the
+    // renderer FOREVER — the official client has no per-call timeout on this
+    // path, and consumers like the file tree dedup further clicks on a
+    // "loading" flag that only a completed response clears ("folder won't open
+    // until refresh"). Answer them with a synthesized timeout error: the
+    // renderer surfaces a retryable error instead, and the host's (possibly
+    // late) real response is dropped by the mux as stale. Calls queued while
+    // offline arrive AFTER this point (fresh pending.at) and are untouched.
+    if (session.mux && prevView.parkedAt) {
+      const stale = [];
+      for (const [gid, e] of session.mux.pending) {
+        if (e.view === view && !e.injected && e.at && e.at <= prevView.parkedAt) stale.push([gid, e]);
+      }
+      if (stale.length > 0) {
+        console.error('[view] resume tab=' + tabId.slice(0, 8) + ': synthesizing timeout errors for ' +
+          stale.length + ' in-flight call(s) lost across the disconnect');
+        for (const [gid, e] of stale) {
+          session.mux.pending.delete(gid);
+          view.sent.delete(gid);
+          session.mux.dropped++;
+          try { sendToView(session, e, { id: gid }, errorAckFor(gid, 'zcode-webui: response lost during disconnect (synthesized timeout)')); } catch (_e) { /* view may close again immediately */ }
+        }
+      }
+    }
+    // Responses skipped while parked because they alone exceeded the replay
+    // byte cap (or would have pushed the buffer over). The renderer is still
+    // awaiting those calls; answer them with a retryable error so its UI does
+    // not hang, instead of dropping the whole gap and forcing a reload.
+    if (prevView.resumeLostResponses && prevView.resumeLostResponses.length > 0) {
+      const lost = prevView.resumeLostResponses.splice(0);
+      console.error('[view] resume tab=' + tabId.slice(0, 8) + ': synthesizing retryable errors for ' +
+        lost.length + ' oversized response(s) skipped during the gap');
+      for (const item of lost) {
+        try {
+          sendToView(session, { view, origId: item.origId }, { id: item.origId },
+            errorAckFor(item.origId, 'zcode-webui: response too large for the offline replay buffer (' +
+              item.bytes + 'B, type ' + item.type + '); please retry after reconnect'));
+        } catch (_e) { /* view may close again immediately */ }
+      }
+    }
+  }
+  return { view, staleEra: false, gapDeclared };
+}
+
+// Leave a view: park its era so a hot resume (ws or relay) can replay the gap.
+// Shared by the ws close handler and /bridge/close — with one host per account,
+// "this page is gone" can no longer mean "kill the host".
+function detachView(session, view, reason) {
+  if (!session || !view) return;
+  if (session.views.get(view.tabId) !== view) return;     // superseded by a newer view
+  session.views.delete(view.tabId);
+  view.sent.clear();
+  view.holdBuf.length = 0;               // eraByTab keeps the object alive — drop its buffers
+  view.holdFrames = false;               // never mounted or still holding: parked buffering takes over
+  view.parkedAt = Date.now();            // era parks: downstream frames buffer for resume replay
+  if (session.views.size === 0) {
+    if (session.framesIn === 0 && session.framesOut === 0) {
+      console.error('[' + reason + '] closed before traffic, terminating host pid=' + session.child.pid);
+      terminateSession(session, 'closed before traffic');
+      return;
+    }
+    session.detachedAt = Date.now();
+    console.error('[' + reason + '] DETACHED (host keeps running) pid=' + session.child.pid + ' views=0 frames in=' + session.framesIn + ' out=' + session.framesOut);
+  } else {
+    console.error('[' + reason + '] view gone tab=' + view.tabId.slice(0, 8) + ' — ' + session.views.size + ' viewer(s) remain');
+  }
+}
+
+// One inbound CONTROL line from a page (a ws text message, or a JSON payload in
+// the relay frame stream). Returns true when the line was a control message.
+function handleViewControl(session, view, text) {
+  const ctrl = String(text);
+  if (ctrl === '{"kind":"zcode-webui-port-ready"}') {
+    releaseHold(view);
+    // replay the latest database state to a freshly wired renderer (a page
+    // that reloads mid-migration must still see where startup stands)
+    if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
+      viewSendLine(view, startupLine(session.lastStartupState));
+    }
+    return true;
+  }
+  // application-level liveness probe from the page (browsers cannot open their
+  // own WS pings, and a half-open TCP socket otherwise looks OPEN for minutes
+  // after the peer is gone)
+  if (ctrl === '{"kind":"zcode-webui-ping"}') {
+    viewSendLine(view, '{"kind":"zcode-webui-pong"}');
+    return true;
+  }
+  if (ctrl === '{"kind":"zcode-webui-startup-snapshot"}') {
+    if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
+      viewSendLine(view, startupLine(session.lastStartupState));
+    }
+    return true;
+  }
+  return false;
+}
+
+// One inbound binary frame from a page.
+function viewIngest(session, view, payload) {
+  if (session.closed) return;
+  if (view.lastFrameAt === 0) view.lastFrameAt = Date.now();
+  if (session.hello) writeToHost(session, view, payload);
+  else session.pendingInbound.push({ view, payload });   // flushed with its owner (see FrameParser callback)
+}
+
+// Adopt the account's running host, or spawn one — coalescing concurrent
+// first-connects (a ws page and a relay page booting at the same moment) onto ONE
+// host instead of racing to spawn two, the loser of which used to live outside
+// `sessions` where no reaper could ever see it again.
+async function ensureSession(userKey, tabId) {
+  const prev = sessions.get(userKey);
+  const live = prev && !prev.closed && prev.child && prev.child.exitCode === null ? prev : null;
+  if (live) {
+    if (MUX_ENABLED && !live.mux) { live.mux = makeMux(); live.eraByTab ??= new Map(); }
+    return { session: live, adopted: true };
+  }
+  let createdHere = false;
+  let spawnPromise = pendingSpawns.get(userKey);
+  if (!spawnPromise) {
+    createdHere = true;
+    spawnPromise = createSession(userKey, tabId);
+    pendingSpawns.set(userKey, spawnPromise);
+    const clear = () => pendingSpawns.delete(userKey);
+    spawnPromise.then(clear, clear);
+  }
+  const session = await spawnPromise;
+  return { session, adopted: !createdHere };
+}
+
 function handleUpgrade(req, socket, head) {
   let urlPath = safeDecode((req.url || '/').split('?')[0]);
   if (base) {
@@ -2303,47 +2654,26 @@ function handleUpgrade(req, socket, head) {
     // account's single running host — switching devices keeps the live stream on
     // the same pid, previous pages simply keep working as additional viewers.
     // Only when the account has NO live session does this page spawn a fresh one.
-    const prev = sessions.get(userKey);
-    let session = prev && !prev.closed && prev.child && prev.child.exitCode === null ? prev : null;
+    let session = null;
     let adopted = false;
-    if (session) {
-      adopted = true;
-      if (MUX_ENABLED && !session.mux) { session.mux = makeMux(); session.eraByTab ??= new Map(); }
-      rebindView(session, tabId);
-      session.detachedAt = 0;
-      console.error('[zcode-webui] view attached pid=' + session.child.pid +
-        ' tab=' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + ', views=' + session.views.size +
-        ', last frame ' + (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')');
-    } else {
-      // Coalesce concurrent first-connects onto ONE host: createSession yields
-      // (ensureWorkspaceDirs I/O) between the map lookup and its sessions.set,
-      // so two tabs opening at the same moment used to spawn two hosts — the
-      // overwritten one then lived outside `sessions` where no reaper could
-      // ever see it again.
-      let createdHere = false;
-      let spawnPromise = pendingSpawns.get(userKey);
-      if (!spawnPromise) {
-        createdHere = true;
-        spawnPromise = createSession(userKey, tabId);
-        pendingSpawns.set(userKey, spawnPromise);
-        const clear = () => pendingSpawns.delete(userKey);
-        spawnPromise.then(clear, clear);
-      }
-      try {
-        session = await spawnPromise;
-      } catch (err) {
-        console.error('[ws] host spawn failed: ' + err.message);
-        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-        return socket.destroy();
-      }
-      // a coalesced waiter attaches to a host it did not spawn: treat it exactly
-      // like any late-joining view (Initialize replay + hold gating)
-      if (!createdHere) adopted = true;
-      if (session.closed) {          // spawned, but already died again (handshake failed)
-        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
-        return socket.destroy();
-      }
+    try {
+      const res2 = await ensureSession(userKey, tabId);
+      session = res2.session;
+      adopted = res2.adopted;
+    } catch (err) {
+      console.error('[ws] host spawn failed: ' + err.message);
+      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      return socket.destroy();
     }
+    if (session.closed) {            // spawned, but already died again (handshake failed)
+      socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+      return socket.destroy();
+    }
+    rebindView(session, tabId);
+    session.detachedAt = 0;
+    console.error('[zcode-webui] view attached pid=' + session.child.pid +
+      ' tab=' + tabId.slice(0, 8) + ' (user ' + shortUserKey(userKey) + ', views=' + session.views.size +
+      ', last frame ' + (session.lastFrameAt ? Math.round((Date.now() - session.lastFrameAt) / 1000) + 's ago' : 'never') + ')');
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req, session, { adopted, tabId, resume });
     });
@@ -2356,195 +2686,38 @@ wss.on('connection', (ws, req, session, meta) => {
   const resume = !!(meta && meta.resume);
   console.error('[ws] connected from ' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress) + ' UA=' + String(req.headers['user-agent'] || '').slice(0, 80));
 
-  // resume=1 means the page instance already bootstrapped once, so its event
-  // subscriptions are "live" from its point of view and it will NEVER re-send
-  // EventListen. If this session holds no era of this tab (server restart, host
-  // reaped and re-spawned by another page), those subscriptions can never be
-  // restored — events would silently stop. Force the clean path instead:
-  // bootstrap.js reloads the page on close code 4000 and re-bootstraps fresh.
-  if (resume && !session.eraByTab.get(tabId)) {
+  const attached = attachView(session, tabId, wsTransport(ws), { adopted, resume, ws });
+  if (attached.staleEra) {
     console.error('[ws] stale-era resume rejected tab=' + tabId.slice(0, 8) + ' — forcing page reload');
     try { ws.close(4000, 'era gone'); } catch (_e) { /* ignore */ }
     return;
   }
-
-  // ---- build this page's view ----
-  const view = {
-    ws, tabId,
-    sent: new Set(),                       // globalIds this renderer is awaiting
-    holdFrames: false, holdBuf: [], holdSkipOnce: false, replayInitOnCapture: false,
-    lastFrameAt: 0,
-    missed: 0,                             // consecutive unanswered keepalive pings
-    parkedAt: 0,                           // ws closed, era parked in eraByTab (resume replay active)
-    resumeBuf: [], resumeBytes: 0, resumeOverflow: false,
-  };
-  // prevView is the previous renderer era of this tab — looked up in eraByTab
-  // because the ws close handler may already have removed it from views (the
-  // close of a hot-reconnecting socket always races the reconnect)
-  const prevView = session.eraByTab.get(tabId) || null;
-  // A resume whose offline gap overflowed the replay buffer cannot be bridged:
-  // the renderer would see a hole in its event stream and quietly go stale. Send
-  // it down the established recovery path instead (close 4000 → page reload).
-  // Checked BEFORE any state mutation so the half-attached view leaves no trace.
-  let gapDeclared = false;
-  if (resume && prevView && prevView.resumeOverflow) {
-    // The offline gap cannot be bridged, but a reload is a heavy answer: keep
-    // the renderer alive, drop the (already truncated) replay buffer and tell
-    // the page that some events were lost — it shows a "重新同步" action.
-    console.error('[ws] resume after offline gap overflow tab=' + tabId.slice(0, 8) +
-      ' — continuing in-page and declaring the gap (' + prevView.resumeBuf.length + ' frame(s) dropped)');
-    prevView.resumeOverflow = false;
-    prevView.resumeBuf.length = 0;
-    prevView.resumeBytes = 0;
-    gapDeclared = true;
-  }
-  if (adopted && !resume) {
-    // fresh renderer bootstrapping against a mid-stream host: gate downstream
-    // until its port-ready ack (or failsafe) so it sees Initialize first
-    view.holdFrames = true;
-    view.holdBuf = [];
-    if (session.firstDownstream) view.holdBuf.push(Buffer.from(session.firstDownstream));
-    else view.replayInitOnCapture = true;
-    setTimeout(() => releaseHold(view), 8000).unref();
-  }
-  if (session.mux && prevView && prevView !== view) {
-    if (resume) {
-      // hot reconnect of the SAME live renderer: its era continues — re-point
-      // the ownership records at the new socket or responses/fires for its
-      // in-flight calls and subscriptions would be dropped forever
-      for (const [, e] of session.mux.pending) if (e.view === prevView) e.view = view;
-      for (const [, e] of session.mux.events) if (e.view === prevView) e.view = view;
-    } else {
-      // fresh renderer era of this tab: the old renderer is gone without the
-      // host ever noticing, so explicitly unsubscribe its events (calls just
-      // expire — their stale responses are dropped by the mux)
-      disposeViewEvents(session, prevView);
-      for (const [gid, e] of session.mux.pending) if (e.view === prevView) {
-        session.mux.pending.delete(gid);
-        prevView.sent.delete(gid);
-      }
-      prevView.sent.clear();
-      prevView.holdBuf.length = 0;           // eraByTab keeps the object alive — drop its buffers
-      prevView.resumeBuf.length = 0;         // a fresh era replays nothing from the old one
-      prevView.resumeBytes = 0;
-    }
-  }
-  session.views.set(tabId, view);
-  session.eraByTab.set(tabId, view);
-  session.detachedAt = 0;
-  // resume replay: flush the frames buffered while this tab's socket was gone
-  // BEFORE any new downstream frame can be sent — per-socket send ordering then
-  // preserves the era's original sequence. (prevView parked buffers only; the
-  // new view starts with an empty one.)
-  if (resume && prevView && prevView !== view) {
-    const gap = prevView.resumeBuf.splice(0);
-    const gapBytes = prevView.resumeBytes;
-    prevView.resumeBytes = 0;
-    if (gap.length > 0) {
-      console.error('[ws] resume replay tab=' + tabId.slice(0, 8) + ': ' + gap.length +
-        ' buffered frame(s), ' + gapBytes + 'B, covering the offline gap');
-      for (const p of gap) { try { ws.send(p, { binary: true }); } catch (_e) { break; } }
-    }
-    // Calls this tab had in flight when its socket dropped, whose responses
-    // never made it out (emitted into the dying socket) would hang the
-    // renderer FOREVER — the official client has no per-call timeout on this
-    // path, and consumers like the file tree dedup further clicks on a
-    // `loading` flag that only a completed response clears ("folder won't
-    // open until refresh"). Answer them with a synthesized timeout error: the
-    // renderer surfaces a retryable error instead, and the host's (possibly
-    // late) real response is dropped by the mux as stale. Calls queued while
-    // offline arrive AFTER this point (fresh pending.at) and are untouched.
-    if (session.mux && prevView.parkedAt) {
-      const stale = [];
-      for (const [gid, e] of session.mux.pending) {
-        if (e.view === view && !e.injected && e.at && e.at <= prevView.parkedAt) stale.push([gid, e]);
-      }
-      if (stale.length > 0) {
-        console.error('[ws] resume tab=' + tabId.slice(0, 8) + ': synthesizing timeout errors for ' +
-          stale.length + ' in-flight call(s) lost across the disconnect');
-        for (const [gid, e] of stale) {
-          session.mux.pending.delete(gid);
-          view.sent.delete(gid);
-          session.mux.dropped++;
-          try { sendToView(session, e, { id: gid }, errorAckFor(gid, 'zcode-webui: response lost during disconnect (synthesized timeout)')); } catch (_e) { /* view may close again immediately */ }
-        }
-      }
-    }
-  }
+  const view = attached.view;
+  const gapDeclared = attached.gapDeclared;
 
   // listeners FIRST (a client answering the ready signal instantly must not
   // lose its first frame), announcements after
   ws.on('message', (data, isBinary) => {
     if (session.closed) return;
-    if (!isBinary) {
-      const ctrl = String(data);
-      if (ctrl === '{"kind":"zcode-webui-port-ready"}') {
-        releaseHold(view);
-        // replay the latest database state to a freshly wired renderer (a page
-        // that reloads mid-migration must still see where startup stands)
-        if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
-          try { ws.send(startupLine(session.lastStartupState)); } catch (_e) { /* ignore */ }
-        }
-        return;
-      }
-      // application-level liveness probe from the page (browsers cannot open
-      // their own WS pings, and a half-open TCP socket otherwise looks OPEN for
-      // minutes after the peer is gone)
-      if (ctrl === '{"kind":"zcode-webui-ping"}') {
-        try { ws.send('{"kind":"zcode-webui-pong"}'); } catch (_e) { /* ignore */ }
-        return;
-      }
-      if (ctrl === '{"kind":"zcode-webui-startup-snapshot"}') {
-        if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
-          try { ws.send(startupLine(session.lastStartupState)); } catch (_e) { /* ignore */ }
-        }
-        return;
-      }
-      return;
-    }
-    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (view.lastFrameAt === 0) view.lastFrameAt = Date.now();
-    if (session.hello) writeToHost(session, view, payload);
-    else session.pendingInbound.push({ view, payload });   // flushed with its owner (see FrameParser callback)
+    notePresence(session, tabId, 'ws', false, true);
+    if (!isBinary) { handleViewControl(session, view, data); return; }
+    viewIngest(session, view, Buffer.isBuffer(data) ? data : Buffer.from(data));
   });
-  ws.on('close', () => {
-    if (session.views.get(tabId) !== view) return;     // superseded by a newer view
-    session.views.delete(tabId);
-    view.sent.clear();
-    view.holdBuf.length = 0;               // eraByTab keeps the object alive — drop its buffers
-    view.holdFrames = false;               // never mounted or still holding: parked buffering takes over
-    view.parkedAt = Date.now();            // era parks: downstream frames buffer for resume replay
-    if (session.views.size === 0) {
-      if (session.framesIn === 0 && session.framesOut === 0) {
-        console.error('[ws] closed before traffic, terminating host pid=' + session.child.pid);
-        terminateSession(session, 'closed before traffic');
-        return;
-      }
-      session.detachedAt = Date.now();
-      console.error('[ws] DETACHED (host keeps running) pid=' + session.child.pid + ' views=0 frames in=' + session.framesIn + ' out=' + session.framesOut);
-    } else {
-      console.error('[ws] view gone tab=' + tabId.slice(0, 8) + ' — ' + session.views.size + ' viewer(s) remain');
-    }
-  });
+  ws.on('close', () => detachView(session, view, 'ws'));
   ws.on('error', () => { /* onclose follows */ });
   ws.on('pong', () => { view.alive = true; view.missed = 0; });
   view.alive = true;
   view.missed = 0;
   view.parkedAt = 0;
 
-  try {
-    ws.send(readyLine(session));
-    // host16: the page cannot synthesize "ready" (the host is still migrating),
-    // so hand it the current state right behind the ready line
-    if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
-      ws.send(startupLine(session.lastStartupState));
-    }
-    if (gapDeclared) ws.send('{"kind":"zcode-webui-gap"}');
-  } catch (_e) { /* ignore */ }
-  const announce = (line) => {
-    try { if (ws.readyState === 1) ws.send(String(line)); } catch (_e) { /* ignore */ }
-  };
-  announce((adopted ? '[zcode-webui] host adopted pid=' : '[zcode-webui] host spawned pid=') + session.child.pid +
+  viewSendLine(view, readyLine(session));
+  // host16: the page cannot synthesize "ready" (the host is still migrating),
+  // so hand it the current state right behind the ready line
+  if (session.pipe && session.pipe.kind === 'host16' && session.lastStartupState) {
+    viewSendLine(view, startupLine(session.lastStartupState));
+  }
+  if (gapDeclared) viewSendLine(view, '{"kind":"zcode-webui-gap"}');
+  console.error((adopted ? '[ws] host adopted pid=' : '[ws] host spawned pid=') + session.child.pid +
     (session.views.size > 1 ? ' (viewers: ' + session.views.size + ')' : ''));
   if (session.views.size > 1) {
     console.error('[zcode-webui] multi-view: ' + session.views.size + ' devices watching user ' + shortUserKey(session.userKey));
@@ -2594,6 +2767,11 @@ if (RESUME_PARK_MS > 0) {
     const agentBusy = hasActiveModelRequest() || (writeAt && now - writeAt <= AGENT_WRITE_ACTIVE_MS);
     for (const s of [...sessions.values()]) {
       if (s.closed || !s.eraByTab) continue;
+      // A live page keeps its parked era indefinitely: its renderer is still
+      // mounted and a hot resume is the only way to avoid a full reload. The
+      // lease disappearing (page closed / browser killed) restores the normal
+      // RESUME_PARK_MS cleanup below.
+      if (hasFreshPresence(s, now)) continue;
       const candidates = [];
       for (const [tabId, era] of s.eraByTab) {
         if (s.views.get(tabId) === era || !era.parkedAt) continue;
@@ -2618,6 +2796,7 @@ if (RESUME_PARK_MS > 0) {
         era.resumeBuf.length = 0;
         era.resumeBytes = 0;
         era.resumeOverflow = false;
+        if (era.resumeLostResponses) era.resumeLostResponses.length = 0;
         era.parkedAt = 0;
         s.eraByTab.delete(tabId);
         console.error('[ws] parked era retired tab=' + tabId.slice(0, 8) +
@@ -2649,7 +2828,7 @@ setInterval(() => {
       if (e.view && e.view.sent) e.view.sent.delete(gid);
       s.mux.dropped++;
       reaped++;
-      if (e.view && e.view.ws && e.view.ws.readyState === 1 && s.views.get(e.view.tabId) === e.view) {
+      if (e.view && viewIsOpen(e.view) && s.views.get(e.view.tabId) === e.view) {
         try {
           sendToView(s, e, { id: gid }, errorAckFor(gid, 'zcode-webui: no response within ' + Math.round(PENDING_CALL_TTL_MS / 1000) + 's (synthesized timeout)'));
           answered++;
@@ -2747,9 +2926,7 @@ function shutdown() {
   for (const s of [...sessions.values()]) {
     terminateSession(s, 'server shutdown');
   }
-  for (const [, entry] of httpRelays) {
-    try { entry.pipe.close(); } catch (_e) { /* ignore */ }
-  }
+  for (const [, entry] of httpRelays) { entry.closed = true; finishRelayWaiter(entry); }
   httpRelays.clear();
   stopLogin(loginRun);
   server.close(() => process.exit(0));

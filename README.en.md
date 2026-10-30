@@ -188,6 +188,12 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_WEBUI_HOME` | — | see notes | Data home of this service (config, renderer, device id, logs); defaults to `~/.zcode-webui` for npm installs; git checkouts keep using the project dir when it already contains `config.json` or `vendor/renderer` |
 | `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | Version/architecture for `fetch-renderer` |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | Reap detached background hosts after this long when idle; `0` = keep forever |
+| `ZCODE_WEBUI_PRESENCE_LEASE_MS` | — | `1800000` | Presence lease: an open page (even backgrounded) renews it every 45 s; a fresh lease keeps the host and its parked era. `0` disables the protection |
+| `ZCODE_WEBUI_PRESENCE_MAX_TABS` | — | `32` | Per-host cap on remembered tab leases |
+| `ZCODE_WEBUI_PRESENCE_FROZEN_MAX_MS` | — | `43200000` | Upper bound for one frozen/bfcache page lease (default 12 h), so a lost closing beacon cannot pin a host forever |
+| `ZCODE_WEBUI_RESUME_BUF_MAX_MB` | — | `32` | Per-tab offline replay byte cap; one oversized response is skipped instead of dropping the whole gap |
+| `ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES` | — | `4096` | Per-tab offline replay frame cap |
+| `ZCODE_WEBUI_RESUME_PARK_MS` | — | `600000` | How long a parked era may sit without a presence lease before it is retired while the host is idle; `0` = never retire |
 | `ZCODE_WEBUI_FRAME_QUIET_MS` | — | `600000` | Reap precondition: no host→browser frames within this window |
 | `ZCODE_WEBUI_AGENT_WRITE_ACTIVE_MS` | — | `600000` | Keep hosts alive while the official CLI DB (message/part/session_entry) was written within this window |
 | `ZCODE_WEBUI_MODEL_REQUEST_ACTIVE_MS` | — | `7200000` | An unmatched `model.request.started` in the CLI log counts as in-flight for at most this long |
@@ -354,8 +360,11 @@ running. Custom paths: override `ZCODE_AGENT_SERVER_COMMAND` / `ZCODE_AGENT_SERV
 That's the mobile browser freezing the page and recycling the network socket in the background (not a
 server timeout). The new version handles it transparently: a background drop **no longer reloads the
 page** — on recovery it hot-reconnects and re-adopts the same running host, replaying anything the task
-produced while you were away. No taps needed; the page self-heals when you come back. The server also
-pings attached clients every 30s so dead sockets are cleaned up and hosts park gracefully.
+produced while you were away. No taps needed; the page self-heals when you come back. An open page
+(even backgrounded) renews a presence lease, and a frozen/bfcache page sends a 12 h lease, so the host
+and the replay window are not reclaimed just because the tab sat idle for a long time; only a closed tab whose lease expired, or a host process that
+actually exited, needs a reload. The server also pings attached clients every 30s so dead sockets are
+cleaned up and hosts park gracefully.
 
 **Q: My in-progress task stopped after the server slept / lost network?**
 Two distinct cases:

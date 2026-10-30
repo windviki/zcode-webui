@@ -271,7 +271,7 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
    `ZCODE_WEBUI_WS_PING_MAX_MISS`（默认 2）可调。terminate 仍然只是 detach，host 照旧后台续跑。
 2. **断线帧无重放**（`resumeBuf` 声明了但从没实现）：热重连成功后，断线窗口里的任务列表事件/
    呼叫响应全部被丢——「不刷新就看不到最新会话」的直接原因。现在每个**渲染层时代（era）**在
-   停靠期间把发给它的下行帧缓冲（默认 2048 帧 / 16MB，`ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES`/
+   停靠期间把发给它的下行帧缓冲（默认 4096 帧 / 32MB，`ZCODE_WEBUI_RESUME_BUF_MAX_FRAMES`/
    `_MB`），resume=1 热重连时按序重放（本地 id 已还原）；缓冲溢出则下次 resume 直接 close 4000
    走整页刷新（比静默漏帧诚实）。停靠期间**不再按 RESUME_PARK_MS 直接 dispose 宿主订阅**
    （2026-10-19 修正：那会在第 10 分钟抹掉 reaper 唯一的帧活跃信号，把长回合误杀）。现在只在
@@ -295,10 +295,10 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 留存）、`ResizeObserver loop completed` 这类浏览器噪声只记日志不出横幅、活动通知（带按钮）不会被
 后续报错覆盖。渲染层黑盒内部若有自己的卡死无法从垫片修——但垫片侧的挡点击因素已清零。
 
-自检：`node scripts/dev/resume-replay-test.mjs`（13 项，协议级：可编程假 host 验证断线补帧重放 +
+自检：`node scripts/dev/resume-replay-test.mjs`（协议级：可编程假 host 验证断线补帧重放 +
 keepalive 宽限；沙箱会显式钉 `ZCODE_SERVER_RUNTIME_ROOT` 并清 `NODE_OPTIONS`，避免从生产进程树
-继承环境串台）、`node scripts/dev/hot-reconnect-test.mjs`（11 项，真浏览器：热重连不刷新、上行
-冲刷、ws 失败不退 http、横幅穿透 + 自动消失）。注意 `scripts/dev/reattach-test.mjs` 是**过时存量**
+继承环境串台）、`node scripts/dev/hot-reconnect-test.mjs`（真浏览器：热重连不刷新、上行
+冲刷、ws 失败不退 http、横幅穿透 + 自动消失、presence 与浮层关闭）。注意 `scripts/dev/reattach-test.mjs` 是**过时存量**
 （断言的是多视图重构前的「每渲染层一个 host」架构，case 2 起必失败），现行覆盖以
 hot-reconnect/resume-replay 为准。
 
@@ -574,6 +574,139 @@ DB `turn_usage` 里 7 条 cancelled 全是 `TURN_CANCELLED` + cause
   ③主规则强制要求 `busy`，而额度撞墙后任务立刻变 `error`，`busy=false` 且机会还有 30 天才过期
   → 永久不动。修复即上面 2/3 两条 + 口径按 `percentage`/`usage`；`busy` 窗口同时从 10min 放到 2h
   （长回合期间索引行不会每分钟重写，10min 会把正在跑的任务判成空闲）。
+
+## 长时后台恢复 / 通知浮层可关闭 / 与 dsh·kimi 的重连对照（2026-10-30）
+
+用户体感：zcode-webui 隔很久回到标签页会整页重载，而 dsh / kimi 是自动连上并刷新消息。三处处置：
+
+1. **「连接已恢复」浮层可关闭**（`web/bootstrap.js`）：`showNotice()` 增加第 4 个参数
+   `closable`，渲染「重新同步」+「关闭」两个按钮；`dismissNotice()` 只移除浮层，不触发
+   reload。离线补帧溢出（`zcode-webui-gap`）和「自动重连失败」两处通知都改为可关闭。
+   以前浮层带按钮就常驻，用户只能点「重新同步」整页刷新才能清掉。
+2. **presence 租约（页面还开着，宿主/era 就不回收）**：`web/bootstrap.js` 每 45s POST
+   `api/presence {tab,state,closing}`（普通 HTTP，WS 断了也能续），pagehide 非 bfcache 时发
+   `closing:true`。`src/server.mjs` 的 `notePresence`/`hasFreshPresence` 把租约记在
+   `session.presenceTabs`；空闲回收器（`DETACHED_TTL_MS`）和 parked-era 退休
+   （`RESUME_PARK_MS`）都先看租约，新鲜则跳过。租约默认 30min，`ZCODE_WEBUI_PRESENCE_LEASE_MS`
+   可调，0 关闭；被冻结/进 bfcache 时客户端再发一次 12h 长租约（`freeze` / `pagehide persisted`，
+   `ZCODE_WEBUI_PRESENCE_FROZEN_MAX_MS` 封顶），覆盖手机后台冻结、无法继续 45s 心跳的场景。
+   效果：标签页在后台放几个小时，回来仍是热重连；关闭标签页后租约过期，恢复原回收策略。
+   `/api/health` → `sessions.presence` 可观测。WS 每帧也会续租（5s 节流），所以 socket 活着时
+   不依赖 HTTP 心跳。
+3. **离线补帧加固**：`RESUME_BUF_MAX_MB` 原来写成了
+   `Math.max(64*1024, env||16) * 1024*1024`——env 被当成字节再乘 MB，实际默认 64GB，配置项形同虚设；
+   已改为 `Math.max(1, env||32) * 1024*1024`，默认 32MB / 4096 帧。另外单个超大**响应帧**
+   （文件内容、截图）不再触发整段 overflow：`bufferForResume()` 识别 201/202/203 且仅有它超字节上限时，
+   只跳过该响应并记入 `view.resumeLostResponses`，重连时给对应 origId 合成 202
+   「response too large for the offline replay buffer…retry」；事件帧仍维持原语义（丢事件会静默污染状态）。
+   overflow 日志补了 frames/bytes/incoming/type，便于现场定位。
+
+**dsh / kimi 源码对照（结论：差异在应用层 resync，不在退避参数）**：
+
+- dsh（`dsh-client-connection/lib/client.browser.js`）：`ConnectionController` 按 generation 重连，
+  退避 500ms ×2 上限 10s，`online/offline` 暂停/恢复；`onConnected` → session-controller 的
+  `handleConnected()` 清空 projection store、重拉列表，已打开的 Session 各自 `resync()` 重开历史窗口。
+- Kimi Code Web（`kimi web` 的 bundle）：WS 帧带 `seq/epoch`，重连后以 `sinceSeq` 恢复订阅；
+  服务端回 `resync_required` 时客户端重新 `GET session` 并重置投影；focus/visibilitychange 发现
+  socket stale 会主动重连。
+- 本垫片：官方渲染层的 service port 是**一次性**握手，`appInitialized` 后不再接受第二个 port，
+  也没有对外的「重新订阅/从快照重建」协议；因此无法像 dsh/kimi 那样在页面内做应用层 resync。
+  对策只能是「别丢会话」：presence 租约 + 补帧；宿主进程真的退出（重启/崩溃/被回收）时，
+  整页刷新仍是唯一可靠路径。这是架构差异，不要用「调大退避/心跳」来假装对齐。
+
+自检：`node scripts/dev/resume-replay-test.mjs` 扩到 Part C（presence 租约跨 TTL 保留宿主与 era、
+超大响应只跳过该帧并合成 202、租约过期后回收）；`node scripts/dev/hot-reconnect-test.mjs`
+增加 presence 已注册、浮层「重新同步+关闭」、点关闭不 reload/不触发动作三项。服务端改动需重启，
+客户端改动刷新页面即可。
+
+## 新建项目选文件夹崩溃 + ws→http 回退后「handshake is required」（2026-10-30，v0.8.5）
+
+**问题一「会话栏 → 新建项目 → 选择文件夹」报 `TypeError: Cannot read properties of undefined (reading 'length')`**：
+3.16 的项目编辑器（`styles-*.js` 里的 ProjectEditor）走的是
+`platform.selectDirectories()`（`index-*.js`: `selectDirectories:()=>window.zcode.selectDirectories()`），
+拿到结果后直接读 `t.length`（`J.debug('[ProjectEditor] native directory selection',{count:t.length})`）。
+垫片的 `web/zcode-bridge.js` 只实现了单选的 `selectDirectory`，**没有** `selectDirectories`——于是落到
+Proxy 兜底 `ok()`（resolve undefined），`undefined.length` 当场炸掉整个对话框。这是「未知 API 一律回 ok」
+这一兜底策略的老毛病（3.15 的 `getCloseToTrayCapability` 崩溃同源）。处置：
+
+- `openDirectoryPicker()` 抽成独立函数（同一个 in-page overlay），
+  `selectDirectory` = 拿到路径（取消 → reject 'cancelled'，维持桌面契约），
+  `selectDirectories` = 拿到 `[path]`（取消 → `[]`，与原生多选对话框一致）。
+- 顺带把 3.16 里**结果会被解引用**的其余方法显式补上真形状：`getEmbeddedBrowserSitePermissions`/`set…`/
+  `clear…`/`resetEmbeddedBrowserSitePermission` → `{}`（渲染层用 `t[e] ?? {}`，undefined 会炸）、
+  `resolveEmbeddedBrowserPermissionPrompt` → ok、`materializeWorkflowArtifactFile` /
+  `requestSourceSettingsAttachment` → 明确 reject（比 undefined 再被读属性干净）、
+  `getApplicationIcon` → null、`syncActiveTaskSession`/`setShortcutRecordingActive`/`reportLocalTtftBatch`/
+  `reportRendererHeapSample` → noop、`openExternalFile` → false。
+- 盘点方法（3.16 渲染层共引用 130 个 `window.zcode.*`）：从 `vendor/renderer/assets/*.js` 里抓
+  `window.zcode.X` 名字，和 bridge 里显式定义的 key 做差集，缺的逐个确认「返回值是否被读」。
+- **客户端改动，刷新页面即生效**。
+
+**问题二「消息发送按钮点了没反应，提示失败 → 查看详情：handshake is required」**：
+日志实证 `fault.connection.handshakeRequired`，来自官方宿主
+（`host/index.js` 的 `assertReady()`：连接未完成 `initializeConversationV4` 时，
+所有 `zcode-agent.*` RPC 直接抛这个错）。现场（2026-10-30 06:44-06:48）：
+
+1. 页面已引导成功（ws 模式），代理把 ws 升级搞坏 → `bootstrap.js` 连试 5 次 open 失败 →
+   `startHttpMode()`；
+2. `/bridge/open` 当时**自己 spawn 了一个新宿主**（旧实现：relay 拥有自己的 pipe）；
+3. 渲染层的 service port 是**一次性**握手，`appInitialized` 之后不会再发 `helloConversationV4`/
+   `initializeConversationV4` → 新宿主**永远没收到会话握手** → 该页面所有 `zcode-agent.*` 调用
+   （`sendConversationCommandV4` 首当其冲）全部 handshakeRequired，发送按钮看起来「点了没反应」；
+4. 用户手动刷新后重新引导（回到原宿主 1217308）才恢复。
+
+根因是架构层面的：**一个账号只能有一个宿主，HTTP 长轮询回退不能另起一个**。处置（服务端）：
+
+- **transport 抽象**：`wsTransport(ws)` / `relayTransport(entry)`（`send`/`sendLine`/`isOpen`/`close`），
+  view 上带 `transport`；`sendToView`/`releaseHold`/`broadcastStartupState`/`terminateSession`/
+  pipe.onExit/keepalive/stale-call sweeper 全部改走 `viewSend`/`viewSendLine`/`viewDetach`/`viewIsOpen`。
+- **`attachView(session, tabId, transport, {adopted,resume,ws})`**：把 ws 分支里 era 记账、hold 门控、
+  resume 补帧、丢失调用合成 202、mux 归属改指等逻辑抽出来，ws 与 relay 共用；返回
+  `{view, staleEra, gapDeclared}`。`detachView(session, view, reason)` 统一「transport 没了 → era 停靠」，
+  `handleViewControl()` 统一处理 port-ready/ping/startup-snapshot 控制行，`viewIngest()` 统一上行帧。
+- **`ensureSession(userKey, tabId)`**：适配/生成宿主 + 并发首连合并，`/ws` 与 `/bridge/open` 共用。
+- **`/bridge/open?tab=<TAB_ID>&resume=1`**：页面已引导（resume=1）时按**热切换**处理——同一个宿主、
+  同一份会话握手、mux 归属改指到 relay view、停靠期帧按序补发；era 不在了就回
+  `{ok:false, staleEra:true}`，bootstrap 直接整页刷新（干净重建）。冷启动（proxy 一开始就不给 ws）
+  照旧 spawn 宿主，只是现在也走 attachView。
+- **控制行走帧流**：HTTP 没有 ws 文本通道，控制行（ready/startup/pong/gap）作为第一个字节是 `{` 的
+  普通帧下发（渲染层 RPC 帧首字节恒为 0..6，不会撞），`bootstrap.js` 的 `parseHttpFrames` 识别后
+  交给与 ws 共用的 `handleControlText()`；上行控制行同理（`/bridge/send` 里 `payload[0]===0x7b`）。
+- **`/bridge/close` 只摘 VIEW**：宿主继续跑（正在跑的回合不会因为刷新/关标签被杀），era 停靠等热恢复；
+  relay 空闲 reaper 也只 `detachView`（`HTTP_RELAY_TTL_MS` 之后），**唯一**能杀宿主的仍是会话 reaper
+  （帧/任务索引/CLI DB/模型请求/CPU 探针五路 busy-guard）。`HTTP_RELAY_MAX` 超限时驱逐最老的**空闲 view**，
+  不再 close 宿主 pipe。`requestRelayClose`/`openHostPipe`/`DEFERRED_RELAY_CLOSE_IDLE_MS`/
+  `RELAY_CLOSE_RECENT_FRAME_MS` 随之删除。
+- `bootstrap.js`：`/bridge/open` 带 `tab`+`resume`；`staleEra` → reload；ws 恢复时先 `closeHttpMode()`
+  再连 ws（`recoverTransport`）；`port-ready` / startup-snapshot 改走 `sendToBridge`（两种传输通用）。
+- `scripts/smoke-test.mjs`：open 之后先发一次 `port-ready`（真实页面也会发）——被适配的宿主在
+  port-ready 之前是 hold 状态，不发会走 8s failsafe。
+
+**行为变化（有意）**：① 任何时刻一个账号只有一个宿主（多设备/多标签都是 view，HTTP 回退不再复制宿主，
+3.16 那 ~500MB/宿主的泄漏也随之消失）；② 关掉 relay 页面不再杀宿主，归属 idle reaper；
+③ `host adopted/spawned`、`[bridge] http session opened … (adopted|spawned)` 日志可判断是否复用。
+
+**踩坑（同一处，务必别再犯）**：官方对话框是 Radix modal，打开时 `react-remove-scroll` 会给
+`<body>` 设 `pointer-events:none`（`data-scroll-locked`）。垫片的 overlay 是 body 的子节点，会**继承**
+这个 none——picker 明明画在最上层（z-index 2147483000，截图可见），但**所有点击都被吞**（
+`document.elementsFromPoint` 直接跳过它）。所以 `web/zcode-bridge.js` 的 `.zwebui-ovl` 必须显式
+`pointer-events:auto`（CSS + 元素 inline 双保险）。排查方法：在对话框里打开 overlay 后打印
+`getComputedStyle(document.body).pointerEvents` 与 `elementsFromPoint` 栈序。
+
+自检（新增两个真浏览器用例）：
+- `node scripts/dev/project-folder-picker-test.mjs`（默认打本机，`:3102` 需 `ZOOM_TEST_ALLOW_PROD=1`；
+  只读：新建项目 → 选择文件夹 → overlay 出现 → 取消 → overlay 关闭、对话框仍可用、全程无 TypeError）。
+- `node scripts/dev/relay-adopt-test.mjs`（**自带沙箱**：拷一份 `~/.zcode/server` + 渲染层，私有端口）：
+  页面 ws 引导 → 打桩让 ws 升级全失败 → 掉线降级到 relay → 断言日志 `(adopted)`、宿主 pid 没变、
+  无 `handshakeRequired`、页面没 reload、UI 仍挂载。`RELAY_TEST_DEBUG=1` 保留沙箱并写
+  `/tmp/relay-adopt-debug.log`。
+
+自检：`node scripts/dev/resume-replay-test.mjs` 新增 **Part D**（17 项，全沙箱 + 脚本化假宿主）：
+relay open 复用同一宿主（`sessions.total` 不涨、日志出现 `(adopted)`）、初始化回放、mux 本地 id 往返、
+**ws→relay 中途换传输**后停靠期缓存的响应按序补发（id 还原）、换传输后新调用照常往返、断线时仍未答的
+调用在 relay 上合成 202、`/bridge/close` 只摘 view 不杀宿主、`resume=1` 且 era 不在 → `staleEra`。
+`node scripts/dev/reaper-guard-test.mjs` 的 Part D 改为断言新语义（close 摘 view / 宿主留给 idle reaper）。
+服务端改动需重启，客户端刷新即可。
 
 ## 其他约定
 

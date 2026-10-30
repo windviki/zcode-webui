@@ -26,6 +26,54 @@
     try { sessionStorage.setItem('zwebui_tab', TAB_ID); } catch (e) { /* ignore */ }
   }
 
+  // ---- presence lease (keeps this tab's server session alive while open) ----
+  // The server keeps a parked renderer era for a hot resume, but it cannot tell
+  // "the browser is still sitting on this tab" from "the page is gone" just by
+  // looking at a dead socket. Before this heartbeat a tab left in the
+  // background for a long time lost its parked era (10 min) and then its host
+  // (30 min), so coming back forced a full page reload.
+  //
+  // The page renews the lease over plain HTTP, which keeps working when the
+  // websocket/proxy path is down. Closing the tab sends an explicit
+  // closing=true; if that beacon is lost the lease simply expires. Best-effort:
+  // a failed presence request must never surface as an error banner.
+  var PRESENCE_EVERY_MS = 45000;
+  var PRESENCE_FROZEN_MS = 12 * 60 * 60 * 1000;
+  var presenceTimer = 0;
+  var presenceClosed = false;
+  function postPresence(closing, ttlMs) {
+    if (presenceClosed && !closing) return;
+    try {
+      var body = {
+        tab: TAB_ID,
+        state: document.visibilityState || 'unknown',
+        closing: !!closing
+      };
+      if (ttlMs > 0) body.ttlMs = ttlMs;
+      fetch('api/presence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        keepalive: !!(closing || ttlMs > 0)
+      }).catch(function () { /* presence is advisory only */ });
+    } catch (e) { /* ignore */ }
+  }
+  // A frozen/bfcache page cannot run the 45 s heartbeat. Ask the server to hold
+  // the lease long enough for a phone tab that the OS freezes for hours; the
+  // next normal heartbeat (resume/visible) shortens it again. A really closed
+  // tab sends closing=true from pagehide, so this long lease is only a fallback.
+  function holdPresenceForFreeze() { postPresence(false, PRESENCE_FROZEN_MS); }
+  try {
+    document.addEventListener('freeze', holdPresenceForFreeze);
+    document.addEventListener('resume', function () { postPresence(false); });
+  } catch (e) { /* Page Lifecycle API not available */ }
+  function startPresence() {
+    postPresence(false);
+    if (presenceTimer) return;
+    presenceTimer = setInterval(function () { postPresence(false); }, PRESENCE_EVERY_MS);
+  }
+  startPresence();
+
   // ---- browser-side diagnostics: forward errors to the server log + visible banner ----
   // Banner rules (learned the hard way): it floats over the bottom-left of the
   // app, so it must NEVER take pointer events — a collapsed sidebar section
@@ -97,20 +145,44 @@
     };
   })();
 
-  // banner with an action button (parked tab / lost connection)
-  function showNotice(text, buttonText, onClick) {
+  // banner with an action button (parked tab / lost connection). A notice is
+  // sticky by design (report() must not clobber it), so it also needs an
+  // explicit way out that does NOT perform the action: the offline-gap notice
+  // after a long background is advisory, and forcing a reload just to clear it
+  // is exactly the behaviour this shim is trying to avoid.
+  function dismissNotice() {
+    if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = 0; }
+    var el = document.getElementById('zcode-webui-error');
+    if (el) el.remove();
+  }
+  function showNotice(text, buttonText, onClick, closable) {
     try {
       if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = 0; }
       var el = bannerEl();
       el.innerHTML = '';
       var t = document.createElement('div');
       t.textContent = '[zcode-webui] ' + text;
-      var b = document.createElement('button');
-      b.textContent = buttonText;
-      b.style.cssText = 'margin-top:8px;background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;pointer-events:auto;';
-      b.addEventListener('click', onClick);
       el.appendChild(t);
-      el.appendChild(b);
+      if (!buttonText && !closable) return;
+      var row = document.createElement('div');
+      row.style.cssText = 'margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;';
+      if (buttonText) {
+        var b = document.createElement('button');
+        b.textContent = buttonText;
+        b.style.cssText = 'background:#2f6fed;color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;pointer-events:auto;';
+        b.addEventListener('click', onClick);
+        row.appendChild(b);
+      }
+      if (closable) {
+        var c = document.createElement('button');
+        c.textContent = '关闭';
+        c.setAttribute('aria-label', '关闭提示');
+        c.title = '关闭提示（不重新同步）';
+        c.style.cssText = 'background:transparent;color:#9fb3c8;border:1px solid #40536a;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit;pointer-events:auto;';
+        c.addEventListener('click', dismissNotice);
+        row.appendChild(c);
+      }
+      el.appendChild(row);
     } catch (e) { /* ignore */ }
   }
 
@@ -233,6 +305,32 @@
     if (portQueue.length < 64) portQueue.push(u8);
   }
 
+  // Server control line (JSON). Arrives as a ws text message, or as a '{"…'
+  // payload in the HTTP relay frame stream — one handler for both transports, so
+  // startup states / pongs / gap notices behave identically on either.
+  // Returns true when the line was a control message (callers skip delivery).
+  function handleControlText(text) {
+    var data = String(text);
+    try {
+      var ctrl = JSON.parse(data);
+      if (ctrl && ctrl.kind === 'zcode-webui-background') { watchBackground(ctrl); return true; }
+      if (ctrl && ctrl.kind === 'zcode-webui-background-cleared') { dismissBackground(); return true; }
+      if (ctrl && ctrl.kind === 'zcode-webui-startup') { postRealStartupState(ctrl.state); return true; }
+      if (ctrl && ctrl.kind === 'zcode-webui-pong') { pongSeen = true; return true; }   // liveness only
+      if (ctrl && ctrl.kind === 'zcode-webui-gap') {
+        // the offline gap overflowed the server's replay buffer: the page was
+        // deliberately kept alive instead of reloaded, so say what was lost.
+        // Resyncing is the safe choice when the UI looks wrong, but it is not
+        // always needed — the notice must be dismissible without reloading.
+        showNotice('连接已恢复，但离线期间的部分事件未能送达。界面无异常时可关闭此提示继续使用；若显示异常，请重新同步。',
+          '重新同步', function () { window.location.reload(); }, true);
+        return true;
+      }
+    } catch (e) { /* not a control message */ }
+    console.debug('[zcode-webui]', data);
+    return false;
+  }
+
   // The official renderer's service-port handshake changed in 3.12:
   //   <= 3.11  window.postMessage('zcode:service-port', '*', [port])      (bare string)
   //   >= 3.12  window.postMessage({type:'zcode:service-port',
@@ -317,9 +415,9 @@
   }
 
   function requestStartupSnapshot() {
-    try {
-      if (mode === 'ws' && ws && ws.readyState === 1) ws.send('{"kind":"zcode-webui-startup-snapshot"}');
-    } catch (e) { /* ignore */ }
+    // works on both transports: sendToBridge queues while a socket/relay is
+    // down and flushes on recovery, so a snapshot request is never lost
+    try { sendToBridge('{"kind":"zcode-webui-startup-snapshot"}'); } catch (e) { /* ignore */ }
   }
 
   // The renderer can also ASK for a state replay: at module end it posts
@@ -345,7 +443,7 @@
     if (delivered) {
       // hot reconnect: the renderer already has its port — tell the server to
       // release any buffered frames immediately (resume mode, no replay)
-      try { if (ws && ws.readyState === 1) ws.send('{"kind":"zcode-webui-port-ready"}'); } catch (e) { /* ignore */ }
+      try { sendToBridge('{"kind":"zcode-webui-port-ready"}'); } catch (e) { /* ignore */ }
       return;
     }
     delivered = true;
@@ -380,9 +478,7 @@
         everDelivered = true;
         // tell the backend this renderer is now wired: an ADOPTED mid-stream host
         // releases its ordered frame buffer on this signal
-        try {
-          if (ws && ws.readyState === 1) ws.send('{"kind":"zcode-webui-port-ready"}');
-        } catch (e) { /* ignore */ }
+        try { sendToBridge('{"kind":"zcode-webui-port-ready"}'); } catch (e) { /* ignore */ }
         return;
       }
       setTimeout(waitReady, 50);
@@ -429,6 +525,14 @@
       if (len === 0 || off + len > u8.length) break;
       var payload = u8.slice(off, off + len);
       off += len;
+      // control lines (ready / startup state / pong / gap notice) share the frame
+      // stream on this transport: renderer frames always start with an RPC preset
+      // byte 0..6, so a leading '{' (0x7b) is unambiguously a JSON control line
+      if (payload.length > 1 && payload[0] === 0x7b) {
+        var text = '';
+        try { text = new TextDecoder().decode(payload); } catch (e) { text = ''; }
+        if (text && handleControlText(text)) return;
+      }
       if (window.__zb_debug || reported > 0) {
         var hex = '';
         for (var k = 0; k < Math.min(payload.length, 16); k++) hex += ('0' + payload[k].toString(16)).slice(-2);
@@ -465,13 +569,16 @@
 
   // Bring SOME transport back when the current one is verifiably dead, always
   // preferring the ws hot-resume path (it keeps the renderer era alive and the
-  // server replays the offline gap; the http fallback can do neither).
+  // server replays the offline gap).
   function recoverTransport() {
     if (mode === 'ws') {
       if (!ws || ws.readyState > 1) connect();
       return;
     }
     if (httpRetryTimer) { clearTimeout(httpRetryTimer); httpRetryTimer = 0; }
+    // hand the page back to ws: drop the relay VIEW (the server parks the era and
+    // the ws resume below re-attaches it to the same host)
+    closeHttpMode();
     mode = 'ws';
     connect();
   }
@@ -482,9 +589,20 @@
     mode = 'http';
     console.warn('[zcode-webui] websocket unavailable, switching to http polling bridge');
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
-    fetch('bridge/open', { method: 'POST' })
+    // tab + resume: the server attaches this page as a VIEW of the account's
+    // running host. resume=1 (the page already booted) makes it a HOT switch of
+    // the SAME renderer era — same host, same conversation handshake, ids
+    // re-pointed — instead of a second host that never got the handshake.
+    fetch('bridge/open?tab=' + encodeURIComponent(TAB_ID) + (everDelivered ? '&resume=1' : ''), { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function (o) {
+        if (o && o.staleEra) {
+          // the host no longer holds this page's era (server restart / reaped):
+          // its event subscriptions can never be restored, so reload clean
+          console.warn('[zcode-webui] relay open: stale era on the server, reloading');
+          window.location.reload();
+          return;
+        }
         if (!o.ok) throw new Error(o.error || 'open failed');
         httpSessionId = o.id;
         if (o.startupMode === 'runtime' && o.startupId) {
@@ -513,9 +631,10 @@
   }
 
   // Closing the browser tab must close the HTTP bridge too — otherwise every
-  // refresh/close leaves a full zcode-server host parked on the backend forever.
+  // refresh/close leaves a parked relay view behind. With one host per account
+  // this only drops the VIEW (the server keeps a running turn alive).
   function closeHttpMode() {
-    if (mode !== 'http' || !httpSessionId) return;
+    if (!httpSessionId) return;
     var id = httpSessionId;
     httpSessionId = null;
     try {
@@ -528,7 +647,15 @@
   window.addEventListener('pagehide', function (ev) {
     // Do NOT close when entering bfcache (ev.persisted): the page can restore
     // and re-open its relay in the pageshow handler below.
-    if (!ev.persisted) closeHttpMode();
+    if (ev.persisted) {
+      holdPresenceForFreeze();          // bfcache pages can sit for hours
+    } else {
+      // tell the server the lease is over even if the WS close event is lost;
+      // a missed beacon is harmless (the lease simply expires)
+      presenceClosed = true;
+      postPresence(true);
+      closeHttpMode();
+    }
   });
 
   // WebSocket path by deployment mode:
@@ -615,9 +742,11 @@
           if (ctrl && ctrl.kind === 'zcode-webui-pong') { pongSeen = true; return; }   // liveness only
           if (ctrl && ctrl.kind === 'zcode-webui-gap') {
             // the offline gap overflowed the server's replay buffer: the page was
-            // deliberately kept alive instead of reloaded, so say what was lost
-            showNotice('连接已恢复，但离线期间的部分事件未能送达。若界面显示异常，点此重新同步。',
-              '重新同步', function () { window.location.reload(); });
+            // deliberately kept alive instead of reloaded, so say what was lost.
+            // Resyncing is the safe choice when the UI looks wrong, but it is not
+            // always needed — the notice must be dismissible without reloading.
+            showNotice('连接已恢复，但离线期间的部分事件未能送达。界面无异常时可关闭此提示继续使用；若显示异常，请重新同步。',
+              '重新同步', function () { window.location.reload(); }, true);
             return;
           }
         } catch (e) { /* not a control message */ }
@@ -657,7 +786,7 @@
         reloadAttempts++;
         flash('会话进程已重启，正在恢复会话…');
         if (reloadAttempts > 2) {
-          showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); });
+          showNotice('连接已断开且自动重连失败。会话数据都在服务端，点此重连即可继续。', '重新连接', function () { window.location.reload(); }, true);
           reloadAttempts = 0;
         } else {
           setTimeout(function () { window.location.reload(); }, 1200);
@@ -738,11 +867,13 @@
     probeNow();
   }, PING_EVERY_MS);
   window.addEventListener('focus', function () {
+    postPresence(false);
     if (mode !== 'ws') return;
     if (!ws || ws.readyState > 1) { hotAttempts = 0; connect(); return; }
     probeNow(true);
   });
   window.addEventListener('online', function () {
+    postPresence(false);
     if (mode !== 'ws') return;
     hotAttempts = 0; reloadAttempts = 0; wsOpenFails = 0;
     if (!ws || ws.readyState > 1) connect();
@@ -750,6 +881,7 @@
   });
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible') return;
+    postPresence(false);
     // back in the foreground: fresh recovery budget + immediate action
     hotAttempts = 0;
     reloadAttempts = 0;
@@ -764,6 +896,8 @@
     }
   });
   window.addEventListener('pageshow', function (ev) {
+    presenceClosed = false;
+    postPresence(false);
     if (!ev.persisted) return;                     // bfcache restore: socket is dead
     hotAttempts = 0; reloadAttempts = 0; wsOpenFails = 0;
     if (mode === 'ws') {
@@ -776,6 +910,12 @@
   // debug/test hook: current socket readiness (0 connecting, 1 open, 3 closed)
   window.__zwebui_ws = function () { return ws ? ws.readyState : -1; };
   window.__zwebui_wsDrop = function () { try { if (ws) ws.close(); } catch (e) { /* ignore */ } };
+  // debug/test hook: renew the presence lease now (or send the closing beacon)
+  window.__zwebui_presence = function (closing, ttlMs) { postPresence(!!closing, Number(ttlMs) || 0); };
+  // debug/test hook: render an advisory notice exactly like the gap/resent paths
+  window.__zwebui_notice = function (text, actionText, onClick, closable) {
+    showNotice(text, actionText, onClick, closable);
+  };
   // debug/test hook: enqueue a frame exactly as the renderer's port would
   // (goes through the uplink buffer when the transport is down)
   window.__zwebui_send = function (data) { sendToBridge(data); };

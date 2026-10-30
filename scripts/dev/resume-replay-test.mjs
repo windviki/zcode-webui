@@ -27,14 +27,17 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
 // ---- the scripted fake host (speaks the stdio frame protocol) ----
 // Handshake (zcode-hello line) + one Initialize (200) frame at boot. Every
-// inbound call (100) is answered with a response (201) — except method 'hold',
-// which is remembered unanswered; a 'go' call answers everything held first.
+// inbound call (100) is answered with a response (201) — except methods 'hold'
+// and 'holdbig', which are remembered unanswered; a 'go' call answers everything
+// held first. 'holdbig' answers with a 2 MiB body so the parked-era buffer has
+// to skip an oversized RESPONSE frame instead of dropping the whole gap.
 const FAKE_HOST = `
 const path = require('path');
 (async () => {
   const { encodeRpcHeader } = await import(require('url').pathToFileURL(path.join(process.env.ZWEBUI_FAKE_HOST_ROOT, 'src', 'rpclog.mjs')).href);
   const enc = (payload) => { const b = Buffer.alloc(13 + payload.length); b.writeUInt8(1, 0); b.writeUInt32BE(0, 1); b.writeUInt32BE(0, 5); b.writeUInt32BE(payload.length, 9); payload.copy(b, 13); return b; };
   const body = Buffer.from([0]);
+  const bigBody = Buffer.alloc(2 * 1024 * 1024, 0x41);
   process.stdout.write(JSON.stringify({ type: 'zcode-hello', version: 'fake-host-1' }) + '\\n');
   setTimeout(() => {
     process.stdout.write(enc(Buffer.concat([encodeRpcHeader([200, 1, 'zwebui-init', 'initialize']), body])));
@@ -66,9 +69,12 @@ const path = require('path');
       buf = buf.subarray(13 + len);
       const hdr = readHdr(payload);
       if (!hdr || hdr[0] !== 100) continue;
-      if (hdr[3] === 'hold') { held.push(hdr); continue; }
+      if (hdr[3] === 'hold' || hdr[3] === 'holdbig') { held.push(hdr); continue; }
       if (hdr[3] === 'go') {
-        for (const c of held) process.stdout.write(enc(Buffer.concat([encodeRpcHeader([201, c[1], c[2], c[3]]), body])));
+        for (const c of held) {
+          const payloadBody = c[3] === 'holdbig' ? bigBody : body;
+          process.stdout.write(enc(Buffer.concat([encodeRpcHeader([201, c[1], c[2], c[3]]), payloadBody])));
+        }
         held.length = 0;
       }
       process.stdout.write(enc(Buffer.concat([encodeRpcHeader([201, hdr[1], hdr[2], hdr[3]]), body])));
@@ -170,10 +176,60 @@ function wsClient(base, { cookie, wsToken }, tab, resume) {
   });
 }
 
-let sandbox = null, server = null, sandbox2 = null, server2 = null;
+// HTTP relay client (bootstrap.js's fallback transport): /bridge/open attaches
+// this page as a VIEW, /bridge/send carries uplink frames, /bridge/poll returns
+// length-prefixed downlink frames.
+async function relayClient(base, id, tab, resume) {
+  const r = await fetch(base + 'bridge/open?tab=' + encodeURIComponent(tab) + (resume ? '&resume=1' : ''), {
+    method: 'POST', headers: { cookie: id.cookie },
+  });
+  const o = await r.json();
+  if (!o.ok) return { open: o, frames: [], failed: true };
+  const client = {
+    open: o, id: o.id, frames: [], texts: [],
+    async sendLine(idNum, method) {
+      const body = Buffer.concat([encodeRpcHeader([100, idNum, 'zwebui-test', method]), Buffer.from([0])]);
+      const res = await fetch(base + 'bridge/send?id=' + o.id, {
+        method: 'POST', headers: { cookie: id.cookie, 'content-type': 'application/octet-stream' }, body,
+      });
+      return res.status;
+    },
+    async sendText(text) {
+      const res = await fetch(base + 'bridge/send?id=' + o.id, {
+        method: 'POST', headers: { cookie: id.cookie, 'content-type': 'application/octet-stream' }, body: Buffer.from(text),
+      });
+      return res.status;
+    },
+    async pollOnce() {
+      const res = await fetch(base + 'bridge/poll?id=' + o.id, { headers: { cookie: id.cookie } });
+      if (!res.ok) return [];
+      const buf = Buffer.from(await res.arrayBuffer());
+      const out = [];
+      let off = 0;
+      while (off + 4 <= buf.length) {
+        const len = buf.readUInt32BE(off);
+        off += 4;
+        if (off + len > buf.length) break;
+        const payload = buf.subarray(off, off + len);
+        off += len;
+        out.push(payload);
+        if (payload.length > 1 && payload[0] === 0x7b) { client.texts.push(payload.toString('utf8')); continue; }
+        const hdr = decodeRpc(payload);
+        if (hdr) client.frames.push({ hdr, raw: Buffer.from(payload) });
+      }
+      return out;
+    },
+    async close() {
+      await fetch(base + 'bridge/close?id=' + o.id, { method: 'POST', headers: { cookie: id.cookie } });
+    },
+  };
+  return client;
+}
+
+let sandbox = null, server = null, sandbox2 = null, server2 = null, sandbox3 = null, server3 = null, sandbox4 = null, server4 = null;
 function cleanup() {
-  for (const s of [server, server2]) { try { if (s && s.exitCode === null) s.kill('SIGKILL'); } catch (_e) { /* ignore */ } }
-  for (const s of [sandbox, sandbox2]) { try { if (s) rmSync(s, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
+  for (const s of [server, server2, server3, server4]) { try { if (s && s.exitCode === null) s.kill('SIGKILL'); } catch (_e) { /* ignore */ } }
+  for (const s of [sandbox, sandbox2, sandbox3, sandbox4]) { try { if (s) rmSync(s, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
 }
 process.on('exit', cleanup);
 process.on('SIGINT', () => process.exit(130));
@@ -319,6 +375,205 @@ try {
   check('B: no-pong client survived the FIRST missed ping (leniency)', aliveAtFirstMiss, 'closed after ' + dead + 'ms');
   check('B: no-pong client terminated after ~' + MAX_MISS + ' misses', deadEventually, 'closed after ' + dead + 'ms');
   check('B: unresponsive log names the miss count', server2.log.some((l) => l.includes('no pong for')));
+
+  // ============================== Part C ==============================
+  // Presence lease + oversized response: a live page keeps its detached host
+  // and parked era past the TTL; a single huge RESPONSE frame is skipped (not
+  // the whole gap) and answered with a retryable 202 on resume.
+  sandbox3 = await makeSandbox('/tmp/zwebui-presence.XXXXXX');
+  mkdirSync(path.join(sandbox3, 'zcode/server'), { recursive: true });
+  symlinkSync(process.execPath, path.join(sandbox3, 'zcode/server/node'));
+  writeFileSync(path.join(sandbox3, 'zcode/server/zcode-server.cjs'), FAKE_HOST);
+
+  const port3 = 3700 + Math.floor(Math.random() * 200);
+  const base3 = 'http://127.0.0.1:' + port3 + '/';
+  const TTL = 900, REAP = 250, PARK = 500, LEASE = 2500;
+  server3 = startServer(sandbox3, port3, {
+    ZCODE_WEBUI_DETACHED_TTL_MS: String(TTL),
+    ZCODE_WEBUI_REAP_INTERVAL_MS: String(REAP),
+    ZCODE_WEBUI_RESUME_PARK_MS: String(PARK),
+    ZCODE_WEBUI_PRESENCE_LEASE_MS: String(LEASE),
+    ZCODE_WEBUI_FRAME_QUIET_MS: '100',
+    ZCODE_WEBUI_RESUME_BUF_MAX_MB: '1',
+    ...(process.env.RESUME_TEST_DEBUG ? { ZCODE_WEBUI_DEBUG_RPC: '1' } : {}),
+  });
+  check('C: sandbox server up (presence/oversized env)', await waitHealth(base3));
+
+  const id3 = await identity(base3);
+  const sendPresence = (tab, closing, ttlMs) => fetch(base3 + 'api/presence', {
+    method: 'POST',
+    headers: { cookie: id3.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ tab, state: 'visible', closing: !!closing, ...(ttlMs ? { ttlMs } : {}) }),
+  }).then((r) => r.json());
+
+  const c1 = await wsClient(base3, id3, 'tab-C1', false);
+  await sleep(300);
+  c1.sendCall(1, 'holdbig');                 // host remembers it, answers only on 'go'
+  await sleep(250);
+  await sendPresence('tab-C1');              // page is alive before the socket drops
+  c1.close();
+  await sleep(100);
+  // Renew the lease beyond DETACHED_TTL_MS and RESUME_PARK_MS. The host and the
+  // parked era must both survive: this is the "long background, same tab" case.
+  for (let i = 0; i < 8; i++) { await sendPresence('tab-C1'); await sleep(300); }
+  const alive3 = await (await fetch(base3 + 'api/health')).json();
+  check('C: live presence lease keeps the detached host alive past TTL', alive3.sessions.total === 1, JSON.stringify(alive3.sessions));
+  check('C: live presence lease keeps the parked era (not retired)',
+    !server3.log.some((l) => l.includes('parked era retired tab=tab-C1')));
+
+  // Another viewer triggers the held call while tab C1 is parked. Its response is
+  // 2 MiB > the 1 MiB replay cap: skip the response, keep the gap.
+  const c2 = await wsClient(base3, id3, 'tab-C2', false);
+  c2.portReady();
+  await sleep(250);
+  c2.sendCall(1, 'go');
+  await sleep(700);
+  check('C: oversized response skipped', server3.log.some((l) => l.includes('skipped oversized response tab=tab-C1')));
+  check('C: oversized response did NOT overflow the whole gap',
+    !server3.log.some((l) => l.includes('resume gap buffer overflowed tab=tab-C1')));
+  if (process.env.RESUME_TEST_DEBUG) {
+    console.log('--- server3 log (tail) ---');
+    console.log(server3.log.slice(-60).join('\n'));
+  }
+
+  const c1b = await wsClient(base3, id3, 'tab-C1', true);
+  await sleep(500);
+  const synthBig = c1b.frames.find((f) => f.hdr && f.hdr.type === 202 && f.hdr.id === 1);
+  check('C: resumed tab gets a retryable 202 for the skipped response', !!synthBig,
+    synthBig ? JSON.stringify(synthBig.hdr.body).slice(0, 160) : 'none');
+  check('C: synthesized error explains the oversized response',
+    !!(synthBig && synthBig.hdr.body && /too large for the offline replay buffer/.test(String(synthBig.hdr.body.message || ''))));
+  c1b.close(); c2.close();
+  await sleep(100);
+
+  // Stop renewing the lease: after LEASE + TTL the host is reaped again.
+  await sleep(LEASE + TTL + REAP * 4);
+  const gone3 = await (await fetch(base3 + 'api/health')).json();
+  check('C: expired lease lets the detached host be reaped', gone3.sessions.total === 0, JSON.stringify(gone3.sessions));
+
+  // A frozen/bfcache page sends one long-ttl lease instead of the 45 s
+  // heartbeat. It must survive beyond the normal lease, then still expire.
+  const FROZEN_TTL = LEASE * 3;
+  const c3 = await wsClient(base3, id3, 'tab-C3', false);
+  await sleep(250);
+  await sendPresence('tab-C3', false, FROZEN_TTL);
+  c3.close();
+  await sleep(LEASE + TTL + REAP * 2);
+  const frozenAlive = await (await fetch(base3 + 'api/health')).json();
+  check('C: frozen-tab long lease survives past the normal lease', frozenAlive.sessions.total === 1, JSON.stringify(frozenAlive.sessions));
+  await sleep(FROZEN_TTL - LEASE + TTL + REAP * 4);
+  const frozenGone = await (await fetch(base3 + 'api/health')).json();
+  check('C: frozen-tab long lease expires and the host is reaped', frozenGone.sessions.total === 0, JSON.stringify(frozenGone.sessions));
+  // ============================== Part D ==============================
+  // HTTP fallback transport must be a VIEW of the account's one host, not a
+  // second host of its own. A second host never received the renderer's
+  // conversation handshake, so after a mid-session ws→http switch every
+  // zcode-agent.* call failed with fault.connection.handshakeRequired — the
+  // "handshake is required" send failure behind the composer doing nothing.
+  sandbox4 = await makeSandbox('/tmp/zwebui-relay.XXXXXX');
+  mkdirSync(path.join(sandbox4, 'zcode/server'), { recursive: true });
+  symlinkSync(process.execPath, path.join(sandbox4, 'zcode/server/node'));
+  writeFileSync(path.join(sandbox4, 'zcode/server/zcode-server.cjs'), FAKE_HOST);
+
+  const port4 = 3900 + Math.floor(Math.random() * 200);
+  const base4 = 'http://127.0.0.1:' + port4 + '/';
+  server4 = startServer(sandbox4, port4);
+  check('D: sandbox server up (relay adoption)', await waitHealth(base4));
+  const id4 = await identity(base4);
+
+  const d1 = await wsClient(base4, id4, 'tab-D1', false);
+  await sleep(300);
+  const before = await (await fetch(base4 + 'api/health')).json();
+  check('D: ws page spawned ONE host', before.sessions.total === 1, JSON.stringify(before.sessions));
+
+  // a cold relay page (booted straight into http mode) joins the SAME host
+  const relay1 = await relayClient(base4, id4, 'tab-D2', false);
+  check('D: relay open succeeded', !relay1.failed, JSON.stringify(relay1.open));
+  const afterOpen = await (await fetch(base4 + 'api/health')).json();
+  check('D: relay did NOT spawn a second host', afterOpen.sessions.total === 1, JSON.stringify(afterOpen.sessions));
+  check('D: relay attached as a second view', afterOpen.sessions.views === 2, JSON.stringify(afterOpen.sessions));
+  check('D: relay adopted the running host', server4.log.some((l) => l.includes('http session opened') && l.includes('(adopted)')));
+  await relay1.sendText('{"kind":"zcode-webui-port-ready"}');
+  await sleep(300);
+  await relay1.pollOnce();
+  check('D: adopted relay got the Initialize replay', relay1.frames.some((f) => f.hdr && f.hdr.type === 200));
+
+  // uplink frames reach the host, responses come back through /bridge/poll with
+  // the renderer-LOCAL id restored (the mux translated it on the way in)
+  const st = await relay1.sendLine(7, 'pingme');
+  check('D: relay send accepted', st === 200, 'status=' + st);
+  await sleep(400);
+  await relay1.pollOnce();
+  const relayResp = relay1.frames.find((f) => f.hdr && f.hdr.type === 201 && f.hdr.method === 'pingme');
+  check('D: relay got its response back', !!relayResp, relayResp ? JSON.stringify(relayResp.hdr).slice(0, 120) : 'none');
+  check('D: response carries the renderer-local id', relayResp && relayResp.hdr.id === 7, 'id=' + (relayResp && relayResp.hdr.id));
+
+  // THE regression: a page booted over ws loses its socket and flips to the
+  // relay. The SAME host must answer it (same era, same mux ids) — proof the
+  // transport swap no longer strands the page on a host that never received the
+  // conversation handshake ("handshake is required" on send).
+  const d2 = await wsClient(base4, id4, 'tab-D4', false);
+  await sleep(250);
+  d2.sendCall(1, 'hold');                    // in flight when the socket dies
+  await sleep(250);
+  d2.close();
+  await sleep(250);
+  // the parked era's buffered response (a call ANSWERED while the tab was away)
+  // must be replayed over the relay: d1's 'go' makes the fake host answer 'hold'
+  d1.sendCall(9, 'go');
+  await sleep(400);
+  const relay2 = await relayClient(base4, id4, 'tab-D4', true);
+  check('D: mid-session relay switch succeeded', !relay2.failed && !relay2.open.staleEra, JSON.stringify(relay2.open));
+  const swapped = await (await fetch(base4 + 'api/health')).json();
+  check('D: transport swap kept the SAME host', swapped.sessions.total === 1, JSON.stringify(swapped.sessions));
+  await relay2.pollOnce();
+  const held = relay2.frames.find((f) => f.hdr && f.hdr.type === 201 && f.hdr.method === 'hold');
+  check('D: response buffered while parked replayed over the relay', !!held, held ? JSON.stringify(held.hdr).slice(0, 120) : 'none');
+  check('D: replayed response kept the renderer-local id', held && held.hdr.id === 1, 'id=' + (held && held.hdr.id));
+  // and the swapped page can keep working through the relay (mux ids allocated
+  // after the swap still round-trip)
+  const stSwap = await relay2.sendLine(2, 'after-swap');
+  await sleep(400);
+  await relay2.pollOnce();
+  check('D: calls sent after the swap round-trip over the relay',
+    stSwap === 200 && relay2.frames.some((f) => f.hdr && f.hdr.type === 201 && f.hdr.method === 'after-swap' && f.hdr.id === 2),
+    'status=' + stSwap);
+
+  // a call that is STILL unanswered when the socket dies cannot be left hanging:
+  // the swapped page gets the synthesized retryable 202 on the relay
+  const d3 = await wsClient(base4, id4, 'tab-D5', false);
+  await sleep(250);
+  d3.sendCall(5, 'hold');                    // never answered
+  await sleep(250);
+  d3.close();
+  await sleep(250);
+  const relay3 = await relayClient(base4, id4, 'tab-D5', true);
+  await sleep(200);
+  await relay3.pollOnce();
+  const synth = relay3.frames.find((f) => f.hdr && f.hdr.type === 202 && f.hdr.id === 5);
+  check('D: unanswered in-flight call gets a synthesized 202 on the relay', !!synth,
+    synth ? JSON.stringify(synth.hdr.body || {}).slice(0, 120) : 'none');
+  await relay3.close();
+  await sleep(200);
+
+  // pagehide / reload of the relay page only drops the VIEW: a running turn on
+  // the shared host must survive
+  const viewsBefore = (await (await fetch(base4 + 'api/health')).json()).sessions.views;
+  await relay1.close();
+  await sleep(300);
+  const afterClose = await (await fetch(base4 + 'api/health')).json();
+  check('D: relay close kept the host alive', afterClose.sessions.total === 1, JSON.stringify(afterClose.sessions));
+  check('D: relay close detached only that view', afterClose.sessions.views === viewsBefore - 1,
+    'viewsBefore=' + viewsBefore + ' after=' + JSON.stringify(afterClose.sessions));
+
+  // a page that already booted cannot silently land on a host without its era:
+  // the server says so and bootstrap reloads (clean re-bootstrap)
+  const stale = await relayClient(base4, id4, 'tab-never-seen', true);
+  check('D: stale-era relay resume is rejected with staleEra', !!stale.failed && stale.open.staleEra === true, JSON.stringify(stale.open));
+
+  await relay2.close();
+  try { d1.close(); } catch (_e) { /* ignore */ }
+
 } catch (e) {
   console.log('FAIL  ' + (e && e.message ? e.message : e));
   checks.push(false);

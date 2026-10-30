@@ -147,6 +147,16 @@ async function httpBridgeAttempt(attempt) {
   if (!open.ok || !open.id) return { ok: false, log, reason: 'open failed' };
   const id = open.id;
   try {
+    // Wire the "service port" the way a real page does (bootstrap.js sends this
+    // right after receiving the port): an ADOPTED host holds downstream frames
+    // until this ack, so without it the Initialize can take the 8 s failsafe.
+    try {
+      await fetch(origin + base + '/bridge/send?id=' + id, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: Buffer.from('{"kind":"zcode-webui-port-ready"}'),
+      });
+    } catch (_e) { /* older servers just ignore it */ }
     const req = message([100, 1, 'system', 'info'], undefined);
     // Empty polls long-poll server-side (~25 s); self-pace on a deadline.
     const deadline = Date.now() + 30000;
