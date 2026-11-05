@@ -97,8 +97,14 @@
     }
     return el;
   }
+  // Ring of the last few delivered frames, attached to the next error report so
+  // a crash can be traced to the frame that preceded it. It used to set
+  // window.__zb_debug = true as a side effect, which then turned on a
+  // console.debug PER FRAME for the rest of the page's life — expensive with
+  // devtools open (devtools formats every call) and observed on a page that had
+  // 56 errors and ~25-40 frames/s. Debug logging is now strictly opt-in
+  // (?zbdebug=1); this ring only records.
   function noteDelivered(hex, len) {
-    window.__zb_debug = true;
     lastDelivered.push(len + 'B:' + hex);
     if (lastDelivered.length > 4) lastDelivered.shift();
   }
@@ -302,8 +308,263 @@
       try { port2.postMessage(u8, [u8.buffer]); } catch (e) { /* ignore */ }
       return;
     }
+    perf.queued++;
     if (portQueue.length < 64) portQueue.push(u8);
   }
+
+  // ---- performance telemetry -------------------------------------------------
+  // "zcode-webui 最近很卡" needs measurements, not guesses. The shim is the only
+  // place that sees both halves of the conversation at once, so it samples the
+  // two things that actually cause perceived lag here:
+  //
+  //   1. the traffic it pushes into the renderer — frames/s, bytes/s, the largest
+  //      frames and the biggest poll batch. A streaming turn emits ~25-40 RPC
+  //      frames/s (measured from the host's own frame counters), and every frame
+  //      walks the renderer's whole RPC channel and usually a React update;
+  //   2. main-thread blockage: long tasks (passive PerformanceObserver) plus a
+  //      short rAF sampling window per report (p50/p95/max interval + jank
+  //      counts), heap and DOM size.
+  //
+  // Every report posts ONE compact line to the server (kind=perf) so the server
+  // log itself carries the timeline; the full object is one call away:
+  //   window.__zwebui_perf()           current snapshot (object)
+  //   window.__zwebui_perf_sample(ms)  Promise<fps stats> — runs a rAF window
+  //   window.__zwebui_perf_report()    force a report now (also logs it)
+  //   window.__zwebui_perf_reset()     zero the counters
+  // Cost per frame: a handful of counter increments. Cost per 30s: one 6s rAF
+  // window (20% duty cycle). No layout reads, no string building until report.
+  var PERF_REPORT_MS = Math.max(Number((cfg && cfg.perfIntervalMs)) || 30000, 5000);
+  var PERF_RAF_WINDOW_MS = 6000;
+  var perf = {
+    at: Date.now(),
+    inFrames: 0, inBytes: 0, outFrames: 0, outBytes: 0,
+    maxFrame: 0, maxFrameHex: '', topFrames: [],
+    types: {},                       // first byte (RPC preset 0..6) -> count
+    queued: 0,
+    batches: 0, maxBatchFrames: 0, maxBatchBytes: 0,
+    polls: 0, pollMs: [], pollMaxMs: 0, pollFail: 0,
+    wsOpens: 0, fallbacks: 0, reconnects: 0, httpOpens: 0,
+    preReadyFrames: 0, controlDrops: 0,
+    longTasks: 0, longTotal: 0, longMax: 0, longTop: [],
+    fps: null, fpsAt: 0, fpsHidden: 0, fpsStalled: 0,
+    reports: 0, lastReport: '',
+    // cumulative since load/reset (the 30s log line reports the interval; the
+    // on-demand snapshot shows both, so a short collection is still readable)
+    totInFrames: 0, totInBytes: 0, totOutFrames: 0, totOutBytes: 0,
+    totLongTasks: 0, totLongTotal: 0, totLongMax: 0,
+    // 60 one-second buckets for frames/bytes (peak rate + last-minute totals)
+    buckets: [],
+  };
+  function perfBucket(now) {
+    var s = Math.floor(now / 1000);
+    var b = perf.buckets[s % 60];
+    if (!b || b.sec !== s) { b = { sec: s, frames: 0, bytes: 0 }; perf.buckets[s % 60] = b; }
+    return b;
+  }
+  // one inbound frame as delivered to the renderer (called from the ws handler
+  // and from the http frame parser)
+  function perfIn(bytes, firstByte, hex) {
+    perf.inFrames++;
+    perf.inBytes += bytes || 0;
+    perf.totInFrames++;
+    perf.totInBytes += bytes || 0;
+    if (!hex) { hex = ''; for (var i = 0; i < Math.min(bytes || 0, 8); i++) hex += '..'; }
+    if ((bytes || 0) > perf.maxFrame) { perf.maxFrame = bytes || 0; perf.maxFrameHex = hex || ''; }
+    if (perf.topFrames.length < 5 || (bytes || 0) > perf.topFrames[perf.topFrames.length - 1].bytes) {
+      perf.topFrames.push({ bytes: bytes || 0, hex: hex || '', t: Date.now() });
+      perf.topFrames.sort(function (a, b) { return b.bytes - a.bytes; });
+      if (perf.topFrames.length > 5) perf.topFrames.length = 5;
+    }
+    var b = perfBucket(Date.now());
+    b.frames++; b.bytes += bytes || 0;
+    if (typeof firstByte === 'number') perf.types[firstByte] = (perf.types[firstByte] || 0) + 1;
+  }
+  function perfOut(bytes) {
+    perf.outFrames++;
+    perf.outBytes += bytes || 0;
+    perf.totOutFrames++;
+    perf.totOutBytes += bytes || 0;
+    var b = perfBucket(Date.now());
+    b.outFrames++;
+  }
+  (function watchLongTasks() {
+    try {
+      if (typeof PerformanceObserver !== 'function') return;
+      var po = new PerformanceObserver(function (list) {
+        var es = list.getEntries();
+        for (var i = 0; i < es.length; i++) {
+          var d = es[i].duration;
+          perf.longTasks++;
+          perf.longTotal += d;
+          if (d > perf.longMax) perf.longMax = d;
+          perf.totLongTasks++;
+          perf.totLongTotal += d;
+          if (d > perf.totLongMax) perf.totLongMax = d;
+          if (d >= 100) {
+            var a = (es[i].attribution && es[i].attribution[0]) || null;
+            perf.longTop.push({
+              ms: Math.round(d),
+              name: (a && (a.name || a.containerType)) || '',
+              src: String((a && a.containerSrc) || '').slice(-60),
+              t: Date.now(),
+            });
+            perf.longTop.sort(function (x, y) { return y.ms - x.ms; });
+            if (perf.longTop.length > 5) perf.longTop.length = 5;
+          }
+        }
+      });
+      po.observe({ entryTypes: ['longtask'] });
+    } catch (e) { /* longtask unsupported (Safari/Firefox): fps window still works */ }
+  })();
+  // rAF jank sampling window. Runs for PERF_RAF_WINDOW_MS at a time so the page
+  // is not kept awake by a permanent animation-frame loop.
+  function perfSampleFps(ms, done) {
+    var windowMs = Math.max(1000, Number(ms) || PERF_RAF_WINDOW_MS);
+    var started = performance.now();
+    var t0 = 0;
+    var intervals = [];
+    var stalled = 0;
+    var finished = false;
+    function finish() {
+      if (finished) return;
+      finished = true;
+      if (stalled) perf.fpsStalled++;
+      if (!intervals.length) { perf.fps = { frames: 0, p50: 0, p95: 0, max: 0, jank50: 0, jank100: 0, jank250: 0, hidden: true }; }
+      else {
+        var s = intervals.slice().sort(function (a, b) { return a - b; });
+        var pick = function (p) { return Math.round(s[Math.min(s.length - 1, Math.floor(s.length * p))] * 10) / 10; };
+        var j = function (v) { var n = 0; for (var i = 0; i < intervals.length; i++) if (intervals[i] >= v) n++; return n; };
+        perf.fps = {
+          frames: intervals.length, windowMs: Math.round(performance.now() - started),
+          p50: pick(0.5), p95: pick(0.95), max: Math.round(s[s.length - 1] * 10) / 10,
+          jank50: j(50), jank100: j(100), jank250: j(250),
+        };
+      }
+      perf.fpsAt = Date.now();
+      if (done) { try { done(perf.fps); } catch (e) { /* ignore */ } }
+    }
+    if (document.hidden) { stalled = 1; setTimeout(finish, 0); return; }
+    // hard deadline in case rAF stalls completely (throttled tab / frozen frame)
+    var guard = setTimeout(function () { stalled = 1; finish(); }, windowMs + 4000);
+    var prev = 0;
+    function tick(now) {
+      if (finished) return;
+      if (prev) intervals.push(now - prev);
+      prev = now;
+      if (now - started >= windowMs) { clearTimeout(guard); finish(); return; }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+  function perfRate() {
+    var now = Date.now();
+    var sumF = 0, sumB = 0, peak = 0;
+    for (var i = 0; i < 60; i++) {
+      var b = perf.buckets[i];
+      if (!b) continue;
+      if (now - b.sec * 1000 > 60000) continue;
+      sumF += b.frames; sumB += b.bytes;
+      if (b.frames > peak) peak = b.frames;
+    }
+    return { framesPerSec: Math.round(sumF / 60 * 10) / 10, kbPerSec: Math.round(sumB / 1024 / 60 * 10) / 10, peakFramesPerSec: peak, minuteFrames: sumF, minuteBytes: sumB };
+  }
+  function kb(n) { return Math.round((n || 0) / 1024 * 10) / 10 + 'kB'; }
+  function perfSnapshot() {
+    var r = perfRate();
+    var mem = null;
+    try {
+      if (performance.memory) {
+        mem = {
+          usedMb: Math.round(performance.memory.usedJSHeapSize / 1048576 * 10) / 10,
+          totalMb: Math.round(performance.memory.totalJSHeapSize / 1048576 * 10) / 10,
+          limitMb: Math.round(performance.memory.jsHeapSizeLimit / 1048576 * 10) / 10,
+        };
+      }
+    } catch (e) { /* not available */ }
+    var nodes = 0;
+    try { nodes = document.getElementsByTagName('*').length; } catch (e) { /* ignore */ }
+    return {
+      upSec: Math.round((Date.now() - perf.at) / 1000),
+      transport: mode,
+      traffic: { inFrames: perf.inFrames, inBytes: perf.inBytes, outFrames: perf.outFrames, outBytes: perf.outBytes, queued: perf.queued, kbPerSec: r.kbPerSec, framesPerSec: r.framesPerSec, peakFramesPerSec: r.peakFramesPerSec, minuteFrames: r.minuteFrames, minuteBytes: r.minuteBytes, types: perf.types },
+      totals: { inFrames: perf.totInFrames, inBytes: perf.totInBytes, outFrames: perf.totOutFrames, outBytes: perf.totOutBytes, longTasks: perf.totLongTasks, longTotalMs: Math.round(perf.totLongTotal), longMaxMs: Math.round(perf.totLongMax) },
+      frames: { maxBytes: perf.maxFrame, maxHex: perf.maxFrameHex, top: perf.topFrames.slice(0, 5) },
+      batches: { polls: perf.batches, maxFrames: perf.maxBatchFrames, maxBytes: perf.maxBatchBytes },
+      poll: { count: perf.polls, maxMs: perf.pollMaxMs, p50: pctl(perf.pollMs, 0.5), p95: pctl(perf.pollMs, 0.95), failed: perf.pollFail },
+      ws: { opens: perf.wsOpens, fallbacks: perf.fallbacks, reconnects: perf.reconnects, httpOpens: perf.httpOpens, preReadyFrames: perf.preReadyFrames, controlDrops: perf.controlDrops },
+      longTasks: { count: perf.longTasks, totalMs: Math.round(perf.longTotal), maxMs: Math.round(perf.longMax), top: perf.longTop.slice(0, 5) },
+      fps: perf.fps, fpsAt: perf.fpsAt, fpsHidden: perf.fpsHidden, fpsStalled: perf.fpsStalled,
+      heap: mem, domNodes: nodes,
+      hidden: document.hidden, reports: perf.reports, lastReport: perf.lastReport,
+    };
+  }
+  function pctl(arr, p) {
+    if (!arr || !arr.length) return 0;
+    var s = arr.slice().sort(function (a, b) { return a - b; });
+    return Math.round(s[Math.min(s.length - 1, Math.floor(s.length * p))] * 10) / 10;
+  }
+  function perfReport(force) {
+    var now = Date.now();
+    if (!force && perfLastTick && now - perfLastTick < PERF_REPORT_MS - 1000) return;
+    perfLastTick = now;
+    perf.reports++;
+    var s = perfSnapshot();
+    var f = s.fps;
+    var line = 'up=' + s.upSec + 's transport=' + s.transport +
+      ' in=' + s.traffic.inFrames + 'f/' + kb(s.traffic.inBytes) +
+      ' out=' + s.traffic.outFrames + 'f/' + kb(s.traffic.outBytes) +
+      ' rate=' + s.traffic.framesPerSec + 'f/s ' + s.traffic.kbPerSec + 'kB/s peak=' + s.traffic.peakFramesPerSec + 'f/s' +
+      ' max=' + kb(s.frames.maxBytes) + (s.frames.maxHex ? ':' + s.frames.maxHex : '') +
+      ' polls=' + s.batches.polls + ' batchMax=' + s.batches.maxFrames + 'f/' + kb(s.batches.maxBytes) +
+      (s.poll.count ? ' rtt=' + s.poll.p50 + '/' + s.poll.p95 + '/' + s.poll.maxMs + 'ms' : '') +
+      ' ws=' + s.ws.opens + '/fb' + s.ws.fallbacks + '/rc' + s.ws.reconnects +
+      ' lt=' + s.longTasks.count + '/' + s.longTasks.totalMs + 'ms max' + s.longTasks.maxMs +
+      (f ? ' fps=' + f.p50 + '/' + f.p95 + '/' + f.max + ' jank50=' + f.jank50 : ' fps=na') +
+      (s.heap ? ' heap=' + s.heap.usedMb + 'MB' : '') +
+      ' dom=' + s.domNodes + (s.hidden ? ' hidden' : '');
+    perf.lastReport = line;
+    s.lastReport = line;
+    try {
+      fetch('api/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ href: window.location.href, kind: 'perf', message: line.slice(0, 480) }),
+        keepalive: true,
+      }).catch(function () { /* never surface as an error */ });
+    } catch (e) { /* ignore */ }
+    // keep the counters bounded: rates are windowed by the buckets, totals are
+    // per-report-interval so the numbers describe "now", not "since load"
+    var carryIn = perf.inFrames, carryOut = perf.outFrames;
+    perf.inFrames = 0; perf.inBytes = 0; perf.outFrames = 0; perf.outBytes = 0;
+    perf.batches = 0; perf.maxBatchFrames = 0; perf.maxBatchBytes = 0;
+    perf.polls = 0; perf.pollMs = []; perf.pollMaxMs = 0; perf.pollFail = 0;
+    perf.longTasks = 0; perf.longTotal = 0; perf.longMax = 0;
+    perf.lastTotalIn = (perf.lastTotalIn || 0) + carryIn;
+    perf.lastTotalOut = (perf.lastTotalOut || 0) + carryOut;
+    // start the next fps window right after reporting (20% duty cycle)
+    perfSampleFps(PERF_RAF_WINDOW_MS);
+  }
+  var perfLastTick = 0;
+  function perfReset() {
+    perf.at = Date.now();
+    perf.inFrames = 0; perf.inBytes = 0; perf.outFrames = 0; perf.outBytes = 0;
+    perf.maxFrame = 0; perf.maxFrameHex = ''; perf.topFrames = []; perf.types = {};
+    perf.totInFrames = 0; perf.totInBytes = 0; perf.totOutFrames = 0; perf.totOutBytes = 0;
+    perf.totLongTasks = 0; perf.totLongTotal = 0; perf.totLongMax = 0;
+    perf.queued = 0; perf.batches = 0; perf.maxBatchFrames = 0; perf.maxBatchBytes = 0;
+    perf.polls = 0; perf.pollMs = []; perf.pollMaxMs = 0; perf.pollFail = 0;
+    perf.longTasks = 0; perf.longTotal = 0; perf.longMax = 0; perf.longTop = [];
+    perf.reports = 0; perf.lastReport = ''; perf.buckets = [];
+    return true;
+  }
+  window.__zwebui_perf = perfSnapshot;
+  window.__zwebui_perf_report = function () { perfReport(true); return perfSnapshot(); };
+  window.__zwebui_perf_reset = function () { perfReset(); perfLastTick = 0; return true; };
+  window.__zwebui_perf_sample = function (ms) {
+    return new Promise(function (resolve) { perfSampleFps(Number(ms) || 5000, resolve); });
+  };
+  setInterval(function () { try { perfReport(false); } catch (e) { /* ignore */ } }, Math.max(PERF_REPORT_MS, 5000));
+  setTimeout(function () { try { perfReport(true); } catch (e) { /* ignore */ } }, Math.min(15000, PERF_REPORT_MS));
 
   // Server control line (JSON). Arrives as a ws text message, or as a '{"…'
   // payload in the HTTP relay frame stream — one handler for both transports, so
@@ -324,6 +585,25 @@
         // always needed — the notice must be dismissible without reloading.
         showNotice('连接已恢复，但离线期间的部分事件未能送达。界面无异常时可关闭此提示继续使用；若显示异常，请重新同步。',
           '重新同步', function () { window.location.reload(); }, true);
+        return true;
+      }
+      // The peer-verification line the ws handshake uses ('…-ready'). Over the
+      // HTTP relay the server sends it as a regular frame (it is the FIRST frame
+      // of every /bridge/open), and it used to fall through to
+      // deliverToRenderer: the official RPC client then decoded JSON as an RPC
+      // message and threw "Cannot read properties of undefined (reading '0')"
+      // inside its MessagePort handler — 56x in the server log on 2026-11-03/04.
+      if (ctrl && ctrl.kind === 'zcode-webui-ready') {
+        if (ctrl.startupMode === 'runtime' && ctrl.startupId) {
+          serverStartup = { mode: 'runtime', startupId: String(ctrl.startupId) };
+        }
+        return true;
+      }
+      // Anything else in the shim's namespace is a control line too: consume it
+      // instead of feeding it to the renderer (a future server control kind must
+      // never be able to crash the RPC channel again).
+      if (ctrl && typeof ctrl.kind === 'string' && ctrl.kind.indexOf('zcode-webui-') === 0) {
+        try { console.debug('[zcode-webui] unknown control line: ' + data.slice(0, 120)); } catch (e2) { /* ignore */ }
         return true;
       }
     } catch (e) { /* not a control message */ }
@@ -492,12 +772,13 @@
       try { data = JSON.stringify(data); } catch (e) { return; }
     }
     if (mode === 'ws') {
-      if (ws && ws.readyState === 1) { try { ws.send(data); } catch (e) { /* ignore */ } }
+      if (ws && ws.readyState === 1) { try { ws.send(data); perfOut(data && data.byteLength || data && data.length || 0); } catch (e) { /* ignore */ } }
       else queueUplink(data);                       // socket down: replay when it returns
       return;
     }
     if (mode === 'http') {
       if (!httpSessionId) { queueUplink(data); return; }
+      perfOut(data && data.byteLength || data && data.length || 0);
       uplinkChain = uplinkChain.then(function () {
         return fetch('bridge/send?id=' + httpSessionId, {
           method: 'POST',
@@ -519,38 +800,69 @@
     if (!buf || !buf.byteLength) return;
     var u8 = new Uint8Array(buf);
     var off = 0;
+    var batchFrames = 0;
+    var batchBytes = 0;
     while (off + 4 <= u8.length) {
       var len = (u8[off] << 24) | (u8[off + 1] << 16) | (u8[off + 2] << 8) | u8[off + 3];
       off += 4;
       if (len === 0 || off + len > u8.length) break;
       var payload = u8.slice(off, off + len);
       off += len;
-      // control lines (ready / startup state / pong / gap notice) share the frame
+      // Control lines (ready / startup state / pong / gap notice) share the frame
       // stream on this transport: renderer frames always start with an RPC preset
-      // byte 0..6, so a leading '{' (0x7b) is unambiguously a JSON control line
+      // byte 0..6, so a leading '{' (0x7b) is unambiguously a JSON control line.
+      // Every such line is consumed here and NEVER handed to the renderer — the
+      // official RPC client decodes it as an RPC message and throws
+      // "Cannot read properties of undefined (reading '0')" from its MessagePort
+      // handler (2026-11-03/04: 56 hits in the server log, every one of them a
+      // '{"kind":"zcode-webui-ready",…}' line from the /bridge/open handshake).
+      // It must also not abandon the batch: this loop used to `return` on a
+      // known control line, silently dropping every later frame of that poll.
       if (payload.length > 1 && payload[0] === 0x7b) {
         var text = '';
         try { text = new TextDecoder().decode(payload); } catch (e) { text = ''; }
-        if (text && handleControlText(text)) return;
+        if (text) handleControlText(text); else perf.controlDrops++;
+        continue;
       }
-      if (window.__zb_debug || reported > 0) {
-        var hex = '';
-        for (var k = 0; k < Math.min(payload.length, 16); k++) hex += ('0' + payload[k].toString(16)).slice(-2);
-        noteDelivered(hex, payload.length);
-        console.debug('[zb-debug] deliver ' + payload.length + 'B ' + hex);
-      }
+      var hex = '';
+      for (var k = 0; k < Math.min(payload.length, 8); k++) hex += ('0' + payload[k].toString(16)).slice(-2);
+      if (reported > 0) noteDelivered(hex, payload.length);        // error attribution only
+      if (window.__zb_debug) console.debug('[zb-debug] deliver ' + payload.length + 'B ' + hex);
+      perfIn(payload.length, payload[0], hex);
+      batchFrames++; batchBytes += payload.length;
       deliverToRenderer(payload);
     }
+    if (batchFrames) {
+      perf.batches++;
+      if (batchFrames > perf.maxBatchFrames) perf.maxBatchFrames = batchFrames;
+      if (batchBytes > perf.maxBatchBytes) perf.maxBatchBytes = batchBytes;
+    }
+    return batchFrames;
   }
 
   function pollLoop() {
     if (mode !== 'http' || !httpSessionId) return;
+    var t0 = performance.now();
     fetch('bridge/poll?id=' + httpSessionId)
       .then(function (r) {
         if (r.status === 410) throw new Error('session-gone');
         return r.arrayBuffer();
       })
-      .then(function (buf) { parseHttpFrames(buf); pollLoop(); })
+      .then(function (buf) {
+        var dt = performance.now() - t0;
+        var frames = parseHttpFrames(buf);
+        // A poll that returns without frames was simply held server-side until
+        // its idle timeout: that duration is not latency. Only a poll woken by
+        // real data measures "frame produced -> renderer fed", which is the
+        // number that matters for perceived lag.
+        perf.polls++;
+        if (frames) {
+          perf.pollMs.push(dt);
+          if (perf.pollMs.length > 240) perf.pollMs.shift();
+          if (dt > perf.pollMaxMs) perf.pollMaxMs = dt;
+        }
+        pollLoop();
+      })
       .catch(function (e) {
         if (mode !== 'http') return;
         if (e && e.message === 'session-gone') {
@@ -560,9 +872,11 @@
           // session host; if it is gone the server answers close 4000 and the
           // page reloads clean.
           httpSessionId = null;
+          perf.pollFail++;
           recoverTransport();
           return;
         }
+        perf.pollFail++;
         setTimeout(pollLoop, 1000);
       });
   }
@@ -587,6 +901,7 @@
     if (mode === 'http' && httpSessionId) return;
     if (httpRetryTimer) { clearTimeout(httpRetryTimer); httpRetryTimer = 0; }
     mode = 'http';
+    perf.fallbacks++;
     console.warn('[zcode-webui] websocket unavailable, switching to http polling bridge');
     if (ws) { try { ws.close(); } catch (e) { /* ignore */ } ws = null; }
     // tab + resume: the server attaches this page as a VIEW of the account's
@@ -611,6 +926,7 @@
         httpRetryDelay = 2000;
         reloadAttempts = 0;
         wsOpenFails = 0;
+        perf.httpOpens++;
         deliverPort();
         if (serverStartup.mode === 'runtime') pollStartupState();
         pollLoop();
@@ -679,6 +995,12 @@
       (everDelivered ? '&resume=1' : '');
   }
   var wsVerified = false;
+  // Frames that arrive before the ws ready line. A hot resume replays the missed
+  // frames first and announces itself right after, so the first message of a
+  // resumed socket is normally BINARY (see the onmessage comment).
+  var preReadyFrames = [];
+  var preReadyBytes = 0;
+  var preReadyTimer = 0;
   var WS_READY = '{"kind":"zcode-webui-ready"}';
   // Liveness: browsers cannot send WebSocket protocol pings, and a half-open
   // TCP socket (phone sleep, NAT timeout, proxy drop) keeps readyState === OPEN
@@ -704,64 +1026,92 @@
   function connect() {
     wsVerified = false;                          // re-arm per connection (hot reconnects)
     wsOpened = false;
+    preReadyFrames = [];                         // stale replay buffer from the previous socket
+    preReadyBytes = 0;
+    if (preReadyTimer) { clearTimeout(preReadyTimer); preReadyTimer = 0; }
     ws = new WebSocket(wsUrl());
     ws.binaryType = 'arraybuffer';
-    ws.onopen = function () { wsOpened = true; reloadAttempts = 0; hotAttempts = 0; wsOpenFails = 0; };
+    ws.onopen = function () { wsOpened = true; reloadAttempts = 0; hotAttempts = 0; wsOpenFails = 0; perf.wsOpens++; };
     ws.onmessage = function (ev) {
       lastInboundAt = Date.now();
-      // the very first message MUST be our ready signal; a foreign websocket
-      // server (e.g. code-server's own /ws when the URL lacked a trailing slash)
-      // would send its own frames here — reject it and fall back to http polling.
+      // The first message is normally our ready line; a foreign websocket server
+      // (code-server's own /ws, a proxy error page) would send its own text here
+      // — that still has to fall back to http polling.
+      //
+      // BUT a HOT RESUME answers with the frames this page missed BEFORE the ready
+      // line (the server flushes the parked replay buffer inside attachView and
+      // sends the ready line right after). Those replayed frames are binary and
+      // arrive first, which used to be read as "unexpected ws peer" → ws.close()
+      // → http fallback on EVERY resume with a non-empty gap (62 /bridge/open
+      // calls with resume=1 in the log on 2026-11-04). The fallback then delivered
+      // the 115-byte ready line as an RPC frame and crashed the renderer client.
+      // So: buffer pre-ready frames and flush them in order once the peer
+      // announces itself; give up only when the stream goes SILENT (a peer that
+      // is not ours never sends our ready line).
       if (!wsVerified) {
-        var ready = null;
         if (typeof ev.data === 'string') {
+          var ready = null;
           if (ev.data === WS_READY) ready = { kind: 'zcode-webui-ready' };
           else { try { ready = JSON.parse(ev.data); } catch (e) { ready = null; } }
-        }
-        if (ready && ready.kind === 'zcode-webui-ready') {
-          if (ready.startupMode === 'runtime' && ready.startupId) {
-            serverStartup = { mode: 'runtime', startupId: String(ready.startupId) };
+          if (ready && ready.kind === 'zcode-webui-ready') {
+            if (ready.startupMode === 'runtime' && ready.startupId) {
+              serverStartup = { mode: 'runtime', startupId: String(ready.startupId) };
+            }
+            wsVerified = true;
+            if (preReadyTimer) { clearTimeout(preReadyTimer); preReadyTimer = 0; }
+            deliverPort();
+            var queued = preReadyFrames;
+            preReadyFrames = [];
+            preReadyBytes = 0;
+            for (var qi = 0; qi < queued.length; qi++) deliverToRenderer(queued[qi]);
+            perf.preReadyFrames += queued.length;
+            flushUplink();                         // frames the renderer sent while offline
+          } else {
+            console.warn('[zcode-webui] unexpected ws peer, closing and falling back to http');
+            try { ws.close(); } catch (e) { /* ignore */ }
+            startHttpMode();
           }
-          wsVerified = true;
-          deliverPort();
-          flushUplink();                         // frames the renderer sent while offline
-        } else {
-          console.warn('[zcode-webui] unexpected ws peer, closing and falling back to http');
-          try { ws.close(); } catch (e) { /* ignore */ }
-          startHttpMode();
+          return;
         }
+        var pre = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
+        preReadyBytes += pre.length;
+        if (preReadyFrames.length < 8192 && preReadyBytes <= 32 * 1024 * 1024) {
+          preReadyFrames.push(pre);
+          if (preReadyTimer) clearTimeout(preReadyTimer);
+          preReadyTimer = setTimeout(function () {
+            preReadyTimer = 0;
+            if (wsVerified) return;
+            console.warn('[zcode-webui] ' + preReadyFrames.length + ' frame(s) (' + preReadyBytes +
+              'B) with no ready line, treating the peer as foreign and falling back to http');
+            preReadyFrames = [];
+            preReadyBytes = 0;
+            try { if (ws) ws.close(); } catch (e) { /* ignore */ }
+            startHttpMode();
+          }, 3000);
+          return;
+        }
+        console.warn('[zcode-webui] pre-ready replay overflow (' + preReadyFrames.length + ' frame(s), ' +
+          preReadyBytes + 'B) with no ready line, falling back to http');
+        preReadyFrames = [];
+        preReadyBytes = 0;
+        try { if (ws) ws.close(); } catch (e) { /* ignore */ }
+        startHttpMode();
         return;
       }
       if (typeof ev.data === 'string') {
-        // server control message: another host of this account is mid-turn
-        try {
-          var ctrl = JSON.parse(ev.data);
-          if (ctrl && ctrl.kind === 'zcode-webui-background') { watchBackground(ctrl); return; }
-          if (ctrl && ctrl.kind === 'zcode-webui-background-cleared') { dismissBackground(); return; }
-          if (ctrl && ctrl.kind === 'zcode-webui-startup') { postRealStartupState(ctrl.state); return; }
-          if (ctrl && ctrl.kind === 'zcode-webui-pong') { pongSeen = true; return; }   // liveness only
-          if (ctrl && ctrl.kind === 'zcode-webui-gap') {
-            // the offline gap overflowed the server's replay buffer: the page was
-            // deliberately kept alive instead of reloaded, so say what was lost.
-            // Resyncing is the safe choice when the UI looks wrong, but it is not
-            // always needed — the notice must be dismissible without reloading.
-            showNotice('连接已恢复，但离线期间的部分事件未能送达。界面无异常时可关闭此提示继续使用；若显示异常，请重新同步。',
-              '重新同步', function () { window.location.reload(); }, true);
-            return;
-          }
-        } catch (e) { /* not a control message */ }
-        console.debug('[zcode-webui]', ev.data);
+        // server control line — one handler for ws and http, so a control kind can
+        // never reach the renderer's RPC client on either transport
+        handleControlText(ev.data);
         return;
       }
       // The official renderer's port transport accepts ONLY Uint8Array
       // (e.data instanceof Uint8Array); an ArrayBuffer is silently dropped.
       var u8 = ev.data instanceof Uint8Array ? ev.data : new Uint8Array(ev.data);
-      if (window.__zb_debug || reported > 0) {
-        var hx = '';
-        for (var k = 0; k < Math.min(u8.length, 16); k++) hx += ('0' + u8[k].toString(16)).slice(-2);
-        noteDelivered(hx, u8.length);
-        console.debug('[zb-debug] ws deliver ' + u8.length + 'B ' + hx);
-      }
+      var hx = '';
+      for (var k = 0; k < Math.min(u8.length, 8); k++) hx += ('0' + u8[k].toString(16)).slice(-2);
+      if (reported > 0) noteDelivered(hx, u8.length);              // error attribution only
+      if (window.__zb_debug) console.debug('[zb-debug] ws deliver ' + u8.length + 'B ' + hx);
+      perfIn(u8.length, u8[0], hx);
       deliverToRenderer(u8);
     };
     ws.onclose = function (ev) {
@@ -824,6 +1174,7 @@
   function scheduleHotReconnect() {
     var delay = Math.min(1000 * Math.pow(2, Math.min(hotAttempts, 4)), 10000);
     hotAttempts++;
+    perf.reconnects++;
     setTimeout(function () {
       if (mode !== 'ws' || (ws && (ws.readyState === 0 || ws.readyState === 1))) return;
       connect();
@@ -1213,6 +1564,12 @@
   var httpFallbackTries = 0;
   function maybeStartHttpMode() {
     if (wsOpened || mode !== 'ws') return;
+    // ?transport=http is meant to FORCE the relay (that is how the ws-less proxy
+    // deployments are exercised). It used to fall into the CONNECTING ladder
+    // below, so a local ws that opened within 9 s silently won and the "forced"
+    // run never touched http at all — which also made the A/B of the control-line
+    // crash impossible. Explicit beats automatic.
+    if (forceHttp) { startHttpMode(); return; }
     if (ws && ws.readyState === 0 && httpFallbackTries++ < 3) {
       setTimeout(maybeStartHttpMode, 3000);
       return;

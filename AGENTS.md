@@ -196,11 +196,9 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
   有没有"守卫武装之后才出现的产物"。任何一项 WARN 都必须先修守卫再继续用。
 - 盘点现状：`node scripts/dev/repo-snapshot-audit.mjs [--json]`（逐工作区列出上次快照时间、是否已被接受、
   manifest 里 `.git` 占比、残留密文）。自检：`node scripts/dev/repo-snapshot-guard-test.mjs`（20 项）。
-- 本机 2026-09-18 的现状：12 个工作区有快照记录，10 份上传已被服务端接受（含 `writing/recabyss`
-  今天 05:30Z 那份，`.git` 21.5MiB / 39.3%）；`vBookmarks`、`vbookmarkspro` 两份共 177MiB 密文
-  已挪到 `~/.zcode/v2/repo-snapshot-quarantine-20260918T1030Z/`（确认无用可直接删），
-  `~/.zcode/v2/checkpoints` 与其下各工作区的 `pending|tmp|manifests|extra-manifests` 目录已置为 `r-x`
-  作为进程外兜底（新工作区也建不出来；要重新启用厂商行为得先 `chmod u+w` 回来）。
+- 本机 2026-09-18 现状：12 个工作区有快照记录，10 份上传已被服务端接受；177MiB 密文已挪进
+  `~/.zcode/v2/repo-snapshot-quarantine-*/`，`checkpoints/*/{pending,tmp,manifests,extra-manifests}`
+  已置 `r-x` 作为进程外兜底（重新启用厂商行为要先 `chmod u+w`）。
 - 注意：守卫在宿主进程启动时注入，**改完要重启服务**（`./zcode-service.sh restart`）才对新宿主生效；
   重启窗口照旧看 `/api/background` 的 `activeCount` 为 0。
 
@@ -714,3 +712,8 @@ relay open 复用同一宿主（`sessions.total` 不涨、日志出现 `(adopted
 - 运行时产物（`*.log*`、`*.pid`、`config.json`、`data/`、`vendor/renderer/`）均已 gitignore，不要提交。
 - 服务由 `zcode-service.sh {start|stop|restart|status|health|logs}` 管理，PID 记录在 `.service.pid`。
   该脚本可直接 `source`（`zcode-update.sh` 就是这么复用端口解析与启停函数的），被 source 时不分发子命令。
+
+## 2026-11-05 崩溃与卡顿
+
+`docs/perf-2026-11-05.md`：`reading '0'` 根因是 http 把 115B ready 控制行当 RPC 帧投给渲染层（已修，
+resume 回退 http 同因）；卡顿实测 + `__zwebui_perf()` + `perf-collect.mjs`。
