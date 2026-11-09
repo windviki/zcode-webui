@@ -46,7 +46,10 @@ sleep "${ZWEBUI_RESTART_GRACE:-5}"   # let the firing session flush its last mes
     set -u
     while IFS= read -r l; do [ -n \"\$l\" ] && export \"\${l?}\"; done < '$ENV_FILE'
     cd '$REPO'
-    nohup node src/server.mjs --port $PORT >> zcode-webui.log 2>&1 &
+    # setsid: the new server gets its own session/process group, so it survives
+    # this restarter (and any caller that forgot the documented setsid) going
+    # away; nohup adds the SIGHUP shield, </dev/null detaches stdin.
+    setsid nohup node src/server.mjs --port $PORT >> zcode-webui.log 2>&1 </dev/null &
   "
 
   OK=""
