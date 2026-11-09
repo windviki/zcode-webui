@@ -21,12 +21,33 @@
 //
 // Usage:
 //   node scripts/patch-316-balance-cache.mjs [runtimeRoot] [--revert] [--dry-run]
-import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, copyFileSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
-const ANCHOR = 'let p=i(()=>{o?.get(n)===u&&(o.delete(n),o.size===0&&Jx.delete(e))},"evict"),f=1e3-(Date.now()-c);';
-const PATCHED = 'let p=i(()=>{o?.get(n)===u&&(o.delete(n),o.size===0&&Jx.delete(e))},"evict"),f=45e3-(Date.now()-c);';
+// 3.16 anchor was a full literal (identifiers n/Jx); 3.17 renamed those inside
+// the evict closure (r/YO) and kept the 1s de-dup window. Match the window
+// itself, which is what the patch changes, and keep the surrounding identifiers.
+const ANCHOR_RE = /,"evict"\),([A-Za-z_$][\w$]*)=1e3-\(Date\.now\(\)-([A-Za-z_$][\w$]*)\);/;
+const PATCHED_RE = /,"evict"\),([A-Za-z_$][\w$]*)=45e3-\(Date\.now\(\)-([A-Za-z_$][\w$]*)\);/;
+// NOTE: a function replacer receives (match, p1, p2, ...) — NOT an array.
+const patchedFor = (m, a, b) => ',"evict"),' + a + '=45e3-(Date.now()-' + b + ');';
+const anchorFor = (m, a, b) => ',"evict"),' + a + '=1e3-(Date.now()-' + b + ');';
+// Refuse to write a bundle that no longer parses: a bad replacement here bricks
+// every host spawn, and the damage is invisible until the next restart.
+function assertParses(text) {
+  const tmp = file + '.patchcheck.mjs';
+  writeFileSync(tmp, text);
+  try {
+    execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe' });
+  } catch (e) {
+    try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
+    console.error('[patch-316-balance] patched bundle does not parse — refusing to write: ' + String(e.stderr || e.message).slice(0, 300));
+    process.exit(4);
+  }
+  try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
+}
 
 const args = process.argv.slice(2);
 const revert = args.includes('--revert');
@@ -43,32 +64,32 @@ if (!existsSync(file)) {
 }
 
 const src = readFileSync(file, 'utf8');
-const hasAnchor = src.includes(ANCHOR);
-const hasPatch = src.includes(PATCHED);
+const anchorMatches = [...src.matchAll(new RegExp(ANCHOR_RE.source, 'g'))];
+const patchedMatches = [...src.matchAll(new RegExp(PATCHED_RE.source, 'g'))];
+const hasAnchor = anchorMatches.length === 1;
+const hasPatch = patchedMatches.length === 1;
 
 if (revert) {
   if (!hasPatch) { console.log('[patch-316-balance] not patched, nothing to revert'); process.exit(0); }
   if (dryRun) { console.log('[patch-316-balance] would revert ' + file); process.exit(0); }
   copyFileSync(file, file + '.bak-bal-' + Date.now());
-  writeFileSync(file, src.split(PATCHED).join(ANCHOR));
+  writeFileSync(file, src.replace(PATCHED_RE, anchorFor));
   console.log('[patch-316-balance] reverted: ' + file);
   process.exit(0);
 }
 
 if (hasPatch) { console.log('[patch-316-balance] already patched: ' + file); process.exit(0); }
 if (!hasAnchor) {
-  console.error('[patch-316-balance] anchor not found — inspect this build before patching');
-  process.exit(3);
-}
-if (src.split(ANCHOR).length !== 2) {
-  console.error('[patch-316-balance] anchor is not unique — refusing to patch');
+  console.error('[patch-316-balance] anchor not found (' + anchorMatches.length + ' match(es)) — inspect this build before patching');
   process.exit(3);
 }
 if (dryRun) { console.log('[patch-316-balance] would patch ' + file); process.exit(0); }
 
 const backup = file + '.bak-bal-' + Date.now();
 copyFileSync(file, backup);
-writeFileSync(file, src.split(ANCHOR).join(PATCHED));
+const patchedSrc = src.replace(ANCHOR_RE, patchedFor);
+assertParses(patchedSrc);
+writeFileSync(file, patchedSrc);
 console.log('[patch-316-balance] patched: ' + file);
 console.log('[patch-316-balance] backup : ' + backup);
 console.log('[patch-316-balance] effect : billing/balance de-dup window 1s -> 45s (one round trip instead of four)');

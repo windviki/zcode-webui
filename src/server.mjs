@@ -21,6 +21,7 @@ import { createHostPipe, detectRuntimeLayout, resolveServerRoot, ensureCliProvid
 import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, currentServerAppVersion } from './upgrade.mjs';
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
+import { createMemoryGuard, collectHostPids } from './memory-guard.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1538,6 +1539,7 @@ async function createSession(userKey, tabId) {
     userKey, primaryTab: tabId, child, pipe,
     hello: pipe.hello,
     startupId: pipe.startupId,
+    spawnedAt: Date.now(),                  // used by the memory guard's reclaim log
     lastStartupState: pipe.lastStartupState,
     views: new Map(),                       // tabId -> view (currently connected)
     eraByTab: new Map(),                    // tabId -> last view object, even after its ws closed (resume/rebind needs it)
@@ -1836,7 +1838,7 @@ function handleRequest(req, res) {
       httpRelayTtlMs: HTTP_RELAY_TTL_MS,
       bindHost: BIND_HOST,
       accessGate: !!ACCESS_TOKEN,
-      guards: { apiCache: guardStatsSnapshot(), quotaReset: quotaResetSnapshot() },
+      guards: { apiCache: guardStatsSnapshot(), quotaReset: quotaResetSnapshot(), memory: MEMORY_GUARD.snapshot() },
     });
   }
   if (urlPath === '/api/login/status') {
@@ -2750,6 +2752,40 @@ setInterval(() => {
     }
   }
 }, WS_PING_MS).unref();
+
+// Host memory guard (2026-11-09 postmortem). A host that balloons to several GB
+// of Buffers takes the whole box down through swap thrash long before the kernel
+// OOM killer fires: MemAvailable and swap both go to ~0, /api/health then answers
+// in 10-20 s, and every page load times out. This guard samples each host's RSS
+// plus /proc/meminfo and reclaims the biggest host ONLY when the machine is
+// genuinely out of memory (see src/memory-guard.mjs for the thresholds). The
+// reclaimed host is terminated exactly like the idle reaper does it — a fresh
+// host spawns on the next page connect, and session history is untouched.
+// Cost: one /proc read per host per interval (15 s default), nothing per request.
+const MEMORY_GUARD = createMemoryGuard({ getHosts: () => collectHostPids(sessions, httpRelays) });
+function reclaimHostForMemory(decision) {
+  const victim = [...sessions.values()].find((s) => !s.closed && s.child && s.child.pid === decision.pid);
+  console.error('[mem-guard] RECLAIM host pid=' + decision.pid + ' rss=' + decision.hostRssMb + 'MB — ' + decision.reason);
+  if (!victim) {
+    // Not in the session map any more (already exiting): make sure it dies.
+    try { process.kill(decision.pid, 'SIGTERM'); } catch (_e) { /* already gone */ }
+    return;
+  }
+  const detached = victim.views.size;
+  const ageSec = victim.spawnedAt ? Math.round((Date.now() - victim.spawnedAt) / 1000) : null;
+  terminateSession(victim, 'memory guard: ' + decision.reason);
+  console.error('[mem-guard] reclaimed pid=' + decision.pid + ' (views detached=' + detached +
+    (ageSec !== null ? ', host age=' + ageSec + 's' : '') +
+    '); the next page connect spawns a fresh host');
+}
+if (MEMORY_GUARD.config.enabled) {
+  setInterval(() => {
+    const decision = MEMORY_GUARD.tick(reclaimHostForMemory);
+    if (decision.action === 'warn') {
+      console.error('[mem-guard] WARN host pid=' + decision.pid + ' rss=' + decision.hostRssMb + 'MB — ' + decision.reason);
+    }
+  }, MEMORY_GUARD.config.intervalMs).unref();
+}
 
 // Parked-era cleanup: a tab whose socket closed buffers downstream frames for a
 // resume that may never come. We deliberately DO NOT dispose its host-side

@@ -712,8 +712,9 @@ relay open 复用同一宿主（`sessions.total` 不涨、日志出现 `(adopted
 - 运行时产物（`*.log*`、`*.pid`、`config.json`、`data/`、`vendor/renderer/`）均已 gitignore，不要提交。
 - 服务由 `zcode-service.sh {start|stop|restart|status|health|logs}` 管理，PID 记录在 `.service.pid`。
   该脚本可直接 `source`（`zcode-update.sh` 就是这么复用端口解析与启停函数的），被 source 时不分发子命令。
+- 内存守卫/埋点见 `docs/memory-guard-2026-11-09.md`；3.17.2 升级见 `docs/upgrade-3.17.2-2026-11-09.md`。
 
 ## 2026-11-05 崩溃与卡顿
 
-`docs/perf-2026-11-05.md`：`reading '0'` 根因是 http 把 115B ready 控制行当 RPC 帧投给渲染层（已修，
-resume 回退 http 同因）；卡顿实测 + `__zwebui_perf()` + `perf-collect.mjs`。
+见 `docs/perf-2026-11-05.md`：`reading '0'` 根因是 http 把 ready 控制行当 RPC 帧投给渲染层
+（resume 回退 http 同因）；卡顿实测工具 `__zwebui_perf()` + `perf-collect.mjs` 也在那里。

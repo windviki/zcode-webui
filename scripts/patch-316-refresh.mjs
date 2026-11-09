@@ -23,12 +23,35 @@
 //
 // The file is backed up next to itself as index.js.bak-<timestamp> before any
 // write, and the patch is idempotent (a second run is a no-op).
-import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, copyFileSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
-const ANCHOR = 'y.refreshRegistry&&await y.client.request(Be.providerRefreshRegistry,{reason:y.reason},rW)';
-const PATCHED = 'y.refreshRegistry&&await Promise.race([y.client.request(Be.providerRefreshRegistry,{reason:y.reason},rW).catch(()=>{}),new Promise(r=>setTimeout(r,1500))])';
+// 3.16 anchor (minified identifiers Be/rW). 3.17 renamed them (De/az) and moved
+// the rest of the file around, so match structurally instead of by literal text:
+//   <a>.refreshRegistry&&await <a>.client.request(<b>.providerRefreshRegistry,{reason:<a>.reason},<c>)
+const ANCHOR_RE = /([A-Za-z_$][\w$]*)\.refreshRegistry&&await \1\.client\.request\(([A-Za-z_$][\w$]*)\.providerRefreshRegistry,\{reason:\1\.reason\},([A-Za-z_$][\w$]*)\)/;
+const PATCHED_RE = /([A-Za-z_$][\w$]*)\.refreshRegistry&&await Promise\.race\(\[\1\.client\.request\(([A-Za-z_$][\w$]*)\.providerRefreshRegistry,\{reason:\1\.reason\},([A-Za-z_$][\w$]*)\)\.catch\(\(\)=>\{\}\),new Promise\(r=>setTimeout\(r,1500\)\)\]\)/;
+// NOTE: a function replacer receives (match, p1, p2, ...) — NOT an array.
+const toPatched = (m, a, b, c) => a + '.refreshRegistry&&await Promise.race([' + a + '.client.request(' + b +
+  '.providerRefreshRegistry,{reason:' + a + '.reason},' + c + ').catch(()=>{}),new Promise(r=>setTimeout(r,1500))])';
+const toAnchor = (m, a, b, c) => a + '.refreshRegistry&&await ' + a + '.client.request(' + b +
+  '.providerRefreshRegistry,{reason:' + a + '.reason},' + c + ')';
+// Refuse to write a bundle that no longer parses: a bad replacement here bricks
+// every host spawn, and the damage is invisible until the next restart.
+function assertParses(text) {
+  const tmp = file + '.patchcheck.mjs';
+  writeFileSync(tmp, text);
+  try {
+    execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe' });
+  } catch (e) {
+    try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
+    console.error('[patch-316] patched bundle does not parse — refusing to write: ' + String(e.stderr || e.message).slice(0, 300));
+    process.exit(4);
+  }
+  try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
+}
 
 const args = process.argv.slice(2);
 const revert = args.includes('--revert');
@@ -45,26 +68,24 @@ if (!existsSync(file)) {
 }
 
 const src = readFileSync(file, 'utf8');
-const hasAnchor = src.includes(ANCHOR);
-const hasPatch = src.includes(PATCHED);
+const anchorMatches = [...src.matchAll(new RegExp(ANCHOR_RE.source, 'g'))];
+const patchedMatches = [...src.matchAll(new RegExp(PATCHED_RE.source, 'g'))];
+const hasAnchor = anchorMatches.length === 1;
+const hasPatch = patchedMatches.length === 1;
 
 if (revert) {
   if (!hasPatch) { console.log('[patch-316] not patched, nothing to revert'); process.exit(0); }
   if (dryRun) { console.log('[patch-316] would revert ' + file); process.exit(0); }
   copyFileSync(file, file + '.bak-' + Date.now());
-  writeFileSync(file, src.split(PATCHED).join(ANCHOR));
+  writeFileSync(file, src.replace(PATCHED_RE, toAnchor));
   console.log('[patch-316] reverted: ' + file);
   process.exit(0);
 }
 
 if (hasPatch) { console.log('[patch-316] already patched: ' + file); process.exit(0); }
 if (!hasAnchor) {
-  console.error('[patch-316] anchor not found — this build changed, inspect it before patching:\n  ' +
-    'y.refreshRegistry&&await y.client.request(Be.providerRefreshRegistry,{reason:y.reason},rW)');
-  process.exit(3);
-}
-if (src.split(ANCHOR).length !== 2) {
-  console.error('[patch-316] anchor is not unique — refusing to patch');
+  console.error('[patch-316] anchor not found (' + anchorMatches.length + ' match(es)) — this build changed, inspect it before patching:\n  ' +
+    '<a>.refreshRegistry&&await <a>.client.request(<b>.providerRefreshRegistry,{reason:<a>.reason},<c>)');
   process.exit(3);
 }
 
@@ -72,7 +93,9 @@ if (dryRun) { console.log('[patch-316] would patch ' + file); process.exit(0); }
 
 const backup = file + '.bak-' + Date.now();
 copyFileSync(file, backup);
-writeFileSync(file, src.split(ANCHOR).join(PATCHED));
+const patchedSrc = src.replace(ANCHOR_RE, toPatched);
+assertParses(patchedSrc);
+writeFileSync(file, patchedSrc);
 console.log('[patch-316] patched: ' + file);
 console.log('[patch-316] backup : ' + backup);
 console.log('[patch-316] effect : provider-registry refresh no longer blocks a send for 30 s (capped at 1.5 s)');

@@ -29,7 +29,7 @@
     "smoke": "node scripts/smoke-test.mjs",
     "ui-check": "node scripts/ui-boot-check.mjs",
     "cli": "node src/cli.mjs",
-    "prepublishOnly": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/dirs.mjs && node --check src/upgrade.mjs && node --check src/repo-snapshot-guard.cjs && node --check src/api-cache-guard.cjs && node --check src/quota-reset-guard.cjs && node --check web/bootstrap.js && node --check scripts/smoke-test.mjs && node --check scripts/ui-boot-check.mjs && bash -n scripts/fetch-renderer.sh && bash -n zcode-service.sh && bash -n zcode-update.sh"
+    "prepublishOnly": "node --check src/cli.mjs && node --check src/server.mjs && node --check src/dirs.mjs && node --check src/upgrade.mjs && node --check src/repo-snapshot-guard.cjs && node --check src/api-cache-guard.cjs && node --check src/quota-reset-guard.cjs && node --check src/memory-attribution-guard.cjs && node --check src/host.mjs && node --check src/memory-guard.mjs && node --check web/bootstrap.js && node --check scripts/smoke-test.mjs && node --check scripts/ui-boot-check.mjs && bash -n scripts/fetch-renderer.sh && bash -n zcode-service.sh && bash -n zcode-update.sh"
   },
   "keywords": [
     "zcode",

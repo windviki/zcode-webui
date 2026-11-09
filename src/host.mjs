@@ -151,6 +151,10 @@ export function buildHostEnv(serverRoot, extra = {}) {
   if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') preload('repo-snapshot-guard.cjs');
   preload('api-cache-guard.cjs');
   preload('quota-reset-guard.cjs');
+  // memory-attribution-guard — names the cause when the host's Buffer pool
+  // explodes (2026-11-09: +2.6GB Buffers in ten minutes took the box down).
+  // Cheap: one memoryUsage() sample per 15s, accounting only for >=1MB Buffers.
+  preload('memory-attribution-guard.cjs');
   return env;
 }
 
@@ -329,6 +333,10 @@ export function buildHost16Env(serverRoot, extra = {}) {
   if (env.ZCODE_WEBUI_ALLOW_REPO_SNAPSHOT !== '1') preload('repo-snapshot-guard.cjs');
   preload('api-cache-guard.cjs');
   preload('quota-reset-guard.cjs');
+  // memory-attribution-guard — names the cause when the host's Buffer pool
+  // explodes (2026-11-09: +2.6GB Buffers in ten minutes took the box down).
+  // Cheap: one memoryUsage() sample per 15s, accounting only for >=1MB Buffers.
+  preload('memory-attribution-guard.cjs');
   return env;
 }
 

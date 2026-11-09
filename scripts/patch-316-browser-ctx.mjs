@@ -19,12 +19,16 @@
 //
 // Usage:
 //   node scripts/patch-316-browser-ctx.mjs [runtimeRoot] [--revert] [--dry-run]
-import { existsSync, readFileSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, copyFileSync, unlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
 const MARK = '/*webui:browser-ctx-bounded*/';
-const START = 'async function XA(e,t){';
+// 3.16 called this helper XA(); 3.17 renamed it XE(). Both are the unbounded
+// "browser ambient context" capture (body starts with `if(!e)return;let n=t.workspaceIdentity?...`),
+// so accept either name instead of failing the anchor on a rename.
+const START_RE = /async function (XA|XE)\(e,t\)\{/;
 const BUDGET_MS = 800;
 
 const args = process.argv.slice(2);
@@ -61,15 +65,18 @@ if (revert) {
 
 if (already) { console.log('[patch-316-browser] already patched: ' + file); process.exit(0); }
 
+const startMatch = src.match(START_RE);
+if (!startMatch) {
+  console.error('[patch-316-browser] XA()/XE() not found — inspect this build before patching');
+  process.exit(3);
+}
+if ((src.match(new RegExp(START_RE.source, 'g')) || []).length !== 1) {
+  console.error('[patch-316-browser] XA()/XE() is not unique — refusing to patch');
+  process.exit(3);
+}
+const START = startMatch[0];
+const FN = startMatch[1];
 const start = src.indexOf(START);
-if (start < 0) {
-  console.error('[patch-316-browser] XA() not found — inspect this build before patching');
-  process.exit(3);
-}
-if (src.indexOf(START, start + 1) >= 0) {
-  console.error('[patch-316-browser] XA() is not unique — refusing to patch');
-  process.exit(3);
-}
 // find the matching closing brace of the function body
 let depth = 0, i = start + START.length - 1, quote = null;
 for (; i < src.length; i++) {
@@ -83,16 +90,31 @@ for (; i < src.length; i++) {
   if (ch === '{') depth++;
   else if (ch === '}') { depth--; if (depth === 0) break; }
 }
-if (depth !== 0) { console.error('[patch-316-browser] could not find the end of XA()'); process.exit(3); }
+if (depth !== 0) { console.error('[patch-316-browser] could not find the end of ' + FN + '()'); process.exit(3); }
 const originalBody = src.slice(start + START.length, i); // everything inside the braces
 const patched =
-  `async function XA(e,t){if(!e)return;${MARK}` +
+  `async function ${FN}(e,t){if(!e)return;${MARK}` +
   `const __xaT=new Promise(r=>setTimeout(()=>r(void 0),${BUDGET_MS}));` +
   `const __xaW=(async()=>{${originalBody}})();` +
   `return await Promise.race([__xaW,__xaT])}`;
 
 if (dryRun) { console.log('[patch-316-browser] would patch ' + file + ' (budget ' + BUDGET_MS + 'ms)'); process.exit(0); }
+const out = src.slice(0, start) + patched + src.slice(i + 1);
+// Refuse to write a bundle that no longer parses (a bad rewrite here bricks
+// every host spawn and stays invisible until the next restart).
+{
+  const tmp = file + '.patchcheck.mjs';
+  writeFileSync(tmp, out);
+  try {
+    execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe' });
+  } catch (e) {
+    try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
+    console.error('[patch-316-browser] patched bundle does not parse — refusing to write: ' + String(e.stderr || e.message).slice(0, 300));
+    process.exit(4);
+  }
+  try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
+}
 copyFileSync(file, file + '.bak-xa-' + Date.now());
-writeFileSync(file, src.slice(0, start) + patched + src.slice(i + 1));
+writeFileSync(file, out);
 console.log('[patch-316-browser] patched: ' + file);
 console.log('[patch-316-browser] effect : browser ambient-context capture capped at ' + BUDGET_MS + 'ms (was unbounded, ~30s with no browser)');

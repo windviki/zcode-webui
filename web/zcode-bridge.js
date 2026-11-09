@@ -982,7 +982,18 @@
     },
     requestSourceSettingsAttachment: function () {
       return Promise.reject(new Error('Source settings attachment bridge unavailable'));
-    }
+    },
+    // ---- 3.17 API surface that dereferences its result -----------------------
+    // Found by diffing window.zcode.* usage between 3.16.3 and 3.17.2: only five
+    // names were added. The three `on*` subscribers are already covered by the
+    // Proxy fallback (it returns an unsubscribe fn for on*), these three are not:
+    //   getFileApplications      → renderer stores the result as `apps` and maps
+    //                              over it: `(… ?? []).then(t => setState({apps:t}))`;
+    //   openFileWithApplication  → reads `r.success` and throws `r.error`;
+    //   browserViewLoadUrl       → embedded-browser only, fire and forget.
+    getFileApplications: val([]),
+    openFileWithApplication: val({ success: false, error: 'not supported in zcode-webui' }),
+    browserViewLoadUrl: ok
   };
 
   // Every "onXxx" channel becomes a subscribe helper returning an unsubscribe fn.

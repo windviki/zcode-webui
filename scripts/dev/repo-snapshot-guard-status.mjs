@@ -50,7 +50,14 @@ console.log('  renderer stamp: ' + (rendererStamp || '(missing)'));
 
 // ---- 2. do the guard hooks still match the deployed runtime bundle? ----
 const serverRoot = (health && health.serverRoot) || path.join(os.homedir(), '.zcode', 'server');
-const bundlePath = path.join(serverRoot, 'zcode-server.cjs');
+// Two runtime generations, two bundle layouts (src/host.mjs detects by LAYOUT):
+//   <= 3.15  standalone zcode-server.cjs driven over 13-byte stdio frames
+//   >= 3.16  the desktop's own host bundle at app/out/host/index.js; there is no
+//            zcode-server.cjs at all, so the old fixed path made this check print
+//            a permanent WARN and skip every hook — blind since the 3.16 install.
+const host16Bundle = path.join(serverRoot, 'app', 'out', 'host', 'index.js');
+const legacyBundle = path.join(serverRoot, 'zcode-server.cjs');
+const bundlePath = fs.existsSync(host16Bundle) ? host16Bundle : legacyBundle;
 console.log('\nruntime hooks (' + bundlePath + ')');
 let bundle = null;
 try { bundle = fs.readFileSync(bundlePath, 'utf8'); } catch (_e) { /* handled below */ }
@@ -102,7 +109,8 @@ try {
     if (!/^\d+$/.test(entry)) continue;
     let cmdline = '';
     try { cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8'); } catch (_e) { continue; }
-    if (cmdline.includes('zcode-server.cjs')) { hostPid = entry; break; }
+    // >= 3.16 hosts are forks of app/out/host/index.js (no zcode-server.cjs).
+    if (cmdline.includes('zcode-server.cjs') || cmdline.includes('app/out/host/index.js')) { hostPid = entry; break; }
   }
 } catch (_e) { /* not linux */ }
 if (!hostPid) {
