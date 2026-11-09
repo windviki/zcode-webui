@@ -133,7 +133,15 @@ start() {
   echo $! > "$PID_FILE"
 
   for _ in {1..30}; do
-    is_up && { info "就绪（pid $(cat "$PID_FILE")）"; return 0; }
+    if is_up; then
+      # setsid 在自身已是进程组组长时会 fork 出真正的服务进程，$! 记录的可能
+      # 只是中间进程；就绪后用 server_pids 把真实 PID 回写，stop 不会杀错。
+      local real
+      real="$(server_pids | head -1)"
+      [[ -n "$real" ]] && echo "$real" > "$PID_FILE"
+      info "就绪（pid $(cat "$PID_FILE")）"
+      return 0
+    fi
     sleep 0.5
   done
   die "启动后 15 秒内健康检查未通过，请查看 $LOG_FILE"
