@@ -12,8 +12,30 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULT_VERSION } from './upgrade.mjs';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { resolveDataHome } from './dirs.mjs';
+import { loginShellEnvSeed } from './login-env.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// The official CLI runs tool commands from a shell snapshot that carries
+// functions/aliases/PATH but NOT exported variables (see src/login-env.mjs for
+// the full story). Seed the host env once from the same login shell, so
+// rc-exported variables (GVM_ROOT, NVM_DIR, GOPATH, SDKMAN_DIR, …) and the PATH
+// entries rc files prepend (~/.cargo/bin, ~/.gvm/bin, sdkman) reach tool shells.
+// Opt out with ZCODE_WEBUI_LOGIN_ENV=0.
+let loginEnvSeedCache;
+function hostLoginEnvSeed() {
+  if (loginEnvSeedCache) return loginEnvSeedCache;
+  loginEnvSeedCache = loginShellEnvSeed({ env: process.env });
+  const names = Object.keys(loginEnvSeedCache.seed || {});
+  if (names.length > 0) {
+    console.error('[zcode-webui] host env seeded from ' + (loginEnvSeedCache.shell || 'login shell') +
+      ': ' + names.length + ' vars (' + names.slice(0, 6).join(', ') +
+      (names.length > 6 ? ', …' : '') + ')');
+  } else if (loginEnvSeedCache.error && loginEnvSeedCache.error !== 'disabled by ZCODE_WEBUI_LOGIN_ENV=0') {
+    console.error('[zcode-webui] host env seed skipped: ' + loginEnvSeedCache.error);
+  }
+  return loginEnvSeedCache;
+}
 
 // Version stamp written by scripts/fetch-renderer.sh, so the host env always matches
 // the fetched renderer version without editing code.
@@ -113,6 +135,7 @@ export function buildHostEnv(serverRoot, extra = {}) {
     : JSON.stringify([path.join(serverRoot, 'agents', 'glm', 'zcode.cjs'), 'app-server', '--stdio']);
   const env = {
     ...process.env,
+    ...hostLoginEnvSeed().seed,
     ZCODE_SERVER_RUNTIME_ROOT: serverRoot,
     ZCODE_ENV: 'production',
     ZCODE_BASE_URL: process.env.ZCODE_BASE_URL || 'https://zcode.z.ai',
@@ -303,6 +326,7 @@ function createHost16LogSink(log) {
 export function buildHost16Env(serverRoot, extra = {}) {
   const env = {
     ...process.env,
+    ...hostLoginEnvSeed().seed,
     ZCODE_SERVER_RUNTIME_ROOT: serverRoot,
     ZCODE_ENV: 'production',
     ZCODE_BASE_URL: process.env.ZCODE_BASE_URL || 'https://zcode.z.ai',

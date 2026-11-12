@@ -718,3 +718,52 @@ relay open 复用同一宿主（`sessions.total` 不涨、日志出现 `(adopted
 
 见 `docs/perf-2026-11-05.md`：`reading '0'` 根因是 http 把 ready 控制行当 RPC 帧投给渲染层
 （resume 回退 http 同因）；卡顿实测工具 `__zwebui_perf()` + `perf-collect.mjs` 也在那里。
+
+## 工具 shell 的 GVM_ROOT 报错 / 登录环境缺失（2026-11-12）
+
+**现象**：zcode 会话里 `cd <dir> && …` 经常失败，输出
+`ERROR: GVM_ROOT not set. Please source $GVM_ROOT/scripts/gvm`（退出码非 0，`&&` 链断掉）；
+另一种形态是每条 `cd` 刷 `setValueForKeyFakeAssocArray:27: command not found: _encode` 噪声。
+sessiondex 全库：zcode 有 39 个会话、422 条消息命中 GVM_ROOT，_encode 15328 条。**与 zcode 本身无关**。
+
+**根因（三层）**：
+1. 官方 CLI 的工具 shell 用「shell snapshot」：启动时跑一次 `zsh -c -l`（或 bash），把 rc 里的
+   函数/alias/选项/PATH 写进 `~/.zcode/cli/exec/shell-snapshots/snapshot-*.sh`，之后每条命令
+   `. snapshot` 再执行（`packages/adapters/src/exec/shell-init-snapshot.ts`）。快照**不导出环境变量**
+   （只写 `export PATH=`），还会**丢弃单下划线私有函数**（`grep -vE '^_[^_]'`）。
+2. `~/.zshrc` / `~/.bashrc` source 了 GVM，它把 `cd` 换成自动切 Go 版本的函数；该函数开头检查
+   `$GVM_ROOT`，为空直接非 0 返回（`~/.gvm/scripts/env/cd:57`），于是工具 shell 里每条 cd 都报错。
+   若 GVM_ROOT 恰好存在（服务从终端启动过），又会因 `_encode/_decode` 被快照丢弃而刷噪声——两种都坏。
+3. zcode-webui 是守护进程（`setsid` 起、环境只有 HOME/TERM/PATH 等），没有 rc 导出变量；而官方 CLI
+   假设自己从用户终端启动。`cargo: command not found` 同源：`~/.cargo/bin` 只在 rc 里进 PATH。
+
+**修复（两半，缺一不可）**：
+- 用户 rc（`~/.zshrc`、`~/.bashrc`）：非交互 shell 里 `unset -f cd`（zsh 用 `[[ -o interactive ]]`，
+  bash 用 `$-`），去掉 gvm 的 cd 包装；`gvm` 命令本身保留，交互终端行为不变（本机无 `.go-version`，
+  自动切换从未生效）。这样新快照里根本没有 cd 函数。
+- 仓库 `src/login-env.mjs` + `src/host.mjs`：host 启动时用与快照同一套 shell 选择逻辑（SHELL 是 bash
+  则 bash，否则 zsh）跑一次 `zsh -c -l`，source rc 后 `env -0` 落临时文件，把**host 缺失的变量**补进
+  env，**PATH 用 rc 的**（cargo/gvm/sdkman 目录）。5s 超时、失败静默降级、按进程缓存；
+  `ZCODE_WEBUI_LOGIN_ENV=0` 关闭。日志 `[zcode-webui] host env seeded from …: N vars (…)`。
+
+**验证**：
+- `node scripts/dev/login-env-test.mjs`（18 项，临时 HOME + 假 rc，不碰真实配置）。
+- 重启后新快照：`ls -t ~/.zcode/cli/exec/shell-snapshots | head -1` 里 `grep -c '^cd ()'` 应为 0；
+  宿主 `/proc/<pid>/environ` 里应有 GVM_ROOT，PATH 含 `.cargo/bin`。
+- 新会话 `cd /tmp && echo OK` 应干净通过（旧宿主仍用旧快照，必须重启服务；重启走空闲窗口流程）。
+
+**同期排查（dsh / kimi / claude，2026-11-12）**：dsh 的 Bash 工具是 `bash -c`（不 source rc，也没有
+shell snapshot），kimi 的工具 shell 同样不重放 rc 函数（kimi wire 里 GVM_ROOT 只出现在读交接文档时，
+`_encode` 为 0），二者不受 cd 问题影响；claude 与 zcode 同用 snapshot 机制（claude 的
+`toolUseResult` 里 `_encode` 真实输出 446 条），本次 rc 守卫一并修掉。另发现 dsh 的 node 进程继承了
+zcode-webui 的 `NODE_OPTIONS`（dsh-codeserver-proxy 的启动环境带来的），dsh 里任何 node/kimi 进程都会
+加载三个 guard 并打印 armed 行；修它需要重启 dsh proxy，本次未动（记录备查）。
+
+**工具链补齐**：用 sessiondex 索引 + zcode CLI DB 的 `state.output` + 解压后的 dsh session +
+kimi/claude wire 复核高频 `command not found`（`file`/`pip`/`agentbus` 的旧缺口是 2026-11-01/11-05
+前尚未安装，dpkg 日志可证，现已自愈）。本机补装 `ripgrep fd-find jq bc sqlite3 zstd poppler-utils
+rsync iproute2 cron python3-pytest ruby bind9-dnsutils`，并把版本管理器入口 symlink 进
+`~/.local/bin`（cargo/rustc/rustup/rustfmt/cargo-clippy/clippy-driver/go/gofmt/mvn/gradle/sysctl，
+以及 kimi/opencode）——dsh 的 `bash -c` 只有 `~/.local/bin:/usr/local/bin:/usr/bin:/bin` 这类基础
+PATH，不读 rc。验证：`env -i HOME=$HOME PATH=<tool-shell PATH> bash -c 'command -v rg cargo go mvn
+pytest ruby'`。radare2/rabin2 不在 Debian bookworm 源里，暂缺。
