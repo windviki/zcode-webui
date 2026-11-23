@@ -88,6 +88,8 @@ Proxy 兜底会给未知方法 `Promise.resolve(undefined)`：`getPreinstalledTo
 - 保留：当前 4.0.0，以及回滚用的 `vendor/renderer.bak-3.17.2-20261123-143334` 与
   `~/.zcode/server-3.17`；`server-3.18` / `renderer-3.18.2` 作为兼容性参考未动。
 - 共释放约 1.1GB；README / AGENTS 的备份策略同步为「当前版 + 上一版」。
+- 本项目 v0.10.0 已提交并推送到 GitHub，并已发布到 npm
+  （`@aixyzstudio/zcode-webui@0.10.0`，2026-11-23）。
 
 ## 回滚
 
