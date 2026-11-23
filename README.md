@@ -85,8 +85,8 @@ git 部署方式见[手动部署](#手动部署git-clone)；想省事也可以�
 git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # 运行时依赖只有 ws
 
-npm run fetch-renderer                 # 从官方 CDN 下载安装包并提取界面
-                                       # （默认 3.15.3，可用 ZCODE_VERSION=… ZCODE_ARCH=x64 覆盖）
+npm run fetch-renderer                 # 只装渲染层（默认 3.15.3，最后一个有组件清单的版本；
+                                       # 3.16+ 的运行时/渲染层请用 scripts/install-316.sh 整包安装）
 
 cp config.example.json config.json     # 可选；常用字段 workspace / oauthProxy / hostProxy
 
@@ -136,9 +136,9 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 **C · 服务器上本来就登录过官方 CLI / 桌面端**
 `~/.zcode` 已就绪，直接使用。
 
-## 3.16 运行时的三个补丁（装机后需重打）
+## 3.16+ 运行时的三个补丁（装机后需重打）
 
-3.16 的 host/agent 都是整包发布物，以下三处是我们对官方运行时的**有界化补丁**
+3.16+ 的 host/agent 都是整包发布物，以下三处是我们对官方运行时的**有界化补丁**
 （每个脚本幂等、写前备份、可 `--revert`，默认目标 `$ZCODE_HOME/server`）：
 
 | 脚本 | 修什么 | 实测效果 |
@@ -147,7 +147,7 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `scripts/patch-316-refresh.mjs` | 每条 sendText 前 `await providerRefreshRegistry` 的 30 s 超时 | 已有会话的消息 30 s → 毫秒级 |
 | `scripts/patch-316-balance-cache.mjs` | `billing/balance` 去重窗口只有 1 s，一次发送串行 4 次 ×10 s | 重复查询 10 s → 0 ms |
 
-重新安装 3.16 运行时（`scripts/install-316.sh`）后，三个脚本都要重跑一遍。
+重新安装 3.16+ 运行时（`scripts/install-316.sh`）后，三个脚本都要重跑一遍。
 
 ## 页面断线恢复
 
@@ -221,7 +221,7 @@ nginx 保留前缀转发即可（`proxy_pass http://127.0.0.1:3102;` 不带 URI 
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | 官方运行时目录（通常无需修改） |
 | `ZCODE_HOME` | — | `~/.zcode` | 官方数据/凭据目录（与官方 CLI 共用） |
 | `ZCODE_WEBUI_HOME` | — | 见右 | 本服务数据目录（config、渲染层、设备标识、日志）；npm 安装默认 `~/.zcode-webui`，git 部署且项目根已有 `config.json` 或 `vendor/renderer` 时沿用项目目录 |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | `fetch-renderer` 的下载版本与架构 |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | `fetch-renderer` 的下载版本与架构（3.16+ 整包安装用 `install-316.sh`，不走这里） |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | 后台会话脱离超过该时长且无任务运行、无帧活动时回收；`0` = 永不回收 |
 | `ZCODE_WEBUI_PRESENCE_LEASE_MS` | — | `1800000` | 页面 presence 租约有效期：页面开着（含后台）每 45s 续租，租约新鲜时保留宿主与 parked era；`0` = 关闭该保护 |
 | `ZCODE_WEBUI_PRESENCE_MAX_TABS` | — | `32` | 每个宿主最多记住多少个标签页的 presence |
@@ -281,8 +281,15 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 > 或 `./zcode-update.sh --rollback` 退回 3.11.x（那一版直接信任本机 CLI 配置里的 key）。
 >
 > **3.15.3 已适配**（2026-10-19）：`./zcode-update.sh -v 3.15.3 --yes` 完成渲染层/运行时升级，
-> smoke、headless 界面启动、守卫自检全部通过；旧版 3.14.3 保留在 `vendor/renderer.bak-3.14.3-*`
-> 与 `~/.zcode/server.bak-3.14.3-*`，可随时回滚。
+> smoke、headless 界面启动、守卫自检全部通过。这是**最后一个有分平台组件清单**的版本；3.16+
+> 必须走下面的整包安装路径，组件式升级器的 `SHIM_MAX_SUPPORTED` 也刻意停在 3.15.3。
+>
+> **4.0.0 已适配并部署**（2026-11-23）：官方 4.0 仍是 3.16 的整包布局，现有垫片只需补 4 个
+> `window.zcode.*` API 桩；沙箱的 smoke、headless UI、设置页、真实 agent 回合和守卫自检全部通过。
+> 本机当前部署为 **4.0.0**（渲染层 + `~/.zcode/server-4.0`）；上一版 **3.17.2** 的渲染层
+> （`vendor/renderer.bak-3.17.2-*`）与运行时（`~/.zcode/server-3.17`）保留作回滚点，
+> 更早的 3.12.3/3.14.3/3.15.3/3.16.3 备份已于 2026-11-23 清理。细节见
+> `docs/upgrade-4.0-2026-11-23.md`。
 
 ### ZCode 3.16+（新运行时布局）
 
@@ -294,30 +301,37 @@ zcode-webui upgrade --yes --restart    # 非交互，并在前后自动停/启�
 | `zcode-server.cjs`（≤ 3.15） | 子进程 stdio + 13 字节帧（沿用原路径） |
 | `app/out/host/index.js`（≥ 3.16） | `child_process.fork` + `process.parentPort` 控制面 + 转交的 MessagePort 承载协议 payload（`src/port-shim.mjs`） |
 
-从官方整包安装 3.16 到**独立目录**（不动现有运行时）：
+从官方整包安装 4.0（或任意 3.16+）到**独立目录**（不动现有运行时）：
 
 ```bash
-./scripts/install-316.sh ~/Downloads/ZCode-3.16.3-linux-x64.deb --renderer
-# 运行时落在 ~/.zcode/server-3.16，旧渲染层保留为 vendor/renderer.bak-<版本>-<时间>
+./scripts/install-316.sh ~/Downloads/ZCode-4.0.0-linux-x64.deb --renderer
+# 运行时落在 ~/.zcode/server-4.0，旧渲染层保留为 vendor/renderer.bak-<版本>-<时间戳>
+
+# 3.16+ 运行时补丁（每个都幂等、写前备份、可 --revert；装完必须重跑）
+for p in patch-316-refresh patch-316-balance-cache patch-316-browser-ctx; do
+  node scripts/$p.mjs ~/.zcode/server-4.0
+done
 
 # 试跑（只影响这一次服务进程）：
-ZCODE_SERVER_RUNTIME_ROOT=~/.zcode/server-3.16 ./zcode-service.sh restart
+ZCODE_SERVER_RUNTIME_ROOT=~/.zcode/server-4.0 ./zcode-service.sh restart
 # 回滚：unset 该变量再 restart
 ```
 
 确认稳定后再切成默认（保留旧目录随时可切回）：
 
 ```bash
-mv ~/.zcode/server ~/.zcode/server-3.15
-ln -s ~/.zcode/server-3.16 ~/.zcode/server
+ln -sfn ~/.zcode/server-4.0 ~/.zcode/server
 ./zcode-service.sh restart
 ```
 
-注意：3.16 首次启动会对 `~/.zcode/v2`（tasks-index 等）执行数据库迁移，并把旧会话镜像进
+注意：3.16+ 首次启动会对 `~/.zcode/v2`（tasks-index 等）执行数据库迁移，并把旧会话镜像进
 `v2/sessions`；**回滚到 3.15 前请确认旧版本能读新 schema**，升级前先备份 `~/.zcode`。
 `/api/health` 的 `runtimeKind` 会显示当前实际使用的传输（`legacy` / `host16`）。
 
 ### 仓库内一键更新（git 部署 / 本机）
+
+> 仅适用于 **≤ 3.15.3**（最后一版有分平台组件清单）。3.16+（含 4.0）官方不再发布组件 manifest，
+> 请用上面的 `install-316.sh` 整包路径；`zcode-update.sh` 的自动目标会停在 3.15.3，不要用它升 4.0。
 
 ```bash
 ./zcode-update.sh              # 探测最新版本 → 拉包解包 → 原子替换 → 重启 → 校验（失败自动回滚）

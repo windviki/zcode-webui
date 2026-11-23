@@ -17,7 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   decideMemoryAction, createMemoryGuard, resolveMemoryThresholds,
-  sampleSystemMemory, sampleHostRssMb, collectHostPids,
+  sampleSystemMemory, sampleHostRssMb, sampleHostFootprintMb, collectHostPids,
 } from '../../src/memory-guard.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -203,6 +203,53 @@ const base = { now: T0, lastReclaimAt: 0, lastWarnAt: 0, swapFreeMb: 0 };
   const rss = sampleHostRssMb(process.pid);
   check('sampleHostRssMb() reads VmRSS for a live pid', Number.isFinite(rss) && rss > 0, String(rss));
   check('sampleHostRssMb() returns null for a dead pid', sampleHostRssMb(999999) === null, String(sampleHostRssMb(999999)));
+
+  const fp = sampleHostFootprintMb(process.pid);
+  check('sampleHostFootprintMb() adds VmSwap to VmRSS',
+    fp && Number.isFinite(fp.rssMb) && fp.rssMb > 0 && Number.isFinite(fp.swapMb) && fp.swapMb >= 0 &&
+    fp.footprintMb === fp.rssMb + fp.swapMb, JSON.stringify(fp));
+  check('sampleHostFootprintMb() returns null for a dead pid', sampleHostFootprintMb(999999) === null);
+}
+
+// ---- footprint accounting (2026-11-16 postmortem replay) ------------------
+// The host that broke this box: 1.0GB resident + 2.2GB swapped out, swap full.
+// The RSS-only guard saw 1014MB (< kill 1238) and only warned 139 times.
+{
+  const TH1116 = {
+    warnRssMb: 929, killRssMb: 1238, minAvailMb: 2572, hardRssMb: 3096, softAvailMb: 4630,
+    cooldownMs: 300000, warnRepeatMs: 300000,
+  };
+  const base = { memAvailableMb: 4156, swapFreeMb: 0, now: T0, lastReclaimAt: 0, lastWarnAt: 0 };
+  const oldRssOnly = decideMemoryAction({ ...base, hosts: [{ pid: 7, rssMb: 1014 }] }, TH1116);
+  check('replay: RSS-only view of the 11-16 host never reclaimed', oldRssOnly.action === 'warn', oldRssOnly.action);
+  const withSwap = decideMemoryAction({ ...base, hosts: [{ pid: 7, rssMb: 1014, swapMb: 2209, footprintMb: 3223 }] }, TH1116);
+  check('replay: footprint view reclaims it (hard cap path)', withSwap.action === 'reclaim' && withSwap.pid === 7, withSwap.action + ' ' + withSwap.reason);
+  check('replay: decision reports rss, swap and footprint',
+    withSwap.hostRssMb === 1014 && withSwap.hostSwapMb === 2209 && withSwap.hostFootprintMb === 3223,
+    JSON.stringify([withSwap.hostRssMb, withSwap.hostSwapMb, withSwap.hostFootprintMb]));
+
+  const mixed = decideMemoryAction({
+    ...base,
+    memAvailableMb: 900, swapFreeMb: 0,
+    hosts: [{ pid: 1, rssMb: 1300, swapMb: 0, footprintMb: 1300 }, { pid: 2, rssMb: 900, swapMb: 2500, footprintMb: 3400 }],
+  }, TH1116);
+  check('biggest host is chosen by footprint, not RSS', mixed.action === 'reclaim' && mixed.pid === 2, JSON.stringify(mixed));
+}
+
+// ---- footprint reader wiring in the guard instance -----------------------
+{
+  const guard = createMemoryGuard({
+    config: { ...POLICY, enabled: true, intervalMs: 1000, warnRepeatMs: 300000, cooldownMs: 300000 },
+    getHosts: () => [11],
+    footprintReader: () => ({ rssMb: 900, swapMb: 2500, footprintMb: 3400 }),
+    sysReader: () => THIS_BOX,
+    now: () => T0,
+  });
+  const reclaimed = [];
+  const d = guard.tick((x) => reclaimed.push(x));
+  const host = guard.snapshot().hosts[0];
+  check('guard samples the footprint and reports swap separately',
+    d.action === 'reclaim' && host.swapMb === 2500 && host.footprintMb === 3400, JSON.stringify(host));
 }
 {
   const sessions = new Map([

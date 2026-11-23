@@ -993,7 +993,43 @@
     //   browserViewLoadUrl       → embedded-browser only, fire and forget.
     getFileApplications: val([]),
     openFileWithApplication: val({ success: false, error: 'not supported in zcode-webui' }),
-    browserViewLoadUrl: ok
+    browserViewLoadUrl: ok,
+    // ---- 3.18 API surface ---------------------------------------------------
+    // Diff of window.zcode.* usage 3.17.2 → 3.18.2 adds nine names. The Proxy
+    // fallback makes every one of them LOOK implemented (names starting with
+    // "on" get an unsubscribe fn, everything else ok()/undefined), so the
+    // capability checks in the renderer (`window.zcode.ensureMicrophoneAccess
+    // && …`) all pass. Give each the shape its own "unsupported" path already
+    // uses, so a capability we cannot back degrades instead of being read as a
+    // real (undefined) result:
+    //   ensureMicrophoneAccess   → awaited and compared with 'denied'/'granted'
+    //                              (voice input; also gated to non-Linux upstream);
+    //   captureBrowserGuestPage  → embedded-browser page capture (no iab here);
+    //   showExtensionNotification→ `.then(handler)`, handler stores {shown,reason};
+    //   browserViewPromoteDraftTabs → falls back to `?? Promise.resolve([])`.
+    ensureMicrophoneAccess: val('unsupported'),
+    resetMicrophoneAccess: ok,
+    openMicrophoneSettings: ok,
+    captureBrowserGuestPage: val(null),
+    browserViewPromoteDraftTabs: val([]),
+    showExtensionNotification: val({ shown: false, reason: 'unsupported' }),
+    sendAppControlNavigation: ok,
+    onExtensionNotificationClick: unsub,
+    onAppControlNavigationMessage: unsub,
+    // ---- 4.0 API surface ---------------------------------------------------
+    // Diff of window.zcode.* usage 3.18.2 → 4.0.0 adds four names. Three of them
+    // would otherwise fall through the generic Proxy: getPreinstalledToolsState
+    // is awaited and its result feeds `r.tools.map(...)`, so an `undefined`
+    // result leaves the settings section stuck on its loading row; execute… and
+    // setReplyLanguage would look like they succeeded while doing nothing.
+    // Return the renderer's own empty state, and reject the command so the UI
+    // reports "command failed" instead of silently pretending to install tools.
+    getPreinstalledToolsState: val({ autoInstallEnabled: false, tools: [] }),
+    executePreinstalledToolsCommand: function () {
+      return Promise.reject(new Error('preinstalled tools are not managed by zcode-webui'));
+    },
+    setReplyLanguage: ok,
+    onPreinstalledToolsState: unsub
   };
 
   // Every "onXxx" channel becomes a subscribe helper returning an unsubscribe fn.

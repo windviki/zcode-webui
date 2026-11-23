@@ -102,8 +102,8 @@ Every block is logged to stderr and shows up as `[host:stderr] [zcode-webui] rep
 git clone https://github.com/windviki/zcode-webui.git
 cd zcode-webui && npm install          # only runtime dependency: ws
 
-npm run fetch-renderer                 # downloads the official installer from the CDN and extracts
-                                       # the UI (default 3.15.3; override ZCODE_VERSION=… ZCODE_ARCH=x64)
+npm run fetch-renderer                 # renderer only (default 3.15.3, the last release with a
+                                       # component manifest; use scripts/install-316.sh for 3.16+)
 
 cp config.example.json config.json     # optional; common fields: workspace / oauthProxy / hostProxy
 
@@ -186,7 +186,7 @@ Priority: CLI args ≈ env vars > `config.json` > defaults.
 | `ZCODE_SERVER_RUNTIME_ROOT` | `serverRoot` | `~/.zcode/server` | Official runtime directory (rarely changed) |
 | `ZCODE_HOME` | — | `~/.zcode` | Official data/credential directory (shared with the CLI) |
 | `ZCODE_WEBUI_HOME` | — | see notes | Data home of this service (config, renderer, device id, logs); defaults to `~/.zcode-webui` for npm installs; git checkouts keep using the project dir when it already contains `config.json` or `vendor/renderer` |
-| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | Version/architecture for `fetch-renderer` |
+| `ZCODE_VERSION` / `ZCODE_ARCH` | — | `3.15.3` / `x64` | Version/architecture for `fetch-renderer` (3.16+ installs use `install-316.sh` instead) |
 | `ZCODE_WEBUI_DETACHED_TTL_MS` | — | `1800000` | Reap detached background hosts after this long when idle; `0` = keep forever |
 | `ZCODE_WEBUI_PRESENCE_LEASE_MS` | — | `1800000` | Presence lease: an open page (even backgrounded) renews it every 45 s; a fresh lease keeps the host and its parked era. `0` disables the protection |
 | `ZCODE_WEBUI_PRESENCE_MAX_TABS` | — | `32` | Per-host cap on remembered tab leases |
@@ -252,10 +252,58 @@ Note: `upgrade` updates the official components only; upgrade zcode-webui itself
 > CLI config key instead).
 >
 > **3.15.3 verified** (2026-10-19): `./zcode-update.sh -v 3.15.3 --yes` completed the renderer/runtime
-> upgrade; smoke, headless UI boot and the guard self-check all passed. The previous 3.14.3 build is kept
-> in `vendor/renderer.bak-3.14.3-*` and `~/.zcode/server.bak-3.14.3-*` for rollback.
+> upgrade; smoke, headless UI boot and the guard self-check all passed. This is the **last release with a
+> per-platform component manifest**; 3.16+ must use the full-installer path below, and
+> `SHIM_MAX_SUPPORTED` intentionally stays at 3.15.3.
+>
+> **4.0.0 supported and deployed** (2026-11-23): 4.0 still uses the 3.16 bundled-host layout, so the
+> existing shim only needed four extra `window.zcode.*` stubs; sandbox smoke, headless UI, settings page,
+> a real agent turn and the guard checks all passed. This deployment now runs **4.0.0** (renderer +
+> `~/.zcode/server-4.0`), with **3.17.2** kept as the rollback point
+> (`vendor/renderer.bak-3.17.2-*` and `~/.zcode/server-3.17`). Older 3.12.3/3.14.3/3.15.3/3.16.3
+> backups were pruned on 2026-11-23. Details: `docs/upgrade-4.0-2026-11-23.md`.
+
+### ZCode 3.16+ (bundled-host layout)
+
+Since 3.16 the official release ships no per-platform component manifest; the host lives inside the
+desktop installer (`resources/app.asar/out/host/*.js`). The shim supports both generations and detects
+them by **layout**, not by version string:
+
+| Runtime layout | Transport |
+|---|---|
+| `zcode-server.cjs` (≤ 3.15) | child-process stdio with 13-byte frames |
+| `app/out/host/index.js` (≥ 3.16) | `child_process.fork` + `process.parentPort` control plane + a transferred MessagePort for protocol payload |
+
+Install 4.0 (or any 3.16+) into a **separate directory**, leaving the current runtime untouched:
+
+```bash
+./scripts/install-316.sh ~/Downloads/ZCode-4.0.0-linux-x64.deb --renderer
+# runtime: ~/.zcode/server-4.0; previous renderer kept as vendor/renderer.bak-<version>-<timestamp>
+
+# 3.16+ runtime patches (idempotent, backup before write, --revert supported; re-run after every install)
+for p in patch-316-refresh patch-316-balance-cache patch-316-browser-ctx; do
+  node scripts/$p.mjs ~/.zcode/server-4.0
+done
+
+# trial run (this process only):
+ZCODE_SERVER_RUNTIME_ROOT=~/.zcode/server-4.0 ./zcode-service.sh restart
+# rollback: unset the variable and restart
+
+# switch permanently once verified:
+ln -sfn ~/.zcode/server-4.0 ~/.zcode/server
+./zcode-service.sh restart
+```
+
+The first 3.16+ start migrates `~/.zcode/v2` (tasks-index etc.) and mirrors old conversations into
+`v2/sessions`; back up `~/.zcode` before upgrading and verify an older build can still read the new
+schema before rolling back. `/api/health` reports the active transport in `runtimeKind`
+(`legacy` / `host16`).
 
 ### One-command update (git checkout / local deployment)
+
+> Applies only to **≤ 3.15.3** (the last release with a component manifest). 3.16+ (including 4.0)
+> publishes no component manifest — use the `install-316.sh` path above;
+> `zcode-update.sh` stops at 3.15.3 on purpose and must not be used to install 4.0.
 
 ```bash
 ./zcode-update.sh              # detect → download → unpack → atomic swap → restart → verify (auto-rollback)

@@ -25,10 +25,13 @@ import os from 'node:os';
 import path from 'node:path';
 
 const MARK = '/*webui:browser-ctx-bounded*/';
-// 3.16 called this helper XA(); 3.17 renamed it XE(). Both are the unbounded
-// "browser ambient context" capture (body starts with `if(!e)return;let n=t.workspaceIdentity?...`),
-// so accept either name instead of failing the anchor on a rename.
-const START_RE = /async function (XA|XE)\(e,t\)\{/;
+// 3.16 called this helper XA(); 3.17 renamed it XE(); 3.18.2 renamed it eN (and
+// will rename it again). Anchor on the *shape* instead of the name: the
+// unbounded "browser ambient context" capture is the only async helper whose
+// body starts with a !param guard and then reads `.workspaceIdentity?.trim() ||
+// .workspacePath` off its second parameter.
+const START_RE =
+  /async function ([A-Za-z0-9_$]{1,6})\(([A-Za-z0-9_$,\s]{1,40})\)\{(if\(![A-Za-z0-9_$]+\)return;)(?=let [A-Za-z0-9_$]+=[A-Za-z0-9_$]+\.workspaceIdentity\?\.trim\(\)\|\|[A-Za-z0-9_$]+\.workspacePath)/;
 const BUDGET_MS = 800;
 
 const args = process.argv.slice(2);
@@ -67,18 +70,25 @@ if (already) { console.log('[patch-316-browser] already patched: ' + file); proc
 
 const startMatch = src.match(START_RE);
 if (!startMatch) {
-  console.error('[patch-316-browser] XA()/XE() not found — inspect this build before patching');
+  console.error('[patch-316-browser] browser ambient-context helper not found — inspect this build before patching');
   process.exit(3);
 }
 if ((src.match(new RegExp(START_RE.source, 'g')) || []).length !== 1) {
-  console.error('[patch-316-browser] XA()/XE() is not unique — refusing to patch');
+  console.error('[patch-316-browser] ambient-context helper anchor is not unique — refusing to patch');
   process.exit(3);
 }
 const START = startMatch[0];
 const FN = startMatch[1];
+const PARAMS = startMatch[2];
+const GUARD = startMatch[3];   // the `if(!x)return;` statement itself (kept verbatim)
 const start = src.indexOf(START);
-// find the matching closing brace of the function body
-let depth = 0, i = start + START.length - 1, quote = null;
+// find the matching closing brace of the function body. START ends at the
+// `!param` guard (no brace), so locate the body's opening brace explicitly —
+// assuming it is START's last char silently scanned from the middle of the body
+// and spliced half the bundle.
+const bracePos = start + START.lastIndexOf('{');
+if (bracePos < start) { console.error('[patch-316-browser] no body brace in anchor'); process.exit(3); }
+let depth = 0, i = bracePos, quote = null;
 for (; i < src.length; i++) {
   const ch = src[i];
   if (quote) {
@@ -91,9 +101,9 @@ for (; i < src.length; i++) {
   else if (ch === '}') { depth--; if (depth === 0) break; }
 }
 if (depth !== 0) { console.error('[patch-316-browser] could not find the end of ' + FN + '()'); process.exit(3); }
-const originalBody = src.slice(start + START.length, i); // everything inside the braces
+const originalBody = src.slice(bracePos + 1, i); // everything inside the braces
 const patched =
-  `async function ${FN}(e,t){if(!e)return;${MARK}` +
+  `async function ${FN}(${PARAMS}){${GUARD}${MARK}` +
   `const __xaT=new Promise(r=>setTimeout(()=>r(void 0),${BUDGET_MS}));` +
   `const __xaW=(async()=>{${originalBody}})();` +
   `return await Promise.race([__xaW,__xaT])}`;
@@ -106,7 +116,10 @@ const out = src.slice(0, start) + patched + src.slice(i + 1);
   const tmp = file + '.patchcheck.mjs';
   writeFileSync(tmp, out);
   try {
-    execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe' });
+    // strip injected guards: their banner otherwise hides the real syntax error
+    const checkEnv = { ...process.env };
+    delete checkEnv.NODE_OPTIONS;
+    execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe', env: checkEnv });
   } catch (e) {
     try { unlinkSync(tmp); } catch (_e) { /* ignore */ }
     console.error('[patch-316-browser] patched bundle does not parse — refusing to write: ' + String(e.stderr || e.message).slice(0, 300));

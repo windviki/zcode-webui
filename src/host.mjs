@@ -13,6 +13,7 @@ import { DEFAULT_VERSION } from './upgrade.mjs';
 import { encodeFrame, FrameParser } from './frame.mjs';
 import { resolveDataHome } from './dirs.mjs';
 import { loginShellEnvSeed } from './login-env.mjs';
+import { ensureCredentialBackup, handleCredentialCipherRequest } from './credential-cipher.mjs';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -323,6 +324,7 @@ function createHost16LogSink(log) {
   };
 }
 
+
 export function buildHost16Env(serverRoot, extra = {}) {
   const env = {
     ...process.env,
@@ -372,6 +374,13 @@ export function createHost16({
   startupId, deviceId = '', locale = 'zh-CN', workspace = '',
 }) {
   const root = layout.root;
+  // >= 3.18 keeps its credential store in the new v2 envelope and rewrites it on
+  // first read; keep a copy so a rollback does not cost a re-login.
+  try {
+    if (readFileSync(path.join(root, 'app', 'out', 'host', 'index.js'), 'utf8').includes('credentialCipherProvider')) {
+      ensureCredentialBackup((line) => log('[host16] ' + line));
+    }
+  } catch (_e) { /* best effort */ }
   const child = fork(layout.entry, [], {
     cwd: root,
     execArgv: ['--import', PORT_SHIM, '--no-warnings'],
@@ -404,6 +413,21 @@ export function createHost16({
     if (m.__z === 'ready') { pipe.preloadReady = true; return; }
     if (m.__z === 'pp') {
       const msg = m.msg || {};
+      // >= 3.18 hands credential encrypt/decrypt to its "main process" over the
+      // utility-process port (src/port-shim.mjs relays it here). Unanswered, the
+      // host never finishes starting: configRuntime.start() and
+      // oauth.restoreCachedSessionState hang, the renderer's
+      // isRestoringOAuthSession stays true and the UI sits on the startup
+      // spinner (2026-11-16, 3.18.2 trial). See src/credential-cipher.mjs.
+      if (msg.type === 'credential-cipher-request') {
+        const reply = handleCredentialCipherRequest(msg, (line) => {
+          if (process.env.ZCODE_WEBUI_CREDENTIAL_DEBUG === '1') log('[host16] ' + line);
+        });
+        if (reply && !pipe.closed && child.connected) {
+          try { child.send({ __z: 'pp', msg: reply }); } catch (_e) { /* channel gone */ }
+        }
+        return;
+      }
       // observed on the wire as both 'database-startup-state' (3.16.x host) and
       // the namespaced form used by the renderer-side channel
       if (msg.type === 'database-startup-state' || msg.type === 'zcode:database-startup-state') {

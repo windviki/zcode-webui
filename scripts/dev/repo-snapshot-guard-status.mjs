@@ -110,7 +110,13 @@ try {
     let cmdline = '';
     try { cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8'); } catch (_e) { continue; }
     // >= 3.16 hosts are forks of app/out/host/index.js (no zcode-server.cjs).
-    if (cmdline.includes('zcode-server.cjs') || cmdline.includes('app/out/host/index.js')) { hostPid = entry; break; }
+    // 4.0 rewrites argv[0] to the process title "zcode-host", so /proc/<pid>/cmdline
+    // is just "zcode-host" and the path match goes blind — fall back to comm.
+    let comm = '';
+    try { comm = fs.readFileSync(`/proc/${entry}/comm`, 'utf8').trim(); } catch (_e) { /* ignore */ }
+    if (cmdline.includes('zcode-server.cjs') || cmdline.includes('app/out/host/index.js') || comm === 'zcode-host') {
+      hostPid = entry; break;
+    }
   }
 } catch (_e) { /* not linux */ }
 if (!hostPid) {
@@ -123,6 +129,7 @@ if (!hostPid) {
 
 const logPath = path.join(PROJECT_ROOT, 'zcode-webui.log');
 let armedAt = null;
+let armedTsApprox = false;
 let blocked = 0;
 let lastBlocked = null;
 if (fs.existsSync(logPath)) {
@@ -133,17 +140,27 @@ if (fs.existsSync(logPath)) {
   fs.readSync(fd, buf, 0, buf.length, from);
   fs.closeSync(fd);
   let lastTs = null;
+  let firstTs = null;
+  let sawArmed = false;
   for (const line of buf.toString('utf8').split('\n')) {
     const ts = line.match(/\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+\]/);
-    if (ts) lastTs = ts[1];
+    if (ts) {
+      lastTs = ts[1];
+      if (!firstTs) firstTs = ts[1];
+    }
     if (line.includes('repo-snapshot-guard:')) {
-      if (line.includes('armed')) armedAt = lastTs;
+      // The guard prints "armed" before the first timestamped host line, so a
+      // freshly rotated log has no preceding timestamp to borrow. Fall back to
+      // the first host timestamp below (a few seconds after arming).
+      if (line.includes('armed')) { sawArmed = true; if (lastTs) armedAt = lastTs; }
       if (line.includes('blocked upload-credential')) { blocked++; lastBlocked = { at: lastTs, line: line.trim().slice(0, 150) }; }
     }
   }
+  if (!armedAt && sawArmed) { armedAt = firstTs; armedTsApprox = true; }
 }
 console.log('\nguard activity (last 8 MiB of the service log)');
-ok('guard armed in at least one host', Boolean(armedAt), armedAt ? 'last armed at ' + armedAt : 'no armed line found');
+ok('guard armed in at least one host', Boolean(armedAt),
+  armedAt ? 'last armed at ' + armedAt + (armedTsApprox ? ' (approx: first timestamped host line; the armed line has none)' : '') : 'no armed line found');
 console.log(`  note  blocked upload-credential requests: ${blocked}`);
 if (lastBlocked) console.log('        last: [' + lastBlocked.at + '] ' + lastBlocked.line.replace(/^\[host:stderr\]\s*/, ''));
 

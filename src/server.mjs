@@ -22,6 +22,7 @@ import { LATEST_PAGE_URLS, parseVersionsFromPage, currentRendererVersion, curren
 import { startLogin, stopLogin, loginState, credentialsPath } from './login.mjs';
 import { resolvePaths } from './dirs.mjs';
 import { createMemoryGuard, collectHostPids } from './memory-guard.mjs';
+import { createAgentProcReaper } from './agent-proc-reaper.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -447,11 +448,14 @@ function readProcSnapshot() {
     try { stat = readFileSync('/proc/' + pid + '/stat', 'utf8'); } catch (_e) { continue; }
     const close = stat.lastIndexOf(')');
     if (close < 0) continue;
+    const open = stat.indexOf('(');
+    const comm = open >= 0 && close > open ? stat.slice(open + 1, close) : '';
     const f = stat.slice(close + 2).split(' ');
     byPid.set(pid, {
       ppid: Number(f[1]) || 0,
       cpu: (Number(f[11]) || 0) + (Number(f[12]) || 0),
       start: Number(f[19]) || 0,
+      comm,
     });
   }
   return byPid;
@@ -1698,6 +1702,56 @@ if (DETACHED_TTL_MS > 0) {
   }, REAP_INTERVAL_MS).unref();
 }
 
+// Idle agent-CLI reaper (2026-11-16). The official host spawns a batch of agent
+// app-servers per page connect (observed 7 x 200-450MB for one load) and only
+// closes them through the desktop transport's dispose, which a web session never
+// triggers: after the page is gone they sit at 0 CPU for hours. Two days of
+// mobile reloads left 17 of them (~985MB RSS + swap) and helped push the box into
+// permanent swap thrash. This reaps the idle ones from the outside.
+//
+// Only when the global busy guard says nothing is running AND the session has no
+// attached view and no fresh page lease; then only depth>=2 descendants whose
+// comm is zcode* and whose whole subtree held its CPU ticks for the idle window.
+// The host respawns an attachment runtime on the next connect, so this costs one
+// spawn, never history. See src/agent-proc-reaper.mjs for the full contract.
+const PROC_REAPER_MODE = String(process.env.ZCODE_WEBUI_PROC_REAPER || 'on').toLowerCase();
+const PROC_REAPER = createAgentProcReaper({
+  minDepth: Number(process.env.ZCODE_WEBUI_PROC_REAPER_MIN_DEPTH) || undefined,
+  minAgeMs: Number(process.env.ZCODE_WEBUI_PROC_REAPER_MIN_AGE_MS) || undefined,
+  idleMs: Number(process.env.ZCODE_WEBUI_PROC_REAPER_IDLE_MS) || undefined,
+  maxPerTick: Number(process.env.ZCODE_WEBUI_PROC_REAPER_MAX_PER_TICK) || undefined,
+});
+if (PROC_REAPER_MODE !== 'off') {
+  setInterval(async () => {
+    try {
+      if (await agentWorkActive()) return;            // a turn/tool/model call is in flight
+      const now = Date.now();
+      const roots = [];
+      for (const s of sessions.values()) {
+        if (s.closed || !s.child || s.child.exitCode !== null) continue;
+        if (s.views.size > 0) continue;               // a page is attached: not ours to prune
+        if (hasFreshPresence(s, now)) continue;       // page alive (lease), just no socket
+        roots.push(s.child.pid);
+      }
+      if (roots.length === 0) return;
+      let uptimeSec = 0;
+      try { uptimeSec = Number(readFileSync('/proc/uptime', 'utf8').split(' ')[0]) || 0; } catch (_e) { /* ignore */ }
+      const res = PROC_REAPER.tick({
+        snapshot: readProcSnapshot(), roots, uptimeSec, now,
+        dryRun: PROC_REAPER_MODE === 'dry-run' || PROC_REAPER_MODE === 'log',
+      });
+      if (res.pids && res.pids.length) {
+        console.error('[proc-reaper] SIGTERM idle agent cli pid=' + res.pids.join(',') +
+          ' (candidates=' + res.candidates + ', mode=' + PROC_REAPER_MODE + ')');
+      } else if (res.wouldReap && res.wouldReap.length) {
+        console.error('[proc-reaper] dry-run: would reap ' + res.wouldReap.join(',') + ' (candidates=' + res.candidates + ')');
+      }
+    } catch (e) {
+      console.error('[proc-reaper] tick failed: ' + ((e && e.message) || e));
+    }
+  }, REAP_INTERVAL_MS).unref();
+}
+
 // A relay is a VIEW now, not a host of its own (see attachView): an abandoned
 // long-poll page must lose its VIEW, never the account's host — the host may be
 // running a turn for the user's other tab. Detaching here also parks the era, so
@@ -1838,7 +1892,28 @@ function handleRequest(req, res) {
       httpRelayTtlMs: HTTP_RELAY_TTL_MS,
       bindHost: BIND_HOST,
       accessGate: !!ACCESS_TOKEN,
-      guards: { apiCache: guardStatsSnapshot(), quotaReset: quotaResetSnapshot(), memory: MEMORY_GUARD.snapshot() },
+      guards: {
+        apiCache: guardStatsSnapshot(),
+        quotaReset: quotaResetSnapshot(),
+        memory: MEMORY_GUARD.snapshot(),
+        // idle agent-CLI reaper: how many vendor app-servers we already pruned
+        // and what the last tick saw (see src/agent-proc-reaper.mjs)
+        procReaper: {
+          mode: PROC_REAPER_MODE,
+          config: {
+            minDepth: PROC_REAPER.config.minDepth,
+            idleMs: PROC_REAPER.config.idleMs,
+            minAgeMs: PROC_REAPER.config.minAgeMs,
+            maxPerTick: PROC_REAPER.config.maxPerTick,
+          },
+          ticks: PROC_REAPER.stats.ticks,
+          reaped: PROC_REAPER.stats.reaped,
+          lastReapedAt: PROC_REAPER.stats.lastReapedAt || null,
+          lastPids: PROC_REAPER.stats.lastPids,
+          lastCandidates: PROC_REAPER.stats.lastCandidates,
+          history: PROC_REAPER.history.slice(-3),
+        },
+      },
     });
   }
   if (urlPath === '/api/login/status') {

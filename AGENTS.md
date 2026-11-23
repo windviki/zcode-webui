@@ -1,5 +1,18 @@
 # AGENTS.md — zcode-webui 项目约定
 
+> **最近变更（2026-11-23，部署 4.0.0）**：官方 4.0.0 仍是 bundled-host 布局，现有垫片
+> （含 3.18 的 credential-cipher 桥）无需新通道即可启动。渲染层 4.0 只新增 4 个
+> `window.zcode.*`（预装工具 / reply language），`web/zcode-bridge.js` 已补显式桩；三个
+> 3.16+ 运行时补丁（refresh / balance-cache / browser-ctx）锚点在 4.0 全部命中。生产已从
+> 3.17.2 切到 4.0.0（`~/.zcode/server-4.0` + `vendor/renderer`，旧渲染层与 `server-3.17`
+> 保留可回滚）。细节见 `docs/upgrade-4.0-2026-11-23.md`。
+>
+> **前次变更（2026-11-16，v0.10.0）**：① 宿主内存守卫改 RSS+swap 口径；② 新增闲置 `zcode-cli`
+> 回收器（`src/agent-proc-reaper.mjs`）；③ **3.18.2 已打通**——真正卡点是宿主的凭据加密桥
+> （`credential-cipher-request` 曾被 server 丢弃，导致启动永挂），由 `src/credential-cipher.mjs` +
+> `src/host.mjs` 按「主进程」角色应答解决，沙箱 UI 门禁全绿；生产仍钉 3.17.2 待切换。
+> 细节见 `docs/leaks-and-318-2026-11-16.md`（本文件尾部已超上下文预算，勿只依赖尾部章节）。
+
 ## 发布流程（GitHub + npm，已验证可用）
 
 发布 = 版本号 bump + release 提交 + 推送 GitHub + npm 发布。按顺序执行：
@@ -137,10 +150,17 @@ shell、以及正在执行的 restart 脚本会一起死，`start` 永远执行�
 
 ### 版本钉位
 
-- 本机部署：**3.15.3**（`zcode-update.sh` 的 `PINNED_VERSION`、`scripts/fetch-renderer.sh` 的
-  `ZCODE_VERSION` 默认值、`src/upgrade.mjs` 的 `DEFAULT_VERSION`、README 里的默认值，四处一起改）。
-- shim 支持上限：**3.15.3**（`SHIM_MAX_SUPPORTED`，两处：`zcode-update.sh` 与 `src/upgrade.mjs`）。
-  超过上限的版本默认不升，只提示；显式 `-v` 仍可试装，装完照常校验、起不来自动回滚。
+- 本机部署：**4.0.0**（host16 整包路径：`scripts/install-316.sh <deb> --dest ~/.zcode/server-4.0`，
+  渲染层 `vendor/renderer`，运行时 `~/.zcode/server -> server-4.0`；旧 3.17.2 渲染层与
+  `~/.zcode/server-3.17` 保留可回滚，见 `docs/upgrade-4.0-2026-11-23.md`）。
+- **组件式升级器**（`zcode-update.sh` 的 `PINNED_VERSION`/`SHIM_MAX_SUPPORTED`、
+  `scripts/fetch-renderer.sh` 的 `ZCODE_VERSION`、`src/upgrade.mjs` 的 `DEFAULT_VERSION`/
+  `SHIM_MAX_SUPPORTED`）仍是 **3.15.3**——那是最后一版有分平台组件清单的官方发布；3.16+
+  （含 4.0）必须走整包安装器，所以这些常量刻意不跟着升，避免自动升级误用组件路径。
+- **备份保留策略**：只留「当前版 + 上一版」。2026-11-23 已清理 3.12.3 / 3.14.3 / 3.15.3 / 3.16.3
+  的渲染层备份与 `server-3.14` / `server-3.15` / `server-3.16`；保留当前 4.0.0 与上一版 3.17.2
+  （`vendor/renderer.bak-3.17.2-*`、`~/.zcode/server-3.17`）。`server-3.18` 与
+  `renderer-3.18.2` 是兼容性参考，不纳入“升级备份”清理。
 
 ### 会话置顶（pin）禁用（2026-09-18）
 
@@ -767,3 +787,45 @@ rsync iproute2 cron python3-pytest ruby bind9-dnsutils`，并把版本管理器�
 以及 kimi/opencode）——dsh 的 `bash -c` 只有 `~/.local/bin:/usr/local/bin:/usr/bin:/bin` 这类基础
 PATH，不读 rc。验证：`env -i HOME=$HOME PATH=<tool-shell PATH> bash -c 'command -v rg cargo go mvn
 pytest ruby'`。radare2/rabin2 不在 Debian bookworm 源里，暂缺。
+
+## 宿主内存口径 + 闲置 zcode-cli 回收（2026-11-16，v0.10.0）
+
+用户报「webui 开不了、提示 startup」。根因不是引导协议回归：`zcode-host` RSS 1.0GB 但 **swap 2.2GB**
+（工作集 3.17GB），整机 swap 100% 满 → 换页抖动（server `D` 态、`/api/health` 8.7s~超时、RPC 6~7s、
+页面入口 40s）→ 渲染层 30s 拿不到启动状态 → 官方 `未能收到启动状态` 屏。内存守卫只读 VmRSS，
+139 次 WARN / 0 次回收。两处修复：
+
+1. **`src/memory-guard.mjs` 改按 footprint（VmRSS + VmSwap）判**：`sampleHostFootprintMb()`；
+   `decideMemoryAction()` 用 `footprintMb`，仍上报 `rssMb`/`hostSwapMb`。阈值语义不变（本机
+   929/1238/3096MB）。11-16 数字回放：RSS 口径只 warn，footprint 口径命中 hard 上限。
+   `/api/health` → `guards.memory.hosts[]` 带 `rssMb/swapMb/footprintMb`。
+2. **`src/agent-proc-reaper.mjs` 回收闲置 agent CLI**：每次页面连接，官方宿主拉起一批 `zcode-cli`
+   （实测 2×400MB + 5×200MB ≈ 1.8GB），页面关闭后 0 CPU 挂几小时（官方只在桌面 transport dispose 时
+   stdin EOF 收掉，web 会话不触发），两天累积 17 个。回收条件全部满足才 SIGTERM：busy-guard 空闲、
+   会话无附着 view 且无新鲜 presence、宿主后代 **depth ≥ 2**、`comm` 精确 `zcode-cli`（不碰
+   `zcode-node-repl`/bash/python）、年龄 ≥5min 且**整棵子树** 10min 内 CPU tick 不变、每 tick ≤8 个。
+   代价只是下次连接重新 spawn 一个附着运行时（实测杀 17 个后页面照常）。`/api/health` →
+   `guards.procReaper`，日志 `[proc-reaper] SIGTERM idle agent cli pid=…`。
+
+自检：`node scripts/dev/agent-proc-reaper-test.mjs`（18 项合成快照）、`memory-guard-test`（+6 项
+footprint 回放）。两者都需重启服务才生效（配置默认值 10min/5min/8）。
+
+**官方 3.18.2：已打通（沙箱全绿，生产仍钉 3.17.2 待切换）**。9 个新 `window.zcode.*` 桩已补进
+`web/zcode-bridge.js`；三个运行时补丁在 3.18.2 上可打（browser-ctx 锚点改成按函数体签名匹配，
+并修掉两个真 bug）。**真正的卡点不是 scoped-port，而是凭据加密桥**：3.18 宿主把
+credential 加解密交给「桌面主进程」（`process.parentPort` 上的
+`credential-cipher-request` → `credential-cipher-result`），而 `src/port-shim.mjs` 把这条通道
+桥到 fork IPC 后，server **丢弃了这类消息** → `configRuntime.start()` 与
+`oauth.restoreCachedSessionState` 永不返回 → 渲染层 `isRestoringOAuthSession` 一直为真 →
+`root-startup-loading` 卡死（等 110s、无报错、从不发 `initializeConversationV4`）。
+处置：`src/credential-cipher.mjs` + `src/host.mjs` 的 pp 分支按主进程角色应答，密钥用官方自己的
+headless 派生式（`zcode-credential-fallback:${platform}:${homedir}:${user}` 的 sha256，或
+`ZCODE_CREDENTIAL_SECRET`），信封 `enc:v2:env:`，**兼容既有 `enc:v1:` 存储**（升级不用重新登录）。
+沙箱实测：`ui-boot-check` 8.2s 启动、root 281KB、composer 就位、任务列表正常。注意 3.18 首次读存储会
+把 v1 迁成 v2，`ensureCredentialBackup()` 会在首次 3.18 启动前留 `credentials.json.bak-pre318`
+（回滚 = 把它 mv 回去）。**新登录协议本身不需要垫片**：渲染层调宿主
+`oauth.startOAuthWithPolling`，宿主自己 `oauth.pollPendingOAuth` 轮询 1-2s 收口；`window.open`
+打开 `zchat.z.ai/auth?...`，`zcode://oauth/callback` 深链只是桌面的快速路径（`onOAuthCallback`
+订阅保留为 no-op 也无碍）。自检：`node scripts/dev/credential-cipher-test.mjs`（16 项）。
+
+细节与下次续做入口见 `docs/leaks-and-318-2026-11-16.md`。

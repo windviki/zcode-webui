@@ -134,6 +134,28 @@ export function sampleHostRssMb(pid) {
   }
 }
 
+// Per-pid *footprint* in MiB: resident set PLUS whatever the kernel pushed into
+// swap. The 2026-11-16 postmortem: the host's VmRSS sat at 1.0GB (below the
+// 1238MB kill line) while VmSwap held another 2.2GB — a 3.17GB working set that
+// the RSS-only guard therefore never saw, and every page load had to fault it
+// back in from a full swap file (health checks answered in 8-10s, the renderer's
+// 30s startup channel timed out). Swap used by a process is memory this machine
+// no longer has; counting it is what makes the guard fire.
+export function sampleHostFootprintMb(pid) {
+  if (!pid) return null;
+  try {
+    const status = readFileSync('/proc/' + pid + '/status', 'utf8');
+    const rss = status.match(/^VmRSS:\s+(\d+)\s+kB/m);
+    if (!rss) return null;
+    const swap = status.match(/^VmSwap:\s+(\d+)\s+kB/m);
+    const rssMb = Math.round(Number(rss[1]) / 1024);
+    const swapMb = swap ? Math.round(Number(swap[1]) / 1024) : 0;
+    return { rssMb, swapMb, footprintMb: rssMb + swapMb };
+  } catch (_e) {
+    return null;
+  }
+}
+
 // Turn the ratio config into the absolute numbers used for decisions, for the
 // machine we are actually running on. `base` is RAM for host RSS (swap does not
 // hold a process's RSS) and RAM+swap for the free-memory floor (a box can be
@@ -180,17 +202,25 @@ export function collectHostPids(sessions, httpRelays) {
 }
 
 // Pure decision function (unit-tested offline).
-//   state = { hosts:[{pid,rssMb}], memAvailableMb, swapFreeMb, now,
-//             lastReclaimAt, lastWarnAt }
+//   state = { hosts:[{pid,rssMb,swapMb?,footprintMb?}], memAvailableMb,
+//             swapFreeMb, now, lastReclaimAt, lastWarnAt }
 //   thresholds = resolved { warnRssMb, killRssMb, minAvailMb, hardRssMb,
 //                           softAvailMb } + { cooldownMs, warnRepeatMs }
-// Returns { action: 'none'|'warn'|'reclaim', pid, reason, hostRssMb }.
+// Returns { action: 'none'|'warn'|'reclaim', pid, reason, hostRssMb,
+//           hostSwapMb, hostFootprintMb }.
+// Decisions compare the FOOTPRINT (RSS + swap, when known) against the same
+// thresholds — see sampleHostFootprintMb for why RSS alone under-reports.
 export function decideMemoryAction(state, thresholds) {
-  const hosts = (state.hosts || []).filter((h) => h && Number.isFinite(h.rssMb) && h.rssMb > 0);
-  const none = { action: 'none', pid: null, reason: '', hostRssMb: 0 };
+  const withFp = (h) => (h && Number.isFinite(h.footprintMb) ? h.footprintMb : (h ? h.rssMb : null));
+  const hosts = (state.hosts || []).filter((h) => h && Number.isFinite(withFp(h)) && withFp(h) > 0);
+  const none = { action: 'none', pid: null, reason: '', hostRssMb: 0, hostSwapMb: 0, hostFootprintMb: 0 };
   if (hosts.length === 0) return none;
 
-  const biggest = hosts.reduce((a, b) => (b.rssMb > a.rssMb ? b : a));
+  const biggest = hosts.reduce((a, b) => (withFp(b) > withFp(a) ? b : a));
+  const fpMb = withFp(biggest);
+  const rssMb = Number.isFinite(biggest.rssMb) ? biggest.rssMb : fpMb;
+  const swapMb = Number.isFinite(biggest.swapMb) ? biggest.swapMb : Math.max(0, fpMb - rssMb);
+  const label = 'host footprint=' + fpMb + 'MB (rss ' + rssMb + ' + swap ' + swapMb + ')';
   const memAvailableMb = state.memAvailableMb;
   const swapFreeMb = Number.isFinite(state.swapFreeMb) ? state.swapFreeMb : 0;
   const freeMb = Number.isFinite(memAvailableMb) ? memAvailableMb + swapFreeMb : null;
@@ -199,46 +229,35 @@ export function decideMemoryAction(state, thresholds) {
   const lastWarnAt = Number.isFinite(state.lastWarnAt) ? state.lastWarnAt : 0;
   const sysKnown = freeMb !== null;
   const cooling = lastReclaimAt > 0 && now - lastReclaimAt < thresholds.cooldownMs;
+  const out = (action, reason) => ({ action, pid: biggest.pid, reason, hostRssMb: rssMb, hostSwapMb: swapMb, hostFootprintMb: fpMb });
 
   // 1) The box is short of memory (incl. swap) and this host is big: reclaim
   //    now. A host already this large is the reason memory is short; the
   //    alternative is minutes of thrashing for every client.
-  if (!cooling && sysKnown && freeMb <= thresholds.minAvailMb && biggest.rssMb >= thresholds.killRssMb) {
-    return {
-      action: 'reclaim', pid: biggest.pid,
-      reason: 'free memory ' + freeMb + 'MB (avail ' + memAvailableMb + ' + swap ' + swapFreeMb +
-        ') <= floor ' + thresholds.minAvailMb + 'MB and host rss=' + biggest.rssMb + 'MB',
-      hostRssMb: biggest.rssMb,
-    };
+  if (!cooling && sysKnown && freeMb <= thresholds.minAvailMb && fpMb >= thresholds.killRssMb) {
+    return out('reclaim', 'free memory ' + freeMb + 'MB (avail ' + memAvailableMb + ' + swap ' + swapFreeMb +
+      ') <= floor ' + thresholds.minAvailMb + 'MB and ' + label);
   }
 
   // 2) A single host is absurdly large while memory is already tight. Covers
   //    the case where free memory is still reclaimable but the host keeps
   //    growing: waiting for the floor risks the same thrash.
-  if (!cooling && sysKnown && biggest.rssMb >= thresholds.hardRssMb && freeMb < thresholds.softAvailMb) {
-    return {
-      action: 'reclaim', pid: biggest.pid,
-      reason: 'host rss=' + biggest.rssMb + 'MB >= hard cap ' + thresholds.hardRssMb +
-        'MB with free ' + freeMb + 'MB < ' + thresholds.softAvailMb + 'MB',
-      hostRssMb: biggest.rssMb,
-    };
+  if (!cooling && sysKnown && fpMb >= thresholds.hardRssMb && freeMb < thresholds.softAvailMb) {
+    return out('reclaim', label + ' >= hard cap ' + thresholds.hardRssMb +
+      'MB with free ' + freeMb + 'MB < ' + thresholds.softAvailMb + 'MB');
   }
 
   // 3) Log-only warning (never kills).
-  if (biggest.rssMb >= thresholds.warnRssMb && now - lastWarnAt >= thresholds.warnRepeatMs) {
-    return {
-      action: 'warn', pid: biggest.pid,
-      reason: 'host rss=' + biggest.rssMb + 'MB >= warn ' + thresholds.warnRssMb + 'MB' +
-        (sysKnown ? '; free=' + freeMb + 'MB' : ''),
-      hostRssMb: biggest.rssMb,
-    };
+  if (fpMb >= thresholds.warnRssMb && now - lastWarnAt >= thresholds.warnRepeatMs) {
+    return out('warn', label + ' >= warn ' + thresholds.warnRssMb + 'MB' +
+      (sysKnown ? '; free=' + freeMb + 'MB' : ''));
   }
 
   return none;
 }
 
 // Guard instance used by src/server.mjs. Injectable readers keep it testable.
-export function createMemoryGuard({ getHosts, sysReader = sampleSystemMemory, rssReader = sampleHostRssMb, now = Date.now, config = memoryGuardConfig() } = {}) {
+export function createMemoryGuard({ getHosts, sysReader = sampleSystemMemory, rssReader = null, footprintReader = null, now = Date.now, config = memoryGuardConfig() } = {}) {
   const state = {
     lastWarnAt: 0,
     lastReclaimAt: 0,
@@ -291,12 +310,24 @@ export function createMemoryGuard({ getHosts, sysReader = sampleSystemMemory, rs
     let hosts = [];
     try {
       const pids = typeof getHosts === 'function' ? getHosts() : [];
-      hosts = pids.map((pid) => ({ pid, rssMb: rssReader(pid) })).filter((h) => Number.isFinite(h.rssMb));
+      // Footprint (RSS + swap) by default. A caller that only has an RSS reader
+      // (or a test double) keeps working: swap is then treated as unknown/0.
+      const read = footprintReader
+        || (rssReader
+          ? (pid) => { const v = rssReader(pid); return Number.isFinite(v) ? { rssMb: v, swapMb: 0, footprintMb: v } : null; }
+          : sampleHostFootprintMb);
+      hosts = pids.map((pid) => {
+        const f = read(pid);
+        if (!f || !Number.isFinite(f.rssMb)) return null;
+        const swapMb = Number.isFinite(f.swapMb) ? f.swapMb : 0;
+        const footprintMb = Number.isFinite(f.footprintMb) ? f.footprintMb : f.rssMb + swapMb;
+        return { pid, rssMb: f.rssMb, swapMb, footprintMb };
+      }).filter(Boolean);
     } catch (_e) { hosts = []; }
     const system = sysReader();
     const thresholds = resolveMemoryThresholds(config, system);
     state.lastTickAt = t;
-    state.lastHosts = hosts.map((h) => ({ pid: h.pid, rssMb: h.rssMb }));
+    state.lastHosts = hosts.map((h) => ({ pid: h.pid, rssMb: h.rssMb, swapMb: h.swapMb, footprintMb: h.footprintMb }));
     state.lastSystem = system;
     state.lastThresholds = thresholds;
     const decision = decideMemoryAction({
